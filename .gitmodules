@@ -1,0 +1,3 @@
+[submodule "submodules/real-life-chess-vision"]
+	path = submodules/real-life-chess-vision
+	url = https://github.com/shainisan/real-life-chess-vision
