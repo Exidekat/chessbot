@@ -61,6 +61,23 @@ def main():
         action="store_true",
         help="Skip calculating best move (useful if engine not available)"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with visualization output"
+    )
+    parser.add_argument(
+        "--corner-conf",
+        type=float,
+        default=0.1,
+        help="Confidence threshold for corner detection (0.0-1.0, default: 0.1)"
+    )
+    parser.add_argument(
+        "--min-corner-dist",
+        type=float,
+        default=50.0,
+        help="Minimum distance between corners in pixels (default: 50.0)"
+    )
 
     args = parser.parse_args()
 
@@ -76,6 +93,10 @@ def main():
     print("=" * 60)
     print(f"Image: {image_path}")
     print(f"Output format: {args.output}")
+    print(f"Debug mode: {'enabled' if args.debug else 'disabled'}")
+    if args.debug:
+        print(f"Corner confidence: {args.corner_conf}")
+        print(f"Min corner distance: {args.min_corner_dist}")
     print()
 
     try:
@@ -87,7 +108,13 @@ def main():
 
         # Take snapshot
         print(f"Taking snapshot of {image_path}...")
-        result = detector.snapshot(str(image_path), output_format=args.output)
+        result = detector.snapshot(
+            str(image_path),
+            output_format=args.output,
+            debug=args.debug,
+            corner_conf=args.corner_conf,
+            min_corner_distance=args.min_corner_dist
+        )
         print("✓ Snapshot complete")
         print()
 
