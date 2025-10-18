@@ -46,6 +46,9 @@ class BoardState:
         self._last_board_state: Optional[chess.Board] = None
         self._last_fen: Optional[str] = None
 
+        # Store transform parameters
+        self.top_margin = 0  # Top margin added during perspective transform
+
         # Piece mapping from class index to notation
         self.piece_map = {
             0: 'b', 1: 'k', 2: 'n', 3: 'p', 4: 'q', 5: 'r',  # black pieces
@@ -303,18 +306,23 @@ class BoardState:
             maxWidth = int(maxWidth * scale)
             maxHeight = int(maxHeight * scale)
 
-        # Construct destination points
+        # Add top margin (1 grid space = 1/8 of board height) to prevent cutting off top pieces
+        margin = maxHeight // 8
+        self.top_margin = margin
+
+        # Construct destination points with margin offset
+        # The board corners map to positions starting at 'margin' pixels from the top
         dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]
+            [0, margin],
+            [maxWidth - 1, margin],
+            [maxWidth - 1, maxHeight - 1 + margin],
+            [0, maxHeight - 1 + margin]
         ], dtype="float32")
 
         # Compute and apply perspective transform with high-quality interpolation
         M = cv2.getPerspectiveTransform(rect, dst)
         warped = cv2.warpPerspective(
-            image, M, (maxWidth, maxHeight),
+            image, M, (maxWidth, maxHeight + margin),  # Add margin to output height
             flags=cv2.INTER_CUBIC,  # Higher quality interpolation
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0)
@@ -359,11 +367,14 @@ class BoardState:
             Tuple of (x_coordinates, y_coordinates) for the grid lines
         """
         width, height = image.size
+
+        # Account for top margin - the actual board starts at 'top_margin' pixels from top
+        # and extends to the bottom of the image
         corners = np.array([
-            [0, 0],
-            [width, 0],
-            [0, height],
-            [width, height]
+            [0, self.top_margin],              # TL: top-left of actual board
+            [width, self.top_margin],          # TR: top-right of actual board
+            [0, height],                       # BL: bottom-left
+            [width, height]                    # BR: bottom-right
         ])
 
         corners = self.order_points(corners)
