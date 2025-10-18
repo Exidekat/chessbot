@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(git submodule add:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(identify chessboard.png)",
+      "Bash(python main.py --image data/chessboard.png --no-bestmove --debug)"
     ],
     "deny": [],
     "ask": []

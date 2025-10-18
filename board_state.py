@@ -279,6 +279,9 @@ class BoardState:
             Transformed PIL Image
         """
         img = Image.open(image_path)
+        # Convert to RGB to ensure consistent 3-channel format (handles RGBA, grayscale, etc.)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
         image = np.asarray(img)
         rect = self.order_points(pts)
         (tl, tr, br, bl) = rect
@@ -293,6 +296,13 @@ class BoardState:
         heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
         maxHeight = max(int(heightA), int(heightB))
 
+        # Ensure minimum dimensions for quality output, especially for small input images
+        MIN_SIZE = 400
+        if maxWidth < MIN_SIZE or maxHeight < MIN_SIZE:
+            scale = max(MIN_SIZE / maxWidth, MIN_SIZE / maxHeight)
+            maxWidth = int(maxWidth * scale)
+            maxHeight = int(maxHeight * scale)
+
         # Construct destination points
         dst = np.array([
             [0, 0],
@@ -301,9 +311,14 @@ class BoardState:
             [0, maxHeight - 1]
         ], dtype="float32")
 
-        # Compute and apply perspective transform
+        # Compute and apply perspective transform with high-quality interpolation
         M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+        warped = cv2.warpPerspective(
+            image, M, (maxWidth, maxHeight),
+            flags=cv2.INTER_CUBIC,  # Higher quality interpolation
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0)
+        )
 
         return Image.fromarray(warped, "RGB")
 
