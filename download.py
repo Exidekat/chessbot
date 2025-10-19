@@ -30,7 +30,7 @@ def copy_corner_model(data_dir: Path) -> bool:
         True if successful, False otherwise
     """
     source = Path("submodules/real-life-chess-vision/best_corners.pt")
-    dest = data_dir / "best_cornres.pt"
+    dest = data_dir / "best_corners.pt"
 
     if not source.exists():
         print(f"✗ Corner model not found at: {source}")
@@ -123,7 +123,7 @@ def verify_models(data_dir: Path) -> bool:
         True if all models present, False otherwise
     """
     required_files = [
-        "best_cornres.pt",
+        "best_corners.pt",
         "best_transformed_detection.pt"
     ]
 

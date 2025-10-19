@@ -26,7 +26,7 @@ class BoardDetector:
 
     def __init__(
         self,
-        corner_model_path: str = "data/best_cornres.pt",
+        corner_model_path: str = "data/best_corners.pt",
         piece_model_path: str = "data/best_transformed_detection.pt"
     ):
         """

@@ -17,7 +17,7 @@ DEFAULT_CONFIG = {
         "gripper_resolution": [640, 480],
     },
     "models": {
-        "corner_model": "data/best_cornres.pt",
+        "corner_model": "data/best_corners.pt",
         "piece_model": "data/best_transformed_detection.pt",
     },
     "paths": {

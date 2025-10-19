@@ -47,7 +47,7 @@ class GuidanceSystem:
 
         # Initialize components
         self.detector = BoardDetector(
-            corner_model_path=config.get('corner_model', 'data/best_cornres.pt'),
+            corner_model_path=config.get('corner_model', 'data/best_corners.pt'),
             piece_model_path=config.get('piece_model', 'data/best_transformed_detection.pt')
         )
 

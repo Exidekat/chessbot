@@ -215,7 +215,7 @@ control_mode: 'guidance'  # or 'vla' (future)
 
 # Guidance (YOLO-based)
 guidance:
-  corner_model: "data/best_cornres.pt"
+  corner_model: "data/best_corners.pt"
   piece_model: "data/best_transformed_detection.pt"
   engine_path: "stockfish"
 

@@ -53,7 +53,7 @@ cameras:
     - 480
 
 models:
-  corner_model: data/best_cornres.pt
+  corner_model: data/best_corners.pt
   piece_model: data/best_transformed_detection.pt
 
 paths:
@@ -91,7 +91,7 @@ guidance:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `models.corner_model` | str | data/best_cornres.pt | YOLO corner detection model |
+| `models.corner_model` | str | data/best_corners.pt | YOLO corner detection model |
 | `models.piece_model` | str | data/best_transformed_detection.pt | YOLO piece detection model |
 
 ### Paths

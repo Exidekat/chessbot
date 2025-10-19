@@ -125,7 +125,7 @@ High-level orchestrator coordinating all components:
 from guidance import GuidanceSystem
 
 guidance = GuidanceSystem(config={
-    'corner_model': 'data/best_cornres.pt',
+    'corner_model': 'data/best_corners.pt',
     'piece_model': 'data/best_transformed_detection.pt',
     'engine_path': 'stockfish',
     'cache_path': 'data/state_cache.json'
@@ -195,7 +195,7 @@ python -m guidance.training.analyze_board \
 ## YOLO Models
 
 ### Required Models
-- **Corner Detection**: `data/best_cornres.pt`
+- **Corner Detection**: `data/best_corners.pt`
 - **Piece Detection**: `data/best_transformed_detection.pt`
 
 Download with:
