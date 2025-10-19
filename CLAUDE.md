@@ -1,1 +1,2 @@
 - For this project, we will only have documentation in unified READMEs that will provide architecture overview and usage of the associated module/directory that it resides in
+- Whenever creating a new script or patching old ones, review and make appropriate updates to the README of the same directory, or of the next parent if unavailable.
