@@ -1,222 +1,379 @@
-# ChessBot - Chess Vision Board State System
+# ChessBot - Unified Chess Robot Control System
 
-A computer vision system for detecting and analyzing chess board positions from images using YOLOv8 and python-chess.
+A modular chess robot system with YOLO-based computer vision, multi-camera management, ROS robot control, and future VLA integration.
 
-## Features
+## Overview
 
-- **Corner Detection**: Automatically detects the four corners of a chessboard using a trained YOLO model
-- **Perspective Correction**: Applies perspective transformation to obtain a bird's-eye view of the board
-- **Piece Detection**: Identifies all chess pieces and their positions using YOLOv8
-- **FEN Notation**: Outputs board state in standard FEN (Forsyth-Edwards Notation) format
-- **UCI Integration**: Compatible with python-chess for move generation and analysis
-- **Engine Analysis**: Calculate best moves using UCI chess engines (e.g., Stockfish)
+ChessBot provides a complete software stack for autonomous chess-playing robots:
+- **Guidance Module**: YOLO-based board detection and symbolic move calculation
+- **Camera Module**: Multi-camera stream management (2 real-time + 1 static overlay)
+- **Controls Module**: ROS robot arm control with safety systems (skeleton)
+- **VLA Module**: Future Vision-Language-Action model integration (skeleton)
 
-## Architecture
+**Status**: Guidance and cameras modules complete and tested. Controls and VLA are skeletal awaiting hardware integration.
 
-The system uses a two-stage YOLO pipeline based on the [real-life-chess-vision](https://github.com/shainisan/real-life-chess-vision) project:
+## Quick Start
 
-1. **Stage 1 - Corner Detection**: YOLO model detects the four corners of the chessboard
-2. **Stage 2 - Perspective Transform**: OpenCV applies perspective correction to normalize the board view
-3. **Stage 3 - Piece Detection**: YOLO model detects all pieces on the corrected board (12 classes: b,k,n,p,q,r,B,K,N,P,Q,R)
-4. **Stage 4 - Square Matching**: Uses IoU (Intersection over Union) to match detected pieces to board squares
-5. **Stage 5 - Output**: Generates FEN notation or python-chess Board object
+### Installation
 
-## Installation
-
-### Prerequisites
-
-- Python 3.8+
-- Git
-- (Optional) Stockfish or another UCI chess engine for move analysis
-
-### Setup
-
-1. Clone the repository with submodules:
 ```bash
+# Clone repository
 git clone --recurse-submodules <repository-url>
 cd chessbot
-```
 
-2. Install Python dependencies:
-```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-3. Download model parameters:
-```bash
+# Download YOLO models
 python download.py
 ```
 
-This will:
-- Copy the corner detection model from the submodule
-- Provide instructions for downloading the piece detection model
+### Run Demo
 
-4. (Optional) Install Stockfish for engine analysis:
 ```bash
-# macOS
-brew install stockfish
+# Detect board state and calculate best move
+python best_move_demo.py --image data/chessboardv2.png --debug
 
-# Ubuntu/Debian
-sudo apt-get install stockfish
+# Or use the old interface (deprecated)
+python main.py --image data/chessboardv2.png --debug
+```
 
-# Windows
-# Download from https://stockfishchess.org/download/
+## Architecture
+
+### Modular Design
+
+```
+chessbot/
+├── guidance/              # YOLO-based chess vision
+│   ├── board_detector.py      # Board state detection
+│   ├── move_calculator.py     # Stockfish integration
+│   ├── training/              # YOLO training tools
+│   └── README.md
+│
+├── cameras/               # Multi-camera management
+│   ├── global_camera.py       # Overhead camera (real-time)
+│   ├── gripper_camera.py      # Arm-mounted camera (real-time)
+│   ├── overlay_generator.py   # Guidance overlay (on-demand)
+│   ├── camera_manager.py      # Unified interface
+│   └── README.md
+│
+├── controls/              # ROS robot control (skeleton)
+│   ├── robot_arm.py           # ROS integration (TODO)
+│   ├── movement.py            # Movement primitives (TODO)
+│   ├── calibration.py         # Calibration system (TODO)
+│   ├── safety.py              # Safety monitoring (TODO)
+│   └── README.md
+│
+├── vla/                   # Future VLA integration (skeleton)
+│   ├── model/                 # Pi0 wrapper (TODO)
+│   ├── data_collection/       # Episode recording (TODO)
+│   ├── training/              # VLA training (TODO)
+│   └── README.md
+│
+├── best_move_demo.py      # Demo using new guidance module
+└── README.md              # This file
+```
+
+**Old Files (Deprecated)**:
+- `board_state.py` - Use `guidance/board_detector.py` instead
+- `robot_interface.py` - Refactored into `guidance/` and `controls/`
+- `tools/` - Moved to `guidance/training/`
+
+### Module Communication
+
+```
+Camera Streams → Guidance System → Overlay Generator
+                      ↓
+                Board State + Best Move
+                      ↓
+              Controls (Robot Execution)
+                      ↓
+                  VLA (Future)
 ```
 
 ## Usage
 
-### Quick Start
-
-Place a chess board image at `data/chessboard.png` and run:
-
-```bash
-python main.py
-```
-
-### Command Line Options
-
-```bash
-python main.py --help
-
-Options:
-  --image IMAGE         Path to chess board image (default: data/chessboard.png)
-  --engine ENGINE       Path to UCI engine (default: stockfish)
-  --time TIME          Engine analysis time in seconds (default: 1.0)
-  --output {fen,board} Output format: 'fen' or 'board' (default: board)
-  --no-bestmove        Skip best move calculation
-```
-
-### Examples
-
-```bash
-# Analyze a specific image
-python main.py --image path/to/chessboard.jpg
-
-# Get FEN notation output
-python main.py --output fen
-
-# Use custom engine with longer analysis time
-python main.py --engine /usr/local/bin/stockfish --time 5.0
-
-# Skip engine analysis (just detect board state)
-python main.py --no-bestmove
-```
-
-### Using the BoardState Module
+### Guidance System
 
 ```python
-from board_state import BoardState
+from guidance import BoardDetector, MoveCalculator
+import chess
 
-# Initialize detector
-detector = BoardState()
-
-# Take snapshot and get FEN
-fen = detector.snapshot("path/to/image.jpg", output_format="fen")
-print(f"FEN: {fen}")
-
-# Or get python-chess Board object
-board = detector.snapshot("path/to/image.jpg", output_format="board")
-print(board)
-
-# Get current state (from last snapshot)
-current_board = detector.current(output_format="board")
+# Detect board state
+detector = BoardDetector()
+fen, transformed = detector.detect_board_state(
+    "board.png",
+    debug=True  # Saves visualization at each stage
+)
 
 # Calculate best move
-best_move = detector.bestmove(engine_path="stockfish", time_limit=1.0)
+calculator = MoveCalculator(engine_path="stockfish")
+board = chess.Board(fen)
+best_move = calculator.calculate_best_move(board, time_limit=1.0)
+
 print(f"Best move: {best_move.uci()}")
 ```
 
-## API Reference
+**Debug Visualizations**:
+- `chessboard_raw_corners.png` - All corner detections
+- `chessboard_corners.png` - Selected 4 corners
+- `chessboard_transformed.png` - Perspective-corrected board
+- `chessboard_detections.png` - Piece detections with confidence
+- `chessboard_grid.png` - 8x8 grid overlay
 
-### BoardState Class
+### Camera System
 
-#### `__init__(corner_model_path, piece_model_path)`
-Initialize the board state detector with model paths.
+```python
+from cameras import CameraManager
 
-#### `snapshot(image_path, output_format='fen') -> str | chess.Board`
-Process an image and detect the board state.
+config = {
+    'global_camera_id': 0,
+    'gripper_camera_id': 1,
+    'overlay_path': 'data/guidance_overlay.png',
+    'overlay_flag_path': 'data/overlay_ready.flag'
+}
 
-**Parameters:**
-- `image_path` (str): Path to the chess board image
-- `output_format` (str): 'fen' for FEN notation string, 'board' for chess.Board object
+cameras = CameraManager(config)
+cameras.start()
 
-**Returns:** FEN string or chess.Board object
+# Get real-time streams
+global_frame = cameras.get_global_frame()
+gripper_frame = cameras.get_gripper_frame()
 
-#### `current(output_format='board') -> str | chess.Board`
-Get the last snapshot result without reprocessing.
+# Get static overlay (only loads when guidance signals via flag)
+overlay = cameras.get_overlay_frame()
 
-**Parameters:**
-- `output_format` (str): 'fen' or 'board'
-
-**Returns:** FEN string or chess.Board object
-
-#### `bestmove(engine_path='stockfish', time_limit=1.0) -> chess.Move`
-Calculate the best move using a UCI engine.
-
-**Parameters:**
-- `engine_path` (str): Path to UCI engine executable
-- `time_limit` (float): Analysis time limit in seconds
-
-**Returns:** chess.Move object or None
-
-## Project Structure
-
-```
-chessbot/
-├── board_state.py           # Main BoardState module
-├── main.py                  # Test driver script
-├── download.py              # Model download script
-├── requirements.txt         # Python dependencies
-├── data/                    # Model files and test images
-│   ├── best_cornres.pt      # Corner detection model
-│   ├── best_transformed_detection.pt  # Piece detection model
-│   └── chessboard.png       # Test image
-└── submodules/
-    └── real-life-chess-vision/  # Original project submodule
+cameras.stop()
 ```
 
-## Model Files
+### Training YOLO Models
 
-The system requires two YOLO model files:
+```bash
+# Collect data from board photos
+python -m guidance.training.data_collector \
+    --source board_photos/ \
+    --output dataset/
 
-1. **best_cornres.pt** - Corner detection model (~6 MB)
-   - Automatically copied from submodule by download.py
+# Train YOLO model
+python -m guidance.training.train_yolo \
+    --data dataset/data.yaml \
+    --epochs 150
 
-2. **best_transformed_detection.pt** - Piece detection model
-   - Must be downloaded manually from OneDrive link provided by download.py
+# Evaluate model
+python -m guidance.training.evaluate_yolo \
+    --model runs/train/weights/best.pt \
+    --data dataset/
+
+# Analyze specific board
+python -m guidance.training.analyze_board \
+    --image data/test_board.png
+```
+
+## Configuration
+
+Example `config.yaml`:
+
+```yaml
+# Control mode
+control_mode: 'guidance'  # or 'vla' (future)
+
+# Guidance (YOLO-based)
+guidance:
+  corner_model: "data/best_cornres.pt"
+  piece_model: "data/best_transformed_detection.pt"
+  engine_path: "stockfish"
+
+# Cameras
+cameras:
+  global_camera_id: 0
+  global_resolution: [1280, 720]
+  gripper_camera_id: 1
+  gripper_resolution: [640, 480]
+  overlay_path: "data/guidance_overlay.png"
+  overlay_flag_path: "data/overlay_ready.flag"
+
+# Robot (ROS)
+robot:
+  type: "ur5"
+  ros_namespace: "/robot_arm"
+  workspace:
+    x_min: 0.2
+    x_max: 0.8
+    y_min: -0.3
+    y_max: 0.3
+    z_min: 0.0
+    z_max: 0.5
+```
+
+## Development Status
+
+### ✅ Completed
+
+**Guidance Module**:
+- [x] `board_detector.py` - Full board detection pipeline with visualizations
+- [x] `move_calculator.py` - Stockfish UCI integration
+- [x] Training tools moved to `guidance/training/`
+- [x] `best_move_demo.py` - Working demo script
+
+**Camera Module**:
+- [x] `global_camera.py` - Threaded overhead camera capture
+- [x] `gripper_camera.py` - Threaded gripper camera capture
+- [x] `overlay_generator.py` - Flag-based overlay management
+- [x] `camera_manager.py` - Unified stream interface
+
+**Documentation**:
+- [x] Module READMEs for all 4 modules
+- [x] Root README (this file)
+
+### 🚧 In Progress
+
+**Guidance Module**:
+- [ ] `coordinate_mapper.py` - Chess square to pixel mapping
+- [ ] `move_interpreter.py` - Move type detection
+- [ ] `highlight_renderer.py` - Visual overlay generation
+- [ ] `guidance_system.py` - Unified orchestrator
+
+### ⏳ To Do
+
+**Controls Module** (requires hardware):
+- [ ] `robot_arm.py` - ROS integration
+- [ ] `movement.py` - Movement primitives
+- [ ] `calibration.py` - Camera/robot calibration
+- [ ] `safety.py` - Safety monitoring
+
+**VLA Module** (future):
+- [ ] `pi0_wrapper.py` - HuggingFace Pi0 integration
+- [ ] `episode_recorder.py` - Data collection
+- [ ] `train_vla.py` - VLA training pipeline
+
+## Module Documentation
+
+Each module has comprehensive documentation:
+
+- **[guidance/README.md](guidance/README.md)** - YOLO vision system, training tools, performance notes
+- **[cameras/README.md](cameras/README.md)** - Multi-camera management, stream specifications
+- **[controls/README.md](controls/README.md)** - ROS integration, movement primitives, calibration
+- **[vla/README.md](vla/README.md)** - Future VLA architecture, Pi0 integration, data collection
+
+## Performance
+
+### Current Baseline
+
+Testing with `chessboardv2.png` (starting position):
+- **Detection Rate**: 27/32 pieces (84%)
+- **Classification Accuracy**: 9/32 correct (28%)
+- **Common Issues**: Pawn misclassification, missed pieces
+
+### Improvement Strategy
+
+1. Collect 100+ board photos from your setup
+2. Use `guidance.training.data_collector` to extract labeled pieces
+3. Train new models with `guidance.training.train_yolo` (150+ epochs)
+4. Evaluate and iterate
+
+## Hardware Requirements
+
+### Cameras
+- **Global Camera**: USB camera for overhead view (1280x720+)
+- **Gripper Camera**: USB camera on robot arm (640x480+)
+- **Mounting**: Stable overhead mount, arm-mounted bracket
+
+### Robot
+- **Arm**: ROS-compatible robot arm (UR5, Franka, etc.)
+- **Gripper**: 2-finger gripper or suction gripper
+- **Workspace**: ~60cm x 60cm chessboard area
+
+### Compute
+- **Vision**: CPU (YOLO on CPU with PyTorch 2.7.1+cpu)
+- **VLA**: GPU recommended for Pi0 inference (future)
+- **Memory**: 8GB+ RAM
+- **Storage**: 50GB+ for episode data (VLA)
+
+## Dependencies
+
+### Python Packages
+```
+ultralytics>=8.0.0
+opencv-python
+numpy
+pillow
+shapely
+python-chess
+```
+
+### System
+- Python 3.8+
+- (Optional) Stockfish for move calculation
+- (Future) ROS Noetic for robot control
+- (Future) CUDA for VLA training
+
+## Migration from Old Code
+
+If you were using the old `board_state.py` directly:
+
+```python
+# OLD
+from board_state import BoardState
+detector = BoardState()
+fen = detector.snapshot("board.png", output_format="fen")
+move = detector.bestmove()
+
+# NEW
+from guidance import BoardDetector, MoveCalculator
+import chess
+
+detector = BoardDetector()
+fen, _ = detector.detect_board_state("board.png")
+
+calculator = MoveCalculator()
+board = chess.Board(fen)
+move = calculator.calculate_best_move(board)
+```
+
+For YOLO training:
+```bash
+# OLD
+python tools/train.py --dataset dataset/
+
+# NEW
+python -m guidance.training.train_yolo --dataset dataset/
+```
 
 ## Troubleshooting
 
-### Models not found
+### Models Not Found
+```bash
+python download.py
 ```
-FileNotFoundError: Corner detection model not found
-```
-**Solution:** Run `python download.py` to set up model files
 
-### Engine not found
+### Camera Not Opening
+```python
+# List available cameras
+import cv2
+for i in range(10):
+    cap = cv2.VideoCapture(i)
+    if cap.isOpened():
+        print(f"Camera {i} available")
+        cap.release()
 ```
-FileNotFoundError: Engine not found at 'stockfish'
-```
-**Solution:** Install Stockfish or specify engine path with `--engine`
 
-### CUDA/GPU errors
-```
-TypeError: can't convert cuda:0 device type tensor to numpy
-```
-**Solution:** The code automatically handles this by using `.cpu()` on tensors
+### Low Detection Accuracy
+- Collect more training data from your specific setup
+- Ensure good lighting and clear view of board
+- Check that all corners are visible (not obscured)
+- Adjust confidence thresholds in detection
 
-### Invalid FEN
-If the detected FEN is invalid, this may indicate:
-- Poor image quality or lighting
-- Obstructed view of the board
-- Model confidence too low
-
-Try adjusting the image or confidence thresholds in the model prediction calls.
+### Import Errors
+Make sure to run from project root:
+```bash
+cd chessbot
+python best_move_demo.py
+```
 
 ## Credits
 
-This project is based on the excellent work by [shainisan/real-life-chess-vision](https://github.com/shainisan/real-life-chess-vision).
+Based on [shainisan/real-life-chess-vision](https://github.com/shainisan/real-life-chess-vision).
 
 ## License
 
-See the LICENSE file for details.
+See LICENSE file for details.
