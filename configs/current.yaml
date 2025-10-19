@@ -1,0 +1,26 @@
+cameras:
+  global_camera_id: 0
+  global_resolution:
+  - 1280
+  - 720
+  gripper_camera_id: 1
+  gripper_resolution:
+  - 640
+  - 480
+models:
+  corner_model: data/best_cornres.pt
+  piece_model: data/best_transformed_detection.pt
+paths:
+  state_cache: data/state_cache.json
+  overlay_image: data/guidance_overlay.png
+  overlay_flag: data/overlay_ready.flag
+  data_dir: data
+visualization:
+  host: 0.0.0.0
+  port: 8000
+guidance:
+  robot_plays_white: false
+  engine_path: stockfish
+  engine_time_limit: 1.0
+  corner_confidence: 0.1
+  min_corner_distance: 50.0

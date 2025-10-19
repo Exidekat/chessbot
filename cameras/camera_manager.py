@@ -7,12 +7,22 @@ Resource-efficient: only fetches overlay from static PNG when flagged by guidanc
 
 import cv2
 import numpy as np
+import sys
 from typing import Optional, Dict, Tuple
 from pathlib import Path
 
 from .global_camera import GlobalCamera
 from .gripper_camera import GripperCamera
 from .overlay_generator import OverlayGenerator
+
+# Add parent directory to path for config imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+try:
+    from configs import get_camera_config, get_path_config
+    CONFIG_AVAILABLE = True
+except ImportError:
+    CONFIG_AVAILABLE = False
 
 
 class CameraManager:
@@ -60,6 +70,40 @@ class CameraManager:
         )
 
         self.running = False
+
+    @classmethod
+    def from_config(cls):
+        """
+        Create CameraManager from YAML configuration file.
+
+        Loads camera settings from configs/current.yaml.
+
+        Returns:
+            CameraManager instance configured from YAML
+
+        Example:
+            camera_mgr = CameraManager.from_config()
+            camera_mgr.start_all()
+        """
+        if not CONFIG_AVAILABLE:
+            print("[CameraManager] Warning: Config module not available, using defaults")
+            return cls()
+
+        # Load camera and path config
+        camera_config = get_camera_config()
+        path_config = get_path_config()
+
+        # Build config dict for initialization
+        config = {
+            'global_camera_id': camera_config.get('global_camera_id', 0),
+            'global_resolution': tuple(camera_config.get('global_resolution', [1280, 720])),
+            'gripper_camera_id': camera_config.get('gripper_camera_id', 1),
+            'gripper_resolution': tuple(camera_config.get('gripper_resolution', [640, 480])),
+            'overlay_path': path_config.get('overlay_image', 'data/guidance_overlay.png'),
+            'overlay_flag_path': path_config.get('overlay_flag', 'data/overlay_ready.flag'),
+        }
+
+        return cls(config)
 
     def start(self) -> bool:
         """

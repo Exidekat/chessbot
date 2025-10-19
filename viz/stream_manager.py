@@ -16,6 +16,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cameras.camera_manager import CameraManager
 
+try:
+    from configs import get_camera_config
+    CONFIG_AVAILABLE = True
+except ImportError:
+    CONFIG_AVAILABLE = False
+
 
 class StreamManager:
     """
@@ -30,10 +36,18 @@ class StreamManager:
         Initialize stream manager.
 
         Args:
-            camera_manager: CameraManager instance (creates new if None)
+            camera_manager: CameraManager instance (creates new from config if None)
             jpeg_quality: JPEG compression quality (0-100, default: 85)
         """
-        self.camera_manager = camera_manager or CameraManager()
+        if camera_manager is None:
+            # Try to create from config, fallback to defaults
+            if CONFIG_AVAILABLE:
+                self.camera_manager = CameraManager.from_config()
+            else:
+                self.camera_manager = CameraManager()
+        else:
+            self.camera_manager = camera_manager
+
         self.jpeg_quality = jpeg_quality
 
         # JPEG encoding parameters
