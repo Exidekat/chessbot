@@ -330,31 +330,155 @@ class BoardState:
 
         return Image.fromarray(warped, "RGB")
 
-    def detect_pieces(self, image: Image.Image) -> Tuple[np.ndarray, object]:
+    def preprocess_for_detection(self, image: Image.Image) -> Image.Image:
+        """
+        Apply GENTLE preprocessing to enhance piece detection accuracy.
+
+        This pipeline addresses two main issues:
+        1. Missed detections - through mild contrast enhancement
+        2. Pawn misclassification - through subtle color normalization
+
+        Args:
+            image: Input PIL Image (RGB)
+
+        Returns:
+            Preprocessed PIL Image (RGB)
+        """
+        # Convert PIL to numpy array
+        img_array = np.array(image)
+
+        # Step 1: Apply MILD CLAHE for gentle contrast enhancement
+        # Reduced clipLimit from 2.0 to 1.5 and larger tiles to be less aggressive
+        lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
+        l_channel = clahe.apply(l_channel)
+
+        # Step 2: SUBTLE color channel normalization
+        # Only normalize if there's significant variation (not always needed)
+        a_std = np.std(a_channel)
+        b_std = np.std(b_channel)
+
+        if a_std > 20:  # Only normalize if there's significant color variation
+            a_channel = cv2.normalize(a_channel, None, alpha=50, beta=205,
+                                       norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        if b_std > 20:
+            b_channel = cv2.normalize(b_channel, None, alpha=50, beta=205,
+                                       norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+        # Merge and convert back to RGB
+        lab_enhanced = cv2.merge([l_channel, a_channel, b_channel])
+        rgb_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+
+        # Step 3: VERY MILD sharpening (reduced kernel strength)
+        # Blend 70% original + 30% sharpened instead of full sharpening
+        kernel_sharpening = np.array([[0, -1, 0],
+                                      [-1, 5, -1],
+                                      [0, -1, 0]])
+        sharpened = cv2.filter2D(rgb_enhanced, -1, kernel_sharpening)
+        result = cv2.addWeighted(rgb_enhanced, 0.7, sharpened, 0.3, 0)
+
+        # Convert back to PIL Image (skip denoising - it was too aggressive)
+        return Image.fromarray(result, "RGB")
+
+    def detect_pieces(self, image: Image.Image, use_preprocessing: bool = True) -> Tuple[np.ndarray, object]:
         """
         Detect chess pieces on the transformed board.
 
         Args:
             image: Transformed board image
+            use_preprocessing: Whether to apply preprocessing pipeline (default: True)
 
         Returns:
             Tuple of (detections array, boxes object)
         """
+        # Apply preprocessing to improve detection accuracy
+        if use_preprocessing:
+            image = self.preprocess_for_detection(image)
+
         # Save image temporarily for YOLO
         temp_path = "data/temp_board.jpg"
-        image.save(temp_path)
+        image.save(temp_path, quality=95)  # Higher quality to preserve enhanced details
 
         results = self.piece_model.predict(
             source=temp_path,
-            conf=0.5,
-            augment=False,
-            verbose=False
+            conf=0.35,  # Lowered from 0.5 to catch more pieces (reduce missed detections)
+            iou=0.5,    # NMS IoU threshold for removing duplicate detections
+            augment=True,  # Enable test-time augmentation for better detection
+            verbose=False,
+            imgsz=640,  # Ensure consistent input size
+            device='cpu'  # Explicitly set device (will use CUDA if available via PyTorch)
         )
 
         boxes = results[0].boxes
         detections = boxes.xyxy.cpu().numpy()
 
+        # Apply post-processing filters
+        detections, boxes = self.post_process_detections(detections, boxes)
+
         return detections, boxes
+
+    def post_process_detections(self, detections: np.ndarray, boxes: object) -> Tuple[np.ndarray, object]:
+        """
+        Apply post-processing to filter and improve detection results.
+
+        This addresses pawn misclassification by using higher confidence thresholds
+        for pawns compared to other pieces.
+
+        Args:
+            detections: Raw detection bounding boxes (N, 4)
+            boxes: YOLO boxes object with class and confidence info
+
+        Returns:
+            Filtered detections and boxes
+        """
+        if len(detections) == 0:
+            return detections, boxes
+
+        # Class-specific confidence thresholds
+        # Pawns (class 3 and 9) require higher confidence to reduce false positives
+        class_thresholds = {
+            0: 0.35,  # black bishop
+            1: 0.35,  # black king
+            2: 0.35,  # black knight
+            3: 0.45,  # black pawn - HIGHER threshold to reduce misclassification
+            4: 0.35,  # black queen
+            5: 0.35,  # black rook
+            6: 0.35,  # white bishop
+            7: 0.35,  # white king
+            8: 0.35,  # white knight
+            9: 0.45,  # white pawn - HIGHER threshold to reduce misclassification
+            10: 0.35, # white queen
+            11: 0.35, # white rook
+        }
+
+        # Filter detections based on class-specific thresholds
+        classes = boxes.cls.cpu().numpy().astype(int)
+        confidences = boxes.conf.cpu().numpy()
+
+        keep_indices = []
+        for i, (cls, conf) in enumerate(zip(classes, confidences)):
+            threshold = class_thresholds.get(cls, 0.35)
+            if conf >= threshold:
+                keep_indices.append(i)
+
+        if len(keep_indices) == 0:
+            # Return empty results if all filtered out
+            return np.array([]), type('obj', (object,), {'cls': np.array([]), 'conf': np.array([]), 'xyxy': np.array([])})()
+
+        # Filter arrays
+        filtered_detections = detections[keep_indices]
+
+        # Create new boxes object with filtered results
+        # Note: This is a simplified approach - boxes object structure may vary
+        filtered_boxes = type('obj', (object,), {
+            'cls': boxes.cls[keep_indices],
+            'conf': boxes.conf[keep_indices],
+            'xyxy': boxes.xyxy[keep_indices]
+        })()
+
+        return filtered_detections, filtered_boxes
 
     def calculate_grid(self, image: Image.Image) -> Tuple[List[float], List[float]]:
         """
@@ -683,7 +807,8 @@ class BoardState:
         # Step 3: Detect pieces
         if debug:
             print("[DEBUG] Step 3: Detecting pieces...")
-        detections, boxes = self.detect_pieces(transformed_image)
+            print("[DEBUG]   Preprocessing: ENABLED")
+        detections, boxes = self.detect_pieces(transformed_image, use_preprocessing=True)
         if debug:
             print(f"[DEBUG]   Found {len(detections)} detections")
             if len(detections) > 0:
@@ -798,3 +923,91 @@ class BoardState:
                 chess.engine.Limit(time=time_limit)
             )
             return result.move
+
+    def execute_move_with_robot(self, move: chess.Move,
+                                robot_executor: Optional[object] = None,
+                                camera_feed: Optional[object] = None) -> bool:
+        """
+        Execute a chess move using the robotic arm interface.
+
+        This method coordinates the robot to physically execute a move on the board
+        with visual highlighting and proper sequencing for captures, castling, etc.
+
+        Args:
+            move: Chess move to execute (from bestmove() or manual)
+            robot_executor: MoveExecutor instance (will create if None)
+            camera_feed: OpenCV VideoCapture for live overlay (optional)
+
+        Returns:
+            True if move executed successfully, False otherwise
+
+        Example:
+            detector = BoardState()
+            detector.snapshot("board.png")
+            best = detector.bestmove()
+
+            # Execute with robot
+            success = detector.execute_move_with_robot(best, camera_feed=camera)
+
+            if success:
+                # Update board state
+                detector._last_board_state.push(best)
+        """
+        if self._last_board_state is None:
+            raise RuntimeError("No snapshot taken yet. Call snapshot() first.")
+
+        # Import robot interface (lazy import to avoid dependency if not used)
+        from robot_interface import MoveExecutor
+
+        # Create or use provided executor
+        if robot_executor is None:
+            robot_executor = MoveExecutor(board_state=self)
+
+        # Execute move
+        try:
+            success = robot_executor.execute_move(
+                move=move,
+                board=self._last_board_state,
+                camera_feed=camera_feed
+            )
+
+            if success:
+                # Update internal board state
+                self._last_board_state.push(move)
+                self._last_fen = self._last_board_state.fen()
+                print(f"[BoardState] Move executed and board updated: {move.uci()}")
+
+            return success
+
+        except Exception as e:
+            print(f"[BoardState] Error executing move with robot: {e}")
+            return False
+
+    def get_robot_executor(self, host: str = "0.0.0.0", port: int = 5555) -> object:
+        """
+        Create and return a MoveExecutor instance for this BoardState.
+
+        Args:
+            host: Host address for robot server
+            port: Port number for robot communication
+
+        Returns:
+            MoveExecutor instance ready to use
+
+        Example:
+            detector = BoardState()
+            executor = detector.get_robot_executor(port=5555)
+
+            # Keep using the same executor for multiple moves
+            for move in moves:
+                detector.execute_move_with_robot(move, robot_executor=executor)
+
+            # Clean up when done
+            executor.cleanup()
+        """
+        from robot_interface import MoveExecutor, RobotCommunicator
+
+        robot_comm = RobotCommunicator(host=host, port=port)
+        executor = MoveExecutor(board_state=self, robot_comm=robot_comm)
+
+        return executor

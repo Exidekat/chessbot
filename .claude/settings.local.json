@@ -4,7 +4,13 @@
       "Bash(git submodule add:*)",
       "Bash(mkdir:*)",
       "Bash(identify chessboard.png)",
-      "Bash(python main.py --image data/chessboard.png --no-bestmove --debug)"
+      "Bash(python main.py --image data/chessboard.png --no-bestmove --debug)",
+      "Bash(python main.py --image data/chessboard.png --no-bestmove --debug --corner-conf 0.01 --min-corner-dist 30)",
+      "Bash(python main.py --image data/chessboard.png --no-bestmove --debug --corner-conf 0.05 --min-corner-dist 40)",
+      "Bash(identify chessboardv2.png)",
+      "Bash(python main.py --image data/chessboardv2.png --no-bestmove --debug)",
+      "Bash(python tools/analyze_test_board.py --image data/chessboardv2.png)",
+      "Bash(python tools/analyze_test_board.py --image data/chessboardv2.png --preprocessing)"
     ],
     "deny": [],
     "ask": []
