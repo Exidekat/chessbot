@@ -1,0 +1,1 @@
+- For this project, we will only have documentation in unified READMEs that will provide architecture overview and usage of the associated module/directory that it resides in
