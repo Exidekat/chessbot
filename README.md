@@ -93,33 +93,36 @@ Camera Streams → Guidance System → Overlay Generator
 
 ## Usage
 
-### Guidance System
+### Guidance System with Overlay Generation
 
 ```python
-from guidance import BoardDetector, MoveCalculator
-import chess
+from guidance import GuidanceSystem
 
-# Detect board state
-detector = BoardDetector()
-fen, transformed = detector.detect_board_state(
+guidance = GuidanceSystem()
+
+# Detect board, calculate best move, update cache
+fen, best_move, actions = guidance.detect_and_calculate(
     "board.png",
+    update_cache=True,
+    robot_plays_white=True,
     debug=True  # Saves visualization at each stage
 )
 
-# Calculate best move
-calculator = MoveCalculator(engine_path="stockfish")
-board = chess.Board(fen)
-best_move = calculator.calculate_best_move(board, time_limit=1.0)
-
 print(f"Best move: {best_move.uci()}")
+print(f"Action sequence: {len(actions)} actions")
+
+# Generate overlay with action highlights
+guidance.generate_overlay_from_cache()
+# → Saves data/guidance_overlay.png with color-coded highlights
 ```
 
-**Debug Visualizations**:
-- `chessboard_raw_corners.png` - All corner detections
-- `chessboard_corners.png` - Selected 4 corners
+**Visualizations Generated**:
+- `chessboard_raw_corners.png` - All corner detections with confidence
+- `chessboard_corners.png` - Selected 4 corners labeled TL/TR/BR/BL
 - `chessboard_transformed.png` - Perspective-corrected board
-- `chessboard_detections.png` - Piece detections with confidence
+- `chessboard_detections.png` - Piece detections with confidence colors
 - `chessboard_grid.png` - 8x8 grid overlay
+- `guidance_overlay.png` - Color-coded action highlights (🟢 pickup, 🔵 place, 🔴 capture, 🟠 graveyard)
 
 ### Camera System
 
@@ -144,6 +147,39 @@ gripper_frame = cameras.get_gripper_frame()
 overlay = cameras.get_overlay_frame()
 
 cameras.stop()
+```
+
+### Overlay Generation Workflow
+
+```bash
+# 1. Detect and calculate (updates state cache)
+python -c "from guidance import GuidanceSystem; \
+    GuidanceSystem().detect_and_calculate('board.png')"
+
+# 2. Generate overlay for current action
+python generate_overlay.py
+
+# 3. Check cache status
+python generate_overlay.py --status
+
+# 4. Generate overlay for specific action
+python generate_overlay.py --action 1
+```
+
+### State Cache Management
+
+```python
+from utils import StateCache
+
+cache = StateCache()
+
+# Robot updates after picking up piece
+cache.update({"robot_state": {"holding_piece": True}}, source="robot")
+cache.advance_action()
+
+# Generate new overlay for next action
+import subprocess
+subprocess.run(["python", "generate_overlay.py"])
 ```
 
 ### Training YOLO Models
@@ -212,6 +248,10 @@ robot:
 **Guidance Module**:
 - [x] `board_detector.py` - Full board detection pipeline with visualizations
 - [x] `move_calculator.py` - Stockfish UCI integration
+- [x] `move_interpreter.py` - Move decomposition into robot actions
+- [x] `coordinate_mapper.py` - Chess square to pixel mapping
+- [x] `highlight_renderer.py` - Color-coded overlay rendering
+- [x] `guidance_system.py` - High-level orchestrator
 - [x] Training tools moved to `guidance/training/`
 - [x] `best_move_demo.py` - Working demo script
 
@@ -221,17 +261,15 @@ robot:
 - [x] `overlay_generator.py` - Flag-based overlay management
 - [x] `camera_manager.py` - Unified stream interface
 
+**Utils Module**:
+- [x] `state_cache.py` - Thread-safe JSON cache for multi-source updates
+
+**Scripts**:
+- [x] `generate_overlay.py` - CLI driver for overlay generation
+
 **Documentation**:
 - [x] Module READMEs for all 4 modules
 - [x] Root README (this file)
-
-### 🚧 In Progress
-
-**Guidance Module**:
-- [ ] `coordinate_mapper.py` - Chess square to pixel mapping
-- [ ] `move_interpreter.py` - Move type detection
-- [ ] `highlight_renderer.py` - Visual overlay generation
-- [ ] `guidance_system.py` - Unified orchestrator
 
 ### ⏳ To Do
 

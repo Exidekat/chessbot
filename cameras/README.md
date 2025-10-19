@@ -76,10 +76,15 @@ overlay = overlay_gen.get_overlay()  # Returns BGR numpy array or None
 
 **Signaling Protocol** (used by guidance system):
 ```python
-# Guidance system side
-overlay_gen.save_overlay(highlighted_image)  # Saves PNG and creates flag
-# or
-overlay_gen.signal_overlay_ready()  # Just updates flag timestamp
+# Guidance system generates overlay
+from guidance import GuidanceSystem
+
+guidance = GuidanceSystem()
+guidance.generate_overlay_from_cache()
+# → Saves data/guidance_overlay.png
+# → Creates data/overlay_ready.flag
+
+# Camera automatically picks up new overlay on next get_overlay_frame()
 ```
 
 **Resource Efficiency:**
@@ -136,24 +141,29 @@ manager.stop()
 
 ### With Guidance System
 ```python
-from cameras import CameraManager, OverlayGenerator
-from guidance import BoardDetector
+from cameras import CameraManager
+from guidance import GuidanceSystem
 
 cameras = CameraManager(config)
 cameras.start()
 
-detector = BoardDetector()
-overlay_gen = OverlayGenerator()
+guidance = GuidanceSystem()
 
 # Capture board state
 global_frame = cameras.get_global_frame()
 cv2.imwrite("temp_board.png", global_frame)
 
-# Detect and generate overlay
-fen, transformed = detector.detect_board_state("temp_board.png", debug=True)
+# Detect, calculate, and update cache
+fen, best_move, actions = guidance.detect_and_calculate(
+    "temp_board.png",
+    update_cache=True
+)
 
-# Signal overlay ready (guidance could highlight best move squares)
-overlay_gen.save_overlay(transformed)  # Cameras will pick it up on next get_overlay_frame()
+# Generate overlay with action highlights
+guidance.generate_overlay_from_cache()
+
+# Camera automatically loads new overlay
+overlay = cameras.get_overlay_frame()  # Returns highlighted board
 ```
 
 ### With Robot Control
