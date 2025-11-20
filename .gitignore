@@ -3,6 +3,7 @@
 
 # downloaded & cached data
 data/
+results/
 viz/site/package-lock.json
 
 # Python
