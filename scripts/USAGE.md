@@ -83,6 +83,24 @@ cp data/training/runs/corner_finetune/weights/best.pt data/best_corners.pt
 # Step 5: Test fine-tuned corner detection model
 python scripts/best_move_demo.py --debug
 
+## Piece Detection Fine-tuning (Fix Piece Recognition Issues)
+
+# Step 1: Collect 30+ training photos with VARIED piece positions on board
+python scripts/collect_piece_training_photos.py --device /dev/video0 --count 30
+
+# Step 2: Label pieces in each photo (draw bounding boxes, assign classes)
+python scripts/label_pieces.py --input data/training/piece_photos
+
+# Step 3: Fine-tune the piece detection model on your labeled data (30-60 min on CPU)
+python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml
+
+# Step 4: Backup original model and deploy fine-tuned model
+mv data/best_transformed_detection.pt data/best_transformed_detection_original.pt
+cp data/training/runs/piece_finetune/weights/best.pt data/best_transformed_detection.pt
+
+# Step 5: Test fine-tuned piece detection model
+python scripts/best_move_demo.py --debug
+
 ## Visualization Tool
 
 # Start visualization tool in development mode (React HMR + FastAPI reload)

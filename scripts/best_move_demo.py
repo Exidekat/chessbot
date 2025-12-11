@@ -214,7 +214,7 @@ def capture_yuyv_720p(device_path, output_path):
         cap.release()
         return False
 
-    # Save image
+    # Save image directly (no transformations - same as training scripts)
     cv2.imwrite(str(output_path), frame)
     print(f"[CameraCapture] [OK] Photo captured: {output_path}")
     print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
