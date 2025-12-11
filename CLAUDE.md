@@ -20,8 +20,11 @@ ChessBot is a modular chess robot system with YOLO-based computer vision, multi-
 
 ### Demo and Testing
 ```bash
-# Run board detection and move calculation demo
-python scripts/best_move_demo.py --image data/chessboardv2.png --debug
+# Run full pipeline: capture YUYV 720p + detect + calculate move
+python scripts/best_move_demo.py --debug
+
+# Run with specific camera
+python scripts/best_move_demo.py --debug --device /dev/video0
 
 # Generate overlay from state cache
 python scripts/generate_overlay.py

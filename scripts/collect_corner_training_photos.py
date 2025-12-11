@@ -68,10 +68,18 @@ def capture_training_photos(device_path, output_dir, count=20):
         print(f"[TrainingCapture] [X] Failed to open camera")
         return False
 
+    # Explicitly set resolution in OpenCV (v4l2-ctl may not persist)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
     # Verify resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[TrainingCapture] Camera resolution: {width}x{height}")
+
+    if width != 1280 or height != 720:
+        print(f"[TrainingCapture] Warning: Expected 1280x720, got {width}x{height}")
+        print(f"[TrainingCapture] Camera may not support YUYV at 720p, using available resolution")
 
     # Warm up
     print("[TrainingCapture] Warming up camera...")
