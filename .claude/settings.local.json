@@ -10,7 +10,13 @@
       "Bash(identify chessboardv2.png)",
       "Bash(python main.py --image data/chessboardv2.png --no-bestmove --debug)",
       "Bash(python tools/analyze_test_board.py --image data/chessboardv2.png)",
-      "Bash(python tools/analyze_test_board.py --image data/chessboardv2.png --preprocessing)"
+      "Bash(python tools/analyze_test_board.py --image data/chessboardv2.png --preprocessing)",
+      "Bash(lsmod:*)",
+      "Bash(lsusb:*)",
+      "Bash(python scripts/capture_photo.py:*)",
+      "Bash(v4l2-ctl:*)",
+      "Bash(python scripts/best_move_demo.py:*)",
+      "Bash(PYTHONPATH=/home/exidekat/chessbot python:*)"
     ],
     "deny": [],
     "ask": []

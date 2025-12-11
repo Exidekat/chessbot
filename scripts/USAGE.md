@@ -10,11 +10,14 @@ python scripts/create_config.py
 
 ## Camera Capture
 
-# Capture photo with auto-detected camera (saves to results/ with timestamp)
+# Capture photo with auto-detected camera (1920x1080, saves to results/ with timestamp)
 python scripts/capture_photo.py
 
 # Capture photo with specific camera device
 python scripts/capture_photo.py --device /dev/video0
+
+# Capture photo with custom resolution (4000x3000 maximum for 4K camera)
+python scripts/capture_photo.py --device /dev/video0 --width 4000 --height 3000
 
 # Capture photo with custom output in results/ directory
 python scripts/capture_photo.py --output results/my_board.png
@@ -22,28 +25,31 @@ python scripts/capture_photo.py --output results/my_board.png
 # Capture photo immediately without preview window
 python scripts/capture_photo.py --no-preview
 
-# Capture photo with specific device and custom output
-python scripts/capture_photo.py --device /dev/video0 --output results/board_image.png
+# Capture photo with specific device, resolution, and output
+python scripts/capture_photo.py --device /dev/video0 --width 2592 --height 1944 --output results/board_image.png
 
 ## Demo and Testing
 
-# Run board detection and move calculation demo with default image
+# Run full pipeline: capture YUYV 720p photo + detect board + calculate best move (auto-detects camera)
 python scripts/best_move_demo.py
 
-# Run demo with custom image
-python scripts/best_move_demo.py --image data/chessboardv2.png
+# Run full pipeline with debug visualizations enabled
+python scripts/best_move_demo.py --debug
 
-# Run demo with debug visualizations enabled
-python scripts/best_move_demo.py --image data/chessboardv2.png --debug
+# Run full pipeline with specific camera device
+python scripts/best_move_demo.py --device /dev/video0
 
-# Run demo without calculating best move (no Stockfish required)
-python scripts/best_move_demo.py --image data/chessboardv2.png --no-bestmove
+# Run full pipeline without calculating best move (no Stockfish required)
+python scripts/best_move_demo.py --no-bestmove
 
-# Run demo with custom corner detection parameters
-python scripts/best_move_demo.py --image data/chessboardv2.png --debug --corner-conf 0.05 --min-corner-dist 40
+# Run full pipeline with custom corner detection parameters (optimized for YUYV 720p)
+python scripts/best_move_demo.py --debug --corner-conf 0.005 --min-corner-dist 30
 
-# Run demo with custom engine time limit
-python scripts/best_move_demo.py --image data/chessboardv2.png --time 2.0
+# Run full pipeline with custom engine time limit
+python scripts/best_move_demo.py --time 2.0
+
+# Run full pipeline with all custom parameters
+python scripts/best_move_demo.py --device /dev/video0 --debug --corner-conf 0.005 --min-corner-dist 30 --time 2.0
 
 ## Overlay Generation
 
@@ -58,6 +64,24 @@ python scripts/generate_overlay.py --status
 
 # Generate overlay with custom cache path
 python scripts/generate_overlay.py --cache data/state_cache.json
+
+## Corner Detection Fine-tuning (Fix Corner Detection Issues)
+
+# Step 1: Collect 20+ training photos of YOUR chessboard (vary angles, lighting, positions)
+python scripts/collect_corner_training_photos.py --device /dev/video0 --count 20
+
+# Step 2: Label the 4 corners in each photo (interactive clicking tool)
+python scripts/label_corners.py --input data/training/board_photos
+
+# Step 3: Fine-tune the corner detection model on your labeled data (15-30 min on CPU)
+python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml
+
+# Step 4: Backup original model and deploy fine-tuned model
+mv data/best_corners.pt data/best_corners_original.pt
+cp data/training/runs/corner_finetune/weights/best.pt data/best_corners.pt
+
+# Step 5: Test fine-tuned corner detection model
+python scripts/best_move_demo.py --debug
 
 ## Visualization Tool
 

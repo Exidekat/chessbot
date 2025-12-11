@@ -2,20 +2,27 @@
 Best Move Demo - Unified Guidance System
 
 This script demonstrates the new guidance module architecture:
-1. Detect board state from an image using BoardDetector
-2. Calculate best move using MoveCalculator
-3. Display results
+1. Capture fresh YUYV 720p photo from camera
+2. Detect board state from the image using BoardDetector
+3. Calculate best move using MoveCalculator
+4. Display results
 
 This replaces the old main.py but uses the new modular guidance system.
 
 Usage:
-    python best_move_demo.py [--image IMAGE_PATH] [--engine ENGINE_PATH]
+    python best_move_demo.py [--engine ENGINE_PATH] [--device CAMERA_DEVICE]
 """
 
 import argparse
 import sys
 from pathlib import Path
 import chess
+import cv2
+import subprocess
+from datetime import datetime
+
+# Add parent directory to path for module imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import from new guidance module
 from guidance.board_detector import BoardDetector
@@ -31,16 +38,193 @@ def print_board(board: chess.Board):
     print("=" * 40)
 
 
+def get_available_cameras():
+    """
+    Detect all available USB cameras.
+
+    Returns:
+        list: List of tuples (device_path, device_info)
+    """
+    cameras = []
+
+    # Method 1: Try v4l2 (Linux)
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "--list-devices"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            current_device_name = None
+
+            for line in lines:
+                if line and not line.startswith('\t') and not line.startswith(' '):
+                    # Device name line
+                    current_device_name = line.strip().rstrip(':')
+                elif line.strip().startswith('/dev/video'):
+                    # Device path line
+                    device_path = line.strip()
+                    if current_device_name:
+                        cameras.append((device_path, current_device_name))
+
+            return cameras
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 2: Fallback - try opening /dev/video* devices
+    print("v4l2-ctl not available, using fallback camera detection...")
+    for i in range(10):
+        device_path = f"/dev/video{i}"
+        if Path(device_path).exists():
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                # Try to read a frame to verify it's a real camera
+                ret, _ = cap.read()
+                if ret:
+                    cameras.append((device_path, f"Camera {i}"))
+                cap.release()
+
+    return cameras
+
+
+def select_camera(cameras):
+    """
+    Prompt user to select a camera from the list.
+
+    Args:
+        cameras: List of (device_path, device_info) tuples
+
+    Returns:
+        str: Selected device path
+    """
+    print("\n" + "=" * 60)
+    print("Multiple cameras detected:")
+    print("=" * 60)
+
+    for idx, (device_path, device_info) in enumerate(cameras, 1):
+        print(f"  [{idx}] {device_path} - {device_info}")
+
+    print("=" * 60)
+
+    while True:
+        try:
+            choice = input(f"\nSelect camera [1-{len(cameras)}]: ").strip()
+            idx = int(choice) - 1
+
+            if 0 <= idx < len(cameras):
+                selected = cameras[idx][0]
+                print(f"[OK] Selected: {selected}")
+                return selected
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(cameras)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+        except KeyboardInterrupt:
+            print("\n\n[X] Cancelled by user")
+            sys.exit(1)
+
+
+def get_camera_index_from_device(device_path):
+    """
+    Extract camera index from device path (e.g., /dev/video0 -> 0).
+
+    Args:
+        device_path: Path to video device
+
+    Returns:
+        int: Camera index for OpenCV
+    """
+    try:
+        # Extract number from /dev/video{N}
+        if device_path.startswith('/dev/video'):
+            return int(device_path.replace('/dev/video', ''))
+    except ValueError:
+        pass
+
+    # Fallback: try to parse as integer
+    try:
+        return int(device_path)
+    except ValueError:
+        print(f"[X] Cannot parse device path: {device_path}")
+        sys.exit(1)
+
+
+def capture_yuyv_720p(device_path, output_path):
+    """
+    Capture a 1280x720 YUYV photo from the specified camera.
+
+    Args:
+        device_path: Camera device path
+        output_path: Path to save the captured image
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    camera_index = get_camera_index_from_device(device_path)
+
+    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
+
+    # Configure camera for YUYV format using v4l2-ctl
+    print(f"[CameraCapture] Setting YUYV 1280x720 format...")
+    try:
+        subprocess.run([
+            "v4l2-ctl",
+            f"--device={device_path}",
+            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV"
+        ], check=True, capture_output=True, text=True)
+        print(f"[CameraCapture] [OK] Format set to YUYV 1280x720")
+    except subprocess.CalledProcessError as e:
+        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
+        print(f"[CameraCapture] Continuing with OpenCV defaults...")
+
+    # Open camera with V4L2 backend
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+
+    if not cap.isOpened():
+        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
+        return False
+
+    # Verify resolution
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[CameraCapture] Camera resolution: {width}x{height}")
+
+    # Warm up camera
+    print("[CameraCapture] Warming up camera (5 frames)...")
+    for _ in range(5):
+        cap.read()
+
+    # Capture frame
+    print("[CameraCapture] Capturing photo...")
+    ret, frame = cap.read()
+
+    if not ret:
+        print("[CameraCapture] [X] Failed to read frame from camera")
+        cap.release()
+        return False
+
+    # Save image
+    cv2.imwrite(str(output_path), frame)
+    print(f"[CameraCapture] [OK] Photo captured: {output_path}")
+    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
+
+    cap.release()
+    return True
+
+
 def main():
     """Main demo driver."""
     parser = argparse.ArgumentParser(
-        description="Best Move Demo - Unified Guidance System"
+        description="Best Move Demo - Unified Guidance System with Live Camera Capture"
     )
     parser.add_argument(
-        "--image",
+        "--device",
         type=str,
-        default="data/chessboard.png",
-        help="Path to the chess board image (default: data/chessboard.png)"
+        default=None,
+        help="Specific camera device (e.g., /dev/video0 or 0). If not specified, auto-detects."
     )
     parser.add_argument(
         "--engine",
@@ -67,40 +251,80 @@ def main():
     parser.add_argument(
         "--corner-conf",
         type=float,
-        default=0.1,
-        help="Confidence threshold for corner detection (0.0-1.0, default: 0.1)"
+        default=0.005,
+        help="Confidence threshold for corner detection (0.0-1.0, default: 0.005)"
     )
     parser.add_argument(
         "--min-corner-dist",
         type=float,
-        default=50.0,
-        help="Minimum distance between corners in pixels (default: 50.0)"
+        default=30.0,
+        help="Minimum distance between corners in pixels (default: 30.0)"
     )
 
     args = parser.parse_args()
 
-    # Check if image exists
-    image_path = Path(args.image)
-    if not image_path.exists():
-        print(f"Error: Image not found at {image_path}")
-        print(f"Please ensure the test image exists at {args.image}")
-        return 1
-
     print("=" * 60)
     print("Best Move Demo - Unified Guidance System")
     print("=" * 60)
-    print(f"Image: {image_path}")
     print(f"Debug mode: {'enabled' if args.debug else 'disabled'}")
     if args.debug:
         print(f"Corner confidence: {args.corner_conf}")
         print(f"Min corner distance: {args.min_corner_dist}")
     print()
 
+    # Step 1: Camera selection and photo capture
+    print("=" * 60)
+    print("STAGE 1: Camera Capture (YUYV 1280x720)")
+    print("=" * 60)
+
+    # Determine which camera to use
+    if args.device:
+        # User specified device
+        device_path = args.device
+        print(f"Using specified device: {device_path}")
+    else:
+        # Auto-detect cameras
+        print("Detecting available cameras...")
+        cameras = get_available_cameras()
+
+        if not cameras:
+            print("\n[X] No cameras found!")
+            print("\nTroubleshooting:")
+            print("  1. Check camera is connected via USB")
+            print("  2. Check camera permissions: ls -l /dev/video*")
+            print("  3. Add user to video group: sudo usermod -a -G video $USER")
+            print("  4. Verify with: v4l2-ctl --list-devices")
+            return 1
+
+        if len(cameras) == 1:
+            # Auto-select single camera
+            device_path = cameras[0][0]
+            print(f"[OK] Auto-selected camera: {device_path} - {cameras[0][1]}")
+        else:
+            # Multiple cameras - prompt user
+            device_path = select_camera(cameras)
+
+    # Capture photo in YUYV 720p format
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    image_path = Path("data") / f"chessboard_capture_{timestamp}.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+
+    success = capture_yuyv_720p(device_path, image_path)
+    if not success:
+        print("\n[X] Photo capture failed")
+        return 1
+
+    print("\n" + "=" * 60)
+    print("STAGE 2: Board Detection & Move Calculation")
+    print("=" * 60)
+    print(f"Image: {image_path}")
+    print()
+
     try:
         # Initialize BoardDetector
         print("Initializing BoardDetector...")
         detector = BoardDetector()
-        print("✓ BoardDetector initialized")
+        print("[OK] BoardDetector initialized")
         print()
 
         # Detect board state
@@ -111,14 +335,14 @@ def main():
             min_corner_distance=args.min_corner_dist,
             debug=args.debug
         )
-        print("✓ Board state detected")
+        print("[OK] Board state detected")
         print()
 
         # Create chess board from FEN
         try:
             board = chess.Board(fen)
         except ValueError:
-            print(f"✗ Invalid FEN: {fen}")
+            print(f"[X] Invalid FEN: {fen}")
             print("   Creating empty board")
             board = chess.Board(None)
 
@@ -134,7 +358,7 @@ def main():
         # Calculate best move if requested
         if not args.no_bestmove:
             print("\n" + "=" * 60)
-            print("Calculating best move:")
+            print("STAGE 3: Best Move Calculation")
             print("=" * 60)
             print(f"Engine: {args.engine}")
             print(f"Time limit: {args.time}s")
@@ -151,7 +375,7 @@ def main():
                 )
 
                 if best_move:
-                    print(f"✓ Best move: {best_move}")
+                    print(f"[OK] Best move: {best_move}")
                     print(f"  UCI notation: {best_move.uci()}")
 
                     # Show the move in algebraic notation
@@ -165,30 +389,31 @@ def main():
                     print(board)
                     print("-" * 60)
                 else:
-                    print("✗ No legal moves available")
+                    print("[X] No legal moves available")
 
             except FileNotFoundError:
-                print(f"✗ Engine not found at '{args.engine}'")
+                print(f"[X] Engine not found at '{args.engine}'")
                 print("  Install stockfish or specify engine path with --engine")
                 print("  On macOS: brew install stockfish")
                 print("  On Ubuntu: sudo apt-get install stockfish")
                 print("  On Windows: Download from https://stockfishchess.org/download/")
             except Exception as e:
-                print(f"✗ Error calculating best move: {e}")
+                print(f"[X] Error calculating best move: {e}")
 
         print("\n" + "=" * 60)
-        print("✓ Demo completed successfully!")
+        print("[OK] Demo completed successfully!")
         print("=" * 60)
+        print(f"\nCaptured image saved: {image_path.absolute()}")
 
         return 0
 
     except FileNotFoundError as e:
-        print(f"✗ Error: {e}")
+        print(f"[X] Error: {e}")
         print("\nPlease run download.py first to set up the model files:")
-        print("  python download.py")
+        print("  python scripts/download.py")
         return 1
     except Exception as e:
-        print(f"✗ Unexpected error: {e}")
+        print(f"[X] Unexpected error: {e}")
         import traceback
         traceback.print_exc()
         return 1

@@ -135,7 +135,7 @@ def get_camera_index_from_device(device_path):
         sys.exit(1)
 
 
-def capture_photo(device_path, output_path, preview=True):
+def capture_photo(device_path, output_path, preview=True, width=None, height=None):
     """
     Capture a photo from the specified camera.
 
@@ -143,6 +143,8 @@ def capture_photo(device_path, output_path, preview=True):
         device_path: Camera device path
         output_path: Path to save the captured image
         preview: Whether to show preview window
+        width: Optional resolution width
+        height: Optional resolution height
 
     Returns:
         bool: True if successful, False otherwise
@@ -150,25 +152,37 @@ def capture_photo(device_path, output_path, preview=True):
     camera_index = get_camera_index_from_device(device_path)
 
     print(f"\nOpening camera: {device_path} (index: {camera_index})")
-    cap = cv2.VideoCapture(camera_index)
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
 
     if not cap.isOpened():
         print(f"✗ Failed to open camera: {device_path}")
         return False
 
-    # Set camera properties for better quality
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    # Set resolution (defaults to 1920x1080 for good quality without USB bandwidth issues)
+    if width is not None and height is not None:
+        print(f"Setting resolution: {width}x{height}")
+        # Use MJPEG for high resolutions, increase buffer size to avoid corruption
+        if width >= 1920 or height >= 1080:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffering
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
     # Get actual resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Camera resolution: {width}x{height}")
 
-    # Warm up camera (capture a few frames)
+    # Warm up camera (capture more frames for high-res to stabilize)
     print("Warming up camera...")
-    for _ in range(5):
+    warmup_frames = 10 if (width >= 3000 or height >= 2000) else 5
+    for _ in range(warmup_frames):
         cap.read()
+
+    # Extra delay for high resolution cameras
+    if width >= 3000 or height >= 2000:
+        import time
+        time.sleep(0.5)
 
     if preview:
         print("\nPreview mode:")
@@ -240,6 +254,18 @@ def main():
         action="store_true",
         help="Capture immediately without preview window"
     )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1920,
+        help="Camera resolution width (default: 1920)"
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=1080,
+        help="Camera resolution height (default: 1080)"
+    )
 
     args = parser.parse_args()
 
@@ -287,7 +313,13 @@ def main():
 
     # Capture photo
     print("\n" + "=" * 60)
-    success = capture_photo(device_path, output_path, preview=not args.no_preview)
+    success = capture_photo(
+        device_path,
+        output_path,
+        preview=not args.no_preview,
+        width=args.width,
+        height=args.height
+    )
     print("=" * 60)
 
     if success:
