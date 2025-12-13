@@ -53,10 +53,14 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=64
     print("This may take 30-60 minutes depending on dataset size and hardware")
     print("(Piece detection requires more epochs than corner detection)")
     print()
-    print("Data augmentation enabled:")
-    print("  - Horizontal flip: 50% (doubles effective dataset)")
-    print("  - Color variation: HSV adjustments")
-    print("  - Geometric: Small rotation, translation, scale")
+    print("UPDATED CONFIGURATION - Based on corner detection success:")
+    print("  - STRONG brightness augmentation (hsv_v=0.7, was 0.4)")
+    print("  - Classification priority (cls=1.0, box=0.5)")
+    print("  - Maximized augmentation (mosaic=1.0, mixup=0.2)")
+    print("  - More rotation variation (degrees=15.0, was 5.0)")
+    print("  - Lower final LR (lrf=0.001, was 0.01)")
+    print("  - Image size 1280 (matches 1280x720 training images)")
+    print("  - GPU training batch=8 (1280 uses 4x memory vs 640)")
     print()
 
     results = model.train(
@@ -66,29 +70,38 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=64
         project=output_dir,
         name="piece_finetune",
         exist_ok=True,
-        patience=15,  # Early stopping patience (more than corner detection)
+        patience=30,  # Increased from 15 - allow more convergence
         save=True,
         plots=True,
-        device=0,  # Use CUDA GPU (device 0)
-        batch=16,  # Larger batch for GPU
+        device=0,  # RTX A5500 GPU
+        batch=8,  # REDUCED from 32 - 1280x1280 uses 4x memory vs 640x640
         optimizer='Adam',
         lr0=0.001,  # Lower learning rate for fine-tuning
-        lrf=0.01,
+        lrf=0.001,  # FIXED: was 0.01 - better convergence
         weight_decay=0.0005,
         warmup_epochs=5,
         amp=True,  # Enable AMP for GPU acceleration
-        # Data augmentation (important for piece detection)
+
+        # CRITICAL: Loss weights - CONSERVATIVE for small dataset
+        box=0.5,    # Moderate (was 0.05 - too low caused instability)
+        cls=1.0,    # Moderate (was 2.5 - too high caused cls_loss explosion)
+        dfl=1.0,    # Standard
+
+        # Data augmentation - MAXIMIZED for small dataset
         hsv_h=0.015,  # Hue augmentation
         hsv_s=0.7,    # Saturation augmentation
-        hsv_v=0.4,    # Value augmentation
-        degrees=5.0,  # Small rotation (boards are mostly aligned)
-        translate=0.1,
-        scale=0.2,
+        hsv_v=0.7,    # FIXED: was 0.4 - STRONG brightness (corner success factor #1)
+        degrees=15.0,  # INCREASED from 5.0 - more rotation variation
+        translate=0.15,  # Increased from 0.1
+        scale=0.3,    # Increased from 0.2
         shear=0.0,
         perspective=0.0,
         flipud=0.0,   # Don't flip vertically (would swap board up/down)
         fliplr=0.5,   # Horizontal flip 50% (doubles dataset, maintains left/right symmetry)
-        mosaic=0.5,   # Mosaic augmentation probability
+        mosaic=1.0,   # FIXED: was 0.5 - ALWAYS use mosaic for small dataset
+        mixup=0.2,    # NEW: Enable mixup augmentation
+        copy_paste=0.1,  # NEW: Enable copy-paste augmentation
+        close_mosaic=10,  # Disable mosaic in last 10 epochs for stability
     )
 
     print("\n" + "=" * 60)
@@ -138,14 +151,14 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=100,
-        help="Number of training epochs (default: 100)"
+        default=150,
+        help="Number of training epochs (default: 150, increased from 100)"
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=640,
-        help="Image size for training (default: 640)"
+        default=1280,
+        help="Image size for training (default: 1280 to match 1280x720 images)"
     )
 
     args = parser.parse_args()

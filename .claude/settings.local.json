@@ -16,7 +16,15 @@
       "Bash(python scripts/capture_photo.py:*)",
       "Bash(v4l2-ctl:*)",
       "Bash(python scripts/best_move_demo.py:*)",
-      "Bash(PYTHONPATH=/home/exidekat/chessbot python:*)"
+      "Bash(PYTHONPATH=/home/exidekat/chessbot python:*)",
+      "WebSearch",
+      "Bash(for i in {0..11})",
+      "Bash(done)",
+      "WebFetch(domain:docs.ultralytics.com)",
+      "Bash(xargs:*)",
+      "Bash(for class in {0..11})",
+      "Bash(do echo -n 'Class $class: ')",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []

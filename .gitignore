@@ -41,5 +41,6 @@ ENV/
 *.swo
 *~
 
-# YOLO output directories
+# YOLO
+yolo11n.pt
 runs/

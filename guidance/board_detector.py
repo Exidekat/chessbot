@@ -477,12 +477,12 @@ class BoardDetector:
 
         results = self.piece_model.predict(
             source=temp_path,
-            conf=0.35,  # Base confidence threshold
+            conf=0.50,  # INCREASED from 0.35 - reduce false positives and duplicates
             iou=0.7,    # NMS IoU threshold (raised from 0.5 to reduce duplicate detections)
-            augment=True,  # Enable test-time augmentation for better detection
+            augment=False,  # DISABLED - was True, causes duplicates and 2-3x slower
             verbose=False,
-            imgsz=640,  # Ensure consistent input size
-            device=0  # Use CUDA GPU (device 0)
+            imgsz=1280,  # UPDATED from 640 - match training resolution (1280x720 images)
+            device=0  # RTX A5500 GPU for fast inference
         )
 
         boxes = results[0].boxes
@@ -511,20 +511,20 @@ class BoardDetector:
             return detections, boxes
 
         # Class-specific confidence thresholds
-        # Pawns (class 3 and 9) require higher confidence to reduce false positives
+        # Pawns and bishops need higher thresholds due to misclassification
         class_thresholds = {
-            0: 0.35,  # black bishop
-            1: 0.35,  # black king
-            2: 0.35,  # black knight
-            3: 0.45,  # black pawn - HIGHER threshold to reduce misclassification
-            4: 0.35,  # black queen
-            5: 0.35,  # black rook
-            6: 0.35,  # white bishop
-            7: 0.35,  # white king
-            8: 0.35,  # white knight
-            9: 0.45,  # white pawn - HIGHER threshold to reduce misclassification
-            10: 0.35, # white queen
-            11: 0.35, # white rook
+            0: 0.50,  # black bishop - INCREASED (was 0.35)
+            1: 0.40,  # black king
+            2: 0.45,  # black knight
+            3: 0.60,  # black pawn - INCREASED (was 0.45) - reduces false positives
+            4: 0.40,  # black queen - lower (underrepresented in training)
+            5: 0.45,  # black rook
+            6: 0.50,  # white bishop - INCREASED (was 0.35)
+            7: 0.40,  # white king
+            8: 0.45,  # white knight
+            9: 0.60,  # white pawn - INCREASED (was 0.45) - reduces false positives
+            10: 0.40, # white queen - lower (underrepresented in training)
+            11: 0.45, # white rook
         }
 
         # Filter detections based on class-specific thresholds

@@ -314,6 +314,18 @@ def create_yolo_dataset(input_dir, output_dir):
     for idx, image_file in enumerate(image_files):
         print(f"\n[{idx+1}/{len(image_files)}] Processing: {image_file.name}")
 
+        # Check if already labeled (skip to preserve existing labels)
+        label_dest = labels_dir / (image_file.stem + ".txt")
+        if label_dest.exists():
+            print(f"  [Already labeled] Skipping (label exists: {label_dest.name})")
+            labeled_count += 1
+            # Count existing pieces
+            with open(label_dest, 'r') as f:
+                existing_pieces = len([line for line in f if line.strip()])
+            total_pieces += existing_pieces
+            print(f"    Existing labels: {existing_pieces} pieces")
+            continue
+
         try:
             # Label pieces
             labeler = PieceLabeler(image_file)
@@ -334,9 +346,8 @@ def create_yolo_dataset(input_dir, output_dir):
             # Convert to YOLO format
             yolo_labels = convert_to_yolo_format(boxes, img_width, img_height)
 
-            # Save image and label
+            # Save image and label (label_dest already defined above)
             image_dest = images_dir / image_file.name
-            label_dest = labels_dir / (image_file.stem + ".txt")
 
             # Copy image
             shutil.copy(image_file, image_dest)

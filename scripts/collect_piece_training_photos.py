@@ -39,26 +39,30 @@ def get_camera_index_from_device(device_path):
 
 def capture_training_photos(device_path, output_dir, count=30):
     """
-    Capture training photos interactively.
+    Capture training photos interactively using 4K MJPEG → 720p downscale.
 
     Args:
         device_path: Camera device path
         output_dir: Directory to save photos
         count: Number of photos to capture
     """
+    import gc
+    import time
+
     camera_index = get_camera_index_from_device(device_path)
 
     print(f"\n[TrainingCapture] Opening camera: {device_path}")
 
-    # Configure camera for YUYV format
-    print(f"[TrainingCapture] Setting YUYV 1280x720 format...")
+    # Configure camera for MJPEG 4K format (same as best_move_demo.py)
+    print(f"[TrainingCapture] Setting MJPEG 3840x2160 @ 30fps format...")
     try:
         subprocess.run([
             "v4l2-ctl",
             f"--device={device_path}",
-            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV"
+            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
+            "--set-parm=30"
         ], check=True, capture_output=True, text=True)
-        print(f"[TrainingCapture] [OK] Format set to YUYV 1280x720")
+        print(f"[TrainingCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
     except subprocess.CalledProcessError as e:
         print(f"[TrainingCapture] Warning: Could not set format: {e}")
 
@@ -69,22 +73,25 @@ def capture_training_photos(device_path, output_dir, count=30):
         print(f"[TrainingCapture] [X] Failed to open camera")
         return False
 
-    # Explicitly set resolution in OpenCV (v4l2-ctl may not persist)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Explicitly set resolution in OpenCV
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
     # Verify resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[TrainingCapture] Camera resolution: {width}x{height}")
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"[TrainingCapture] Camera resolution: {width}x{height} @ {fps}fps")
 
-    if width != 1280 or height != 720:
-        print(f"[TrainingCapture] Warning: Expected 1280x720, got {width}x{height}")
-        print(f"[TrainingCapture] Camera may not support YUYV at 720p, using available resolution")
+    if width != 3840 or height != 2160:
+        print(f"[TrainingCapture] Warning: Expected 3840x2160, got {width}x{height}")
+        print(f"[TrainingCapture] Attempting to continue with available resolution")
 
     # Warm up
     print("[TrainingCapture] Warming up camera...")
-    for _ in range(5):
+    for _ in range(10):
         cap.read()
 
     print("\n" + "=" * 60)
@@ -116,8 +123,10 @@ def capture_training_photos(device_path, output_dir, count=30):
             print("[TrainingCapture] [X] Failed to read frame")
             break
 
+        # Downscale to 720p for display (much faster than displaying 4K)
+        display_frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
+
         # Draw status overlay
-        display_frame = frame.copy()
         status_text = f"Photos: {captured}/{count} - Press SPACE to capture, Q to quit"
         cv2.putText(display_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -133,15 +142,19 @@ def capture_training_photos(device_path, output_dir, count=30):
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord(' '):
-            # Capture photo
+            # Capture photo - downscale 4K to 720p (same as best_move_demo.py)
+            print(f"[TrainingCapture] Capturing photo {captured+1}/{count}...")
+            print(f"[TrainingCapture] Downscaling from {frame.shape[1]}x{frame.shape[0]} to 1280x720...")
+            downscaled = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"board_{captured+1:03d}_{timestamp}.png"
             filepath = output_dir / filename
 
-            cv2.imwrite(str(filepath), frame)
+            cv2.imwrite(str(filepath), downscaled)
             captured += 1
 
-            print(f"[OK] Captured {captured}/{count}: {filename}")
+            print(f"[OK] Captured {captured}/{count}: {filename} (1280x720)")
 
             # Print suggestion for next position
             if captured < count:
@@ -162,8 +175,11 @@ def capture_training_photos(device_path, output_dir, count=30):
             print(f"\n[TrainingCapture] Finished early with {captured} photos")
             break
 
-    cap.release()
+    # Release camera (GC method for WBC-0E01 compatibility)
+    del cap
+    gc.collect()
     cv2.destroyAllWindows()
+    print("[TrainingCapture] Camera released (GC)")
 
     print("\n" + "=" * 60)
     print(f"[OK] Training photo collection complete!")
