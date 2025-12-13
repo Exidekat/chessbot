@@ -69,14 +69,14 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=64
         patience=15,  # Early stopping patience (more than corner detection)
         save=True,
         plots=True,
-        device='cpu',  # Use CPU (change to 0 for GPU if available)
-        batch=8,  # Small batch for CPU
+        device=0,  # Use CUDA GPU (device 0)
+        batch=16,  # Larger batch for GPU
         optimizer='Adam',
         lr0=0.001,  # Lower learning rate for fine-tuning
         lrf=0.01,
         weight_decay=0.0005,
         warmup_epochs=5,
-        amp=False,  # Disable AMP for CPU
+        amp=True,  # Enable AMP for GPU acceleration
         # Data augmentation (important for piece detection)
         hsv_h=0.015,  # Hue augmentation
         hsv_s=0.7,    # Saturation augmentation

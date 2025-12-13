@@ -117,7 +117,7 @@ def train_model(data_yaml: Path, epochs: int = 150, batch_size: int = 16,
         save=True,  # Save checkpoints
         save_period=10,  # Save every N epochs
         cache=False,  # Don't cache images (may use too much RAM)
-        device='cpu',  # Will auto-detect CUDA if available
+        device=0,  # Use CUDA GPU (device 0)
         workers=4,  # Number of dataloader workers
         project='runs/train',  # Project directory
         name='chess_pieces',  # Experiment name

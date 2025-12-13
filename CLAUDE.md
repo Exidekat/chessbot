@@ -418,3 +418,5 @@ python {args for the script execution}
 
 This means we should have exactly 2 lines per script usage. Some scripts may have more than one usage.
 - Cached data, results, and intermediate files should be output to data/ or results/ by default. USAGE examples should reflect this standard.
+- For this project, we have two cameras that will not change resolution at any stage of the pipeline. The first camera is the Global Top camera, which we have set to 1280x720 resolution. We use the 1280x720 image captures from the Global Camera for all of our piece detection (and piece detection data collection, labelling, and finetuning) and all of our corner detection (and corner detection data collection, labelling, and finetuning) Note that for both of these models in our pipeline, images must be 1280x720 for consistency. Our second camera is a Robot Gripper camera, which we have set to 224x224.
+- Our global camera is the WBC-0E01 camera. Our gripper camera is the eMeet C950 camera.

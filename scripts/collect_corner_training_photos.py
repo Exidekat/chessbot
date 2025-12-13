@@ -140,6 +140,11 @@ def capture_training_photos(device_path, output_dir, count=20):
     print(f"Total photos: {captured}")
     print(f"Saved to: {output_dir}")
     print("=" * 60)
+    print()
+    print("Next steps:")
+    print(f"  1. Label corners: python scripts/label_corners.py --input {output_dir} --output data/training/corner_dataset")
+    print(f"  2. Train model: python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml --epochs 100")
+    print("=" * 60)
 
     return True
 

@@ -171,9 +171,19 @@ def create_yolo_dataset(input_dir, output_dir):
     print("=" * 60)
 
     labeled_count = 0
+    skipped_count = 0
 
     for idx, image_file in enumerate(image_files):
         print(f"\n[{idx+1}/{len(image_files)}] Processing: {image_file.name}")
+
+        # Check if already labeled
+        label_dest = labels_dir / (image_file.stem + ".txt")
+        image_dest = images_dir / image_file.name
+
+        if label_dest.exists() and image_dest.exists():
+            print(f"  [Already labeled] Skipping...")
+            skipped_count += 1
+            continue
 
         try:
             # Label corners
@@ -225,7 +235,11 @@ def create_yolo_dataset(input_dir, output_dir):
     print("\n" + "=" * 60)
     print("[OK] Dataset creation complete!")
     print("=" * 60)
-    print(f"Labeled images: {labeled_count}/{len(image_files)}")
+    print(f"Total images: {len(image_files)}")
+    print(f"Already labeled: {skipped_count}")
+    print(f"Newly labeled: {labeled_count}")
+    print(f"Final dataset size: {labeled_count + skipped_count}")
+    print()
     print(f"Images: {images_dir}")
     print(f"Labels: {labels_dir}")
     print(f"Config: {yaml_path}")

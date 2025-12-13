@@ -20,6 +20,8 @@ import chess
 import cv2
 import subprocess
 from datetime import datetime
+import time
+import gc
 
 # Add parent directory to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -152,8 +154,110 @@ def get_camera_index_from_device(device_path):
         sys.exit(1)
 
 
+def capture_4k_downscale(device_path, output_path):
+    """
+    Capture 4K MJPEG video for 1 second, then downscale best frame to 1280x720.
+
+    This approach uses the camera's 4K MJPEG mode (which produces better quality)
+    and downscales to the 720p resolution required by detection models.
+
+    Args:
+        device_path: Camera device path
+        output_path: Path to save the captured image
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    camera_index = get_camera_index_from_device(device_path)
+
+    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
+
+    # Configure camera for MJPEG 3840x2160 (4K)
+    print(f"[CameraCapture] Setting MJPEG 3840x2160 @ 30fps format...")
+    try:
+        subprocess.run([
+            "v4l2-ctl",
+            f"--device={device_path}",
+            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
+            "--set-parm=30"
+        ], check=True, capture_output=True, text=True)
+        print(f"[CameraCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
+    except subprocess.CalledProcessError as e:
+        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
+        print(f"[CameraCapture] Continuing with OpenCV defaults...")
+
+    # Open camera with V4L2 backend
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+
+    if not cap.isOpened():
+        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
+        return False
+
+    # Explicitly set resolution and FPS in OpenCV
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+    # Verify resolution and FPS
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
+
+    if width != 3840 or height != 2160:
+        print(f"[CameraCapture] Warning: Expected 3840x2160, got {width}x{height}")
+        print(f"[CameraCapture] Attempting to continue with available resolution")
+
+    # Capture frames for 1 second
+    print(f"[CameraCapture] Capturing 4K frames for 1 second...")
+    frames = []
+    start_time = time.time()
+    frame_count = 0
+
+    while time.time() - start_time < 1.0:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[CameraCapture] [X] Failed to read frame {frame_count + 1}")
+            del cap
+            gc.collect()
+            return False
+        frames.append(frame)
+        frame_count += 1
+
+    print(f"[CameraCapture] [OK] Captured {len(frames)} 4K frames")
+
+    # Release camera early (before processing)
+    del cap
+    gc.collect()
+    print("[CameraCapture] [OK] Camera released (GC)")
+
+    if not frames:
+        print(f"[CameraCapture] [X] No frames captured")
+        return False
+
+    # Use the middle frame (best chance of avoiding motion blur from start/end)
+    middle_idx = len(frames) // 2
+    best_frame = frames[middle_idx]
+    print(f"[CameraCapture] Using frame {middle_idx + 1}/{len(frames)} (middle frame)")
+
+    # Downscale to 1280x720 using high-quality interpolation
+    print(f"[CameraCapture] Downscaling from {best_frame.shape[1]}x{best_frame.shape[0]} to 1280x720...")
+    downscaled = cv2.resize(best_frame, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
+
+    # Save downscaled image
+    cv2.imwrite(str(output_path), downscaled)
+    print(f"[CameraCapture] [OK] Photo saved: {output_path}")
+    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
+
+    return True
+
+
 def capture_yuyv_720p(device_path, output_path):
     """
+    DEPRECATED: Direct 720p YUYV capture (kept for fallback).
+    Use capture_4k_downscale() instead for better quality.
+
     Capture a 1280x720 YUYV photo from the specified camera.
 
     Args:
@@ -167,15 +271,16 @@ def capture_yuyv_720p(device_path, output_path):
 
     print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
 
-    # Configure camera for YUYV format using v4l2-ctl
-    print(f"[CameraCapture] Setting YUYV 1280x720 format...")
+    # Configure camera for YUYV 1280x720 (uncompressed)
+    print(f"[CameraCapture] Setting YUYV 1280x720 @ 10fps format...")
     try:
         subprocess.run([
             "v4l2-ctl",
             f"--device={device_path}",
-            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV"
+            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV",
+            "--set-parm=10"
         ], check=True, capture_output=True, text=True)
-        print(f"[CameraCapture] [OK] Format set to YUYV 1280x720")
+        print(f"[CameraCapture] [OK] Format set to YUYV 1280x720 @ 10fps")
     except subprocess.CalledProcessError as e:
         print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
         print(f"[CameraCapture] Continuing with OpenCV defaults...")
@@ -187,39 +292,45 @@ def capture_yuyv_720p(device_path, output_path):
         print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
         return False
 
-    # Explicitly set resolution in OpenCV (v4l2-ctl may not persist)
+    # Explicitly set resolution and FPS in OpenCV (v4l2-ctl may not persist)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 10)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
 
-    # Verify resolution
+    # Verify resolution and FPS
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[CameraCapture] Camera resolution: {width}x{height}")
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
 
     if width != 1280 or height != 720:
         print(f"[CameraCapture] Warning: Expected 1280x720, got {width}x{height}")
         print(f"[CameraCapture] Camera may not support YUYV at 720p, using available resolution")
 
-    # Warm up camera
-    print("[CameraCapture] Warming up camera (5 frames)...")
-    for _ in range(5):
-        cap.read()
-
-    # Capture frame
-    print("[CameraCapture] Capturing photo...")
-    ret, frame = cap.read()
-
-    if not ret:
-        print("[CameraCapture] [X] Failed to read frame from camera")
-        cap.release()
-        return False
+    # Capture 2 frames (1 for warmup, use the 2nd frame)
+    # Reduced to minimize time before power-cycle with YUYV
+    print("[CameraCapture] Warming up camera and capturing...")
+    frame = None
+    for i in range(2):
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[CameraCapture] [X] Failed to read frame {i+1}/2")
+            # Note: Not calling cap.release() due to WBC-0E01 quirk
+            del cap
+            gc.collect()
+            return False
 
     # Save image directly (no transformations - same as training scripts)
     cv2.imwrite(str(output_path), frame)
     print(f"[CameraCapture] [OK] Photo captured: {output_path}")
     print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
 
-    cap.release()
+    # Note: Not calling cap.release() due to WBC-0E01 quirk causing errno=19
+    # Instead, delete reference and force garbage collection
+    del cap
+    gc.collect()
+    print("[CameraCapture] [OK] Camera capture complete (GC release)")
     return True
 
 
@@ -282,7 +393,7 @@ def main():
 
     # Step 1: Camera selection and photo capture
     print("=" * 60)
-    print("STAGE 1: Camera Capture (YUYV 1280x720)")
+    print("STAGE 1: Camera Capture (4K MJPEG -> 720p Downscale)")
     print("=" * 60)
 
     # Determine which camera to use
@@ -312,12 +423,12 @@ def main():
             # Multiple cameras - prompt user
             device_path = select_camera(cameras)
 
-    # Capture photo in YUYV 720p format
+    # Capture photo using 4K MJPEG with downscaling to 720p
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_path = Path("data") / f"chessboard_capture_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    success = capture_yuyv_720p(device_path, image_path)
+    success = capture_4k_downscale(device_path, image_path)
     if not success:
         print("\n[X] Photo capture failed")
         return 1

@@ -9,8 +9,22 @@ Use this when:
 - Wrong piece types are identified (pawn vs bishop, etc.)
 - Pieces are missed entirely despite being visible
 - Your pieces look different from the training data (color, shape, size)
+- **CRITICAL**: After pipeline changes that affect when detection runs (e.g., before vs after perspective transform)
 
 The piece detection model was trained on generic chess pieces. Fine-tuning it on **your specific pieces** will dramatically improve accuracy.
+
+## Current Issues (2025-12-12)
+
+**Current Problems**:
+- Pawn/bishop confusion
+- Low classification accuracy (28%)
+- Duplicate detections
+
+**Root Causes**:
+1. **Model trained on different images than your specific setup** - Generic training data doesn't match your pieces, lighting, and camera
+2. **Duplicate detections** - NMS threshold too lenient (FIXED: increased from 0.5 to 0.7)
+
+**Solution**: Fine-tune model on YOUR specific board photos. You have 30 existing photos in `data/training/board_photos/` - use them to retrain. See sections below.
 
 ## Why Fine-tune?
 
@@ -289,6 +303,73 @@ Training plots are saved to `data/training/runs/piece_finetune/`:
 - `results.png` - Training metrics over time
 - `confusion_matrix.png` - Which pieces get confused
 - `labels.jpg` - Distribution of labeled data
+
+## Using Your Existing Training Data (30 Board Photos)
+
+If you already have board photos in `data/training/board_photos/`, you can retrain without collecting more:
+
+**Regenerate dataset from your existing board photos:**
+
+```bash
+python -m guidance.training.data_collector \
+    --source data/training/board_photos/ \
+    --output data/training/piece_dataset_updated/ \
+    --min-conf 0.5
+```
+
+**Train new model on YOUR specific pieces:**
+
+```bash
+python -m guidance.training.train_yolo \
+    --dataset data/training/piece_dataset_updated/ \
+    --epochs 200 \
+    --batch 16 \
+    --model m
+```
+
+**Deploy:**
+
+```bash
+cp runs/train/chess_pieces/weights/best.pt data/best_transformed_detection.pt
+```
+
+This will fine-tune the model to recognize YOUR specific pieces, lighting, and camera setup, dramatically improving accuracy.
+
+## Quick Detection Parameter Tuning
+
+For immediate (but limited) improvements without retraining:
+
+**1. Increase NMS threshold (reduce duplicates)** - ALREADY DONE
+   - Changed `iou=0.5` to `iou=0.7` in `guidance/board_detector.py:438`
+
+**2. Increase base confidence (reduce false positives):**
+
+Edit `guidance/board_detector.py:437`:
+```python
+conf=0.50,  # UP from 0.35
+```
+
+**3. Adjust class-specific thresholds (reduce pawn/bishop confusion):**
+
+Edit `guidance/board_detector.py:453-468`:
+```python
+class_thresholds = {
+    0: 0.45,  # black bishop (UP from 0.35)
+    1: 0.35,  # black king
+    2: 0.35,  # black knight
+    3: 0.60,  # black pawn (UP from 0.45)
+    4: 0.35,  # black queen
+    5: 0.35,  # black rook
+    6: 0.45,  # white bishop (UP from 0.35)
+    7: 0.35,  # white king
+    8: 0.35,  # white knight
+    9: 0.60,  # white pawn (UP from 0.45)
+    10: 0.35, # white queen
+    11: 0.35, # white rook
+}
+```
+
+These are temporary fixes. Retraining on your data is the proper solution for high accuracy.
 
 ## Next Steps After Fine-tuning
 

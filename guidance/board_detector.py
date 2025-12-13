@@ -27,7 +27,8 @@ class BoardDetector:
     def __init__(
         self,
         corner_model_path: str = "data/best_corners.pt",
-        piece_model_path: str = "data/best_transformed_detection.pt"
+        piece_model_path: str = "data/best_transformed_detection.pt",
+        camera_position: str = "right"
     ):
         """
         Initialize the BoardDetector.
@@ -35,9 +36,11 @@ class BoardDetector:
         Args:
             corner_model_path: Path to the YOLO corner detection model
             piece_model_path: Path to the YOLO piece detection model
+            camera_position: Camera position relative to board ('top', 'right', 'bottom', 'left')
         """
         self.corner_model_path = Path(corner_model_path)
         self.piece_model_path = Path(piece_model_path)
+        self.camera_position = camera_position
 
         # Initialize models (lazy loading)
         self._corner_model: Optional[YOLO] = None
@@ -119,50 +122,68 @@ class BoardDetector:
 
     @staticmethod
     def filter_duplicate_corners(points: np.ndarray, confidences: np.ndarray,
-                                 min_distance: float = 50.0, max_corners: int = 4) -> np.ndarray:
+                                 min_distance: float = 50.0, max_corners: int = 4,
+                                 image_width: int = 1280, image_height: int = 720) -> np.ndarray:
         """
-        Filter out duplicate corner detections using confidence-based greedy selection.
+        Filter corner detections using quadrant-based selection.
 
         Algorithm:
-        1. Sort detections by confidence (highest first)
-        2. Greedily select corners that aren't within min_distance of already-selected corners
-        3. Stop when we have max_corners corners
+        1. Divide image into 4 quadrants (TL, TR, BR, BL)
+        2. Select the highest-confidence corner from each quadrant
+        3. This ensures we get one corner from each region of the board
 
         Args:
             points: Array of detected corner points
             confidences: Confidence scores for each point
-            min_distance: Minimum distance between corners (pixels)
+            min_distance: Minimum distance between corners (pixels) - not used in quadrant method
             max_corners: Maximum number of corners to return (default: 4)
+            image_width: Image width for quadrant calculation (default: 1280)
+            image_height: Image height for quadrant calculation (default: 720)
 
         Returns:
-            Filtered array of unique corners (up to max_corners)
+            Filtered array of 4 corners (one per quadrant)
         """
         if len(points) == 0:
             return points
 
-        # Sort by confidence (descending)
-        sorted_indices = np.argsort(confidences)[::-1]
-        sorted_points = points[sorted_indices]
-        sorted_confidences = confidences[sorted_indices]
+        # Calculate image center
+        center_x = image_width / 2
+        center_y = image_height / 2
 
-        # Greedily select corners
+        # Assign each detection to a quadrant
+        # Quadrants: 0=TL, 1=TR, 2=BR, 3=BL
+        quadrants = {0: [], 1: [], 2: [], 3: []}
+
+        for i, point in enumerate(points):
+            x, y = point
+            conf = confidences[i]
+
+            if x < center_x and y < center_y:
+                quadrant = 0  # Top-Left
+            elif x >= center_x and y < center_y:
+                quadrant = 1  # Top-Right
+            elif x >= center_x and y >= center_y:
+                quadrant = 2  # Bottom-Right
+            else:
+                quadrant = 3  # Bottom-Left
+
+            quadrants[quadrant].append((point, conf, i))
+
+        # Select highest-confidence corner from each quadrant
         selected_corners = []
 
-        for point, conf in zip(sorted_points, sorted_confidences):
-            # Check if this point is far enough from all already-selected corners
-            is_valid = True
-            for selected_corner in selected_corners:
-                distance = np.sqrt(np.sum((point - selected_corner) ** 2))
-                if distance < min_distance:
-                    is_valid = False
-                    break
+        for quadrant_id in range(4):
+            detections = quadrants[quadrant_id]
 
-            if is_valid:
-                selected_corners.append(point)
+            if len(detections) == 0:
+                # No corner in this quadrant - will cause error later
+                continue
 
-                # Stop when we have enough corners
-                if len(selected_corners) >= max_corners:
-                    break
+            # Sort by confidence (descending) and take the best
+            detections.sort(key=lambda x: x[1], reverse=True)
+            best_point, best_conf, orig_idx = detections[0]
+
+            selected_corners.append(best_point)
 
         return np.array(selected_corners)
 
@@ -195,8 +216,14 @@ class BoardDetector:
         points = arr[:, 0:2]
         confidences = boxes.conf.cpu().numpy()
 
+        # Get image dimensions for quadrant calculation
+        from PIL import Image
+        img = Image.open(image_path)
+        img_width, img_height = img.size
+
         if debug:
             print(f"[DEBUG]   Confidence threshold: {conf_threshold}")
+            print(f"[DEBUG]   Image dimensions: {img_width}x{img_height}")
             print(f"[DEBUG]   Raw detections: {len(points)}")
             for i, (pt, conf) in enumerate(zip(points, confidences)):
                 print(f"[DEBUG]     Detection {i}: {pt} (conf: {conf:.3f})")
@@ -204,20 +231,36 @@ class BoardDetector:
             # Save visualization of raw detections
             self.visualize_raw_detections(image_path, points, confidences)
 
-        # Filter duplicate corners using confidence-based greedy selection
+        # Filter corners using quadrant-based selection
         unique_points = self.filter_duplicate_corners(
-            points, confidences, min_distance=min_distance, max_corners=4
+            points, confidences, min_distance=min_distance, max_corners=4,
+            image_width=img_width, image_height=img_height
         )
 
         if debug:
-            print(f"[DEBUG]   Selected corners after filtering (min_distance={min_distance}): {len(unique_points)}")
+            print(f"[DEBUG]   Selected corners using quadrant method: {len(unique_points)}")
             if len(unique_points) > 0:
-                # Show which detections were selected
+                quadrant_names = ['TL quadrant', 'TR quadrant', 'BR quadrant', 'BL quadrant']
+                # Show which detections were selected and from which quadrant
+                center_x = img_width / 2
+                center_y = img_height / 2
+
                 for i, corner in enumerate(unique_points):
                     # Find the original detection index
                     for orig_idx, (pt, conf) in enumerate(zip(points, confidences)):
                         if np.allclose(pt, corner, atol=0.01):
-                            print(f"[DEBUG]     Selected corner {i}: Detection {orig_idx} (conf: {conf:.3f})")
+                            # Determine quadrant
+                            x, y = pt
+                            if x < center_x and y < center_y:
+                                quad_name = quadrant_names[0]
+                            elif x >= center_x and y < center_y:
+                                quad_name = quadrant_names[1]
+                            elif x >= center_x and y >= center_y:
+                                quad_name = quadrant_names[2]
+                            else:
+                                quad_name = quadrant_names[3]
+
+                            print(f"[DEBUG]     Selected corner {i}: Detection {orig_idx} from {quad_name} (conf: {conf:.3f})")
                             break
 
         # Validate we have exactly 4 corners
@@ -233,22 +276,17 @@ class BoardDetector:
         corners = self.order_points(unique_points)
         return corners
 
-    def four_point_transform(self, image_path: str, pts: np.ndarray) -> Image.Image:
+    def get_perspective_matrix(self, image: Image.Image, pts: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
         """
-        Apply perspective transform to get bird's-eye view of the board.
+        Calculate perspective transform matrix and output dimensions.
 
         Args:
-            image_path: Path to the image file
+            image: Input PIL Image
             pts: Four corner points
 
         Returns:
-            Transformed PIL Image
+            Tuple of (transform_matrix, output_width, output_height, top_margin)
         """
-        img = Image.open(image_path)
-        # Convert to RGB to ensure consistent 3-channel format (handles RGBA, grayscale, etc.)
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        image = np.asarray(img)
         rect = self.order_points(pts)
         (tl, tr, br, bl) = rect
 
@@ -262,19 +300,17 @@ class BoardDetector:
         heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
         maxHeight = max(int(heightA), int(heightB))
 
-        # Ensure minimum dimensions for quality output, especially for small input images
+        # Ensure minimum dimensions for quality output
         MIN_SIZE = 400
         if maxWidth < MIN_SIZE or maxHeight < MIN_SIZE:
             scale = max(MIN_SIZE / maxWidth, MIN_SIZE / maxHeight)
             maxWidth = int(maxWidth * scale)
             maxHeight = int(maxHeight * scale)
 
-        # Add top margin (1 grid space = 1/8 of board height) to prevent cutting off top pieces
+        # Add top margin (1 grid space = 1/8 of board height)
         margin = maxHeight // 8
-        self.top_margin = margin
 
         # Construct destination points with margin offset
-        # The board corners map to positions starting at 'margin' pixels from the top
         dst = np.array([
             [0, margin],
             [maxWidth - 1, margin],
@@ -282,11 +318,79 @@ class BoardDetector:
             [0, maxHeight - 1 + margin]
         ], dtype="float32")
 
-        # Compute and apply perspective transform with high-quality interpolation
+        # Compute perspective transform matrix
         M = cv2.getPerspectiveTransform(rect, dst)
+
+        return M, maxWidth, maxHeight, margin
+
+    def transform_bounding_boxes(self, detections: np.ndarray, transform_matrix: np.ndarray) -> np.ndarray:
+        """
+        Transform bounding box coordinates through perspective warp.
+
+        Args:
+            detections: Array of bounding boxes in format (x1, y1, x2, y2)
+            transform_matrix: Perspective transformation matrix from cv2.getPerspectiveTransform
+
+        Returns:
+            Transformed bounding boxes in same format
+        """
+        if len(detections) == 0:
+            return detections
+
+        transformed_boxes = []
+
+        for box in detections:
+            x1, y1, x2, y2 = box[:4]
+
+            # Define the 4 corners of the bounding box
+            corners = np.array([
+                [x1, y1],  # Top-left
+                [x2, y1],  # Top-right
+                [x2, y2],  # Bottom-right
+                [x1, y2]   # Bottom-left
+            ], dtype=np.float32)
+
+            # Apply perspective transform to all 4 corners
+            # cv2.perspectiveTransform requires shape (1, N, 2)
+            corners_reshaped = corners.reshape(1, -1, 2)
+            transformed_corners = cv2.perspectiveTransform(corners_reshaped, transform_matrix)
+            transformed_corners = transformed_corners.reshape(-1, 2)
+
+            # Find the new bounding box from transformed corners
+            new_x1 = np.min(transformed_corners[:, 0])
+            new_y1 = np.min(transformed_corners[:, 1])
+            new_x2 = np.max(transformed_corners[:, 0])
+            new_y2 = np.max(transformed_corners[:, 1])
+
+            transformed_boxes.append([new_x1, new_y1, new_x2, new_y2])
+
+        return np.array(transformed_boxes)
+
+    def four_point_transform(self, image_path: str, pts: np.ndarray) -> Image.Image:
+        """
+        Apply perspective transform to get bird's-eye view of the board.
+
+        Args:
+            image_path: Path to the image file
+            pts: Four corner points
+
+        Returns:
+            Transformed PIL Image
+        """
+        img = Image.open(image_path)
+        # Convert to RGB to ensure consistent 3-channel format
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        image = np.asarray(img)
+
+        # Get transform matrix and dimensions
+        M, maxWidth, maxHeight, margin = self.get_perspective_matrix(img, pts)
+        self.top_margin = margin
+
+        # Apply perspective transform
         warped = cv2.warpPerspective(
-            image, M, (maxWidth, maxHeight + margin),  # Add margin to output height
-            flags=cv2.INTER_CUBIC,  # Higher quality interpolation
+            image, M, (maxWidth, maxHeight + margin),
+            flags=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0)
         )
@@ -345,33 +449,40 @@ class BoardDetector:
         # Convert back to PIL Image (skip denoising - it was too aggressive)
         return Image.fromarray(result, "RGB")
 
-    def detect_pieces(self, image: Image.Image, use_preprocessing: bool = True) -> Tuple[np.ndarray, object]:
+    def detect_pieces(self, image_source, use_preprocessing: bool = False) -> Tuple[np.ndarray, object]:
         """
-        Detect chess pieces on the transformed board.
+        Detect chess pieces on an image (either original or transformed).
 
         Args:
-            image: Transformed board image
-            use_preprocessing: Whether to apply preprocessing pipeline (default: True)
+            image_source: Either a PIL Image or path to image file
+            use_preprocessing: Whether to apply preprocessing pipeline (default: False for original images)
 
         Returns:
             Tuple of (detections array, boxes object)
         """
-        # Apply preprocessing to improve detection accuracy
-        if use_preprocessing:
-            image = self.preprocess_for_detection(image)
-
-        # Save image temporarily for YOLO
-        temp_path = "data/temp_board.jpg"
-        image.save(temp_path, quality=95)  # Higher quality to preserve enhanced details
+        # Handle both PIL Image and file path inputs
+        if isinstance(image_source, str):
+            image = Image.open(image_source)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            temp_path = image_source
+        else:
+            image = image_source
+            # Apply preprocessing if requested
+            if use_preprocessing:
+                image = self.preprocess_for_detection(image)
+            # Save image temporarily for YOLO
+            temp_path = "data/temp_board.jpg"
+            image.save(temp_path, quality=95)
 
         results = self.piece_model.predict(
             source=temp_path,
-            conf=0.35,  # Lowered from 0.5 to catch more pieces (reduce missed detections)
-            iou=0.5,    # NMS IoU threshold for removing duplicate detections
+            conf=0.35,  # Base confidence threshold
+            iou=0.7,    # NMS IoU threshold (raised from 0.5 to reduce duplicate detections)
             augment=True,  # Enable test-time augmentation for better detection
             verbose=False,
             imgsz=640,  # Ensure consistent input size
-            device='cpu'  # Explicitly set device (will use CUDA if available via PyTorch)
+            device=0  # Use CUDA GPU (device 0)
         )
 
         boxes = results[0].boxes
@@ -556,6 +667,45 @@ class BoardDetector:
             squares.append(row_squares)
 
         return squares
+
+    def rotate_board_for_camera_position(self, board_array: List[List[str]]) -> List[List[str]]:
+        """
+        Rotate board array based on camera position to get correct orientation.
+
+        Camera positions and required rotations:
+        - 'top': No rotation (0°)
+        - 'right': 90° clockwise
+        - 'bottom': 180°
+        - 'left': 90° counter-clockwise (270° clockwise)
+
+        Args:
+            board_array: 8x8 array of piece notations
+
+        Returns:
+            Rotated 8x8 array
+        """
+        if self.camera_position == "top":
+            # No rotation needed
+            return board_array
+
+        elif self.camera_position == "right":
+            # 90° clockwise: transpose then reverse each row
+            transposed = [[board_array[row][col] for row in range(8)] for col in range(8)]
+            return [row[::-1] for row in transposed]
+
+        elif self.camera_position == "bottom":
+            # 180°: reverse all rows, then reverse each row
+            return [row[::-1] for row in board_array[::-1]]
+
+        elif self.camera_position == "left":
+            # 90° counter-clockwise (270° clockwise): reverse each row then transpose
+            reversed_rows = [row[::-1] for row in board_array]
+            return [[reversed_rows[row][col] for row in range(8)] for col in range(8)]
+
+        else:
+            # Unknown position - no rotation
+            print(f"[WARNING] Unknown camera position '{self.camera_position}', no rotation applied")
+            return board_array
 
     def board_to_fen(self, board_array: List[List[str]]) -> str:
         """
@@ -766,6 +916,12 @@ class BoardDetector:
         """
         Detect complete board state from an image.
 
+        NEW PIPELINE ORDER:
+        1. Detect corners
+        2. Detect pieces on ORIGINAL image (trained without perspective correction)
+        3. Apply perspective transform to BOTH image and bounding boxes
+        4. Calculate grid and match pieces
+
         Args:
             image_path: Path to the board image
             corner_conf: Confidence threshold for corner detection
@@ -792,30 +948,52 @@ class BoardDetector:
                 print(f"[BoardDetector]     {labels[i]}: {corner}")
             self.visualize_corners(image_path, corners)
 
-        # Step 2: Apply perspective transform
+        # Step 2: Detect pieces on ORIGINAL image (before transformation)
         if debug:
-            print("[BoardDetector] Step 2: Applying perspective transform...")
+            print("[BoardDetector] Step 2: Detecting pieces on original image...")
+            print("[BoardDetector]   Preprocessing: DISABLED (using original training data)")
 
-        transformed_image = self.four_point_transform(image_path, corners)
+        # Load original image for detection
+        original_image = Image.open(image_path)
+        if original_image.mode != 'RGB':
+            original_image = original_image.convert('RGB')
 
-        if debug:
-            transformed_image.save("data/chessboard_transformed.png")
-            print(f"[BoardDetector]   Transformed image size: {transformed_image.size}")
-            print(f"  → Transformed board saved to data/chessboard_transformed.png")
-
-        # Step 3: Detect pieces
-        if debug:
-            print("[BoardDetector] Step 3: Detecting pieces...")
-            print("[BoardDetector]   Preprocessing: ENABLED")
-
-        detections, boxes = self.detect_pieces(transformed_image, use_preprocessing=True)
+        detections, boxes = self.detect_pieces(image_path, use_preprocessing=False)
 
         if debug:
             print(f"[BoardDetector]   Found {len(detections)} detections")
             if len(detections) > 0:
                 confidences = boxes.conf.cpu().numpy()
                 print(f"[BoardDetector]   Confidence range: {confidences.min():.3f} - {confidences.max():.3f}")
-            self.visualize_detections(transformed_image, detections, boxes)
+            # Visualize detections on ORIGINAL image
+            self.visualize_detections(original_image, detections, boxes,
+                                     output_path="data/chessboard_detections.png")
+
+        # Step 3: Apply perspective transform to BOTH image and bounding boxes
+        if debug:
+            print("[BoardDetector] Step 3: Applying perspective transform...")
+
+        # Get transform matrix
+        M, maxWidth, maxHeight, margin = self.get_perspective_matrix(original_image, corners)
+        self.top_margin = margin
+
+        # Transform the image
+        image_array = np.asarray(original_image)
+        warped = cv2.warpPerspective(
+            image_array, M, (maxWidth, maxHeight + margin),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0)
+        )
+        transformed_image = Image.fromarray(warped, "RGB")
+
+        # Transform the bounding boxes
+        detections = self.transform_bounding_boxes(detections, M)
+
+        if debug:
+            transformed_image.save("data/chessboard_transformed.png")
+            print(f"[BoardDetector]   Transformed image size: {transformed_image.size}")
+            print(f"  → Transformed board saved to data/chessboard_transformed.png")
 
         # Step 4: Calculate grid
         if debug:
@@ -833,7 +1011,7 @@ class BoardDetector:
 
         squares = self.create_squares(x_coords, y_coords)
 
-        # Step 6: Match pieces to squares
+        # Step 6: Match pieces to squares (using transformed detections)
         if debug:
             print("[BoardDetector] Step 6: Matching pieces to squares...")
 
@@ -854,9 +1032,18 @@ class BoardDetector:
         if debug:
             print(f"[BoardDetector]   Matched {matched_pieces} pieces to squares")
 
-        # Step 7: Convert to FEN
+        # Step 7: Rotate board based on camera position
         if debug:
-            print("[BoardDetector] Step 7: Converting to FEN...")
+            print(f"[BoardDetector] Step 7: Rotating board for camera position '{self.camera_position}'...")
+
+        board_array = self.rotate_board_for_camera_position(board_array)
+
+        if debug:
+            print("[BoardDetector]   Board rotated to correct orientation")
+
+        # Step 8: Convert to FEN
+        if debug:
+            print("[BoardDetector] Step 8: Converting to FEN...")
 
         fen_position = self.board_to_fen(board_array)
         full_fen = f"{fen_position} w KQkq - 0 1"
