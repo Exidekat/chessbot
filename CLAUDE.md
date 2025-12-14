@@ -78,6 +78,7 @@ chessbot/
 │   ├── board_detector.py       # Corner detection → perspective transform → piece detection
 │   ├── move_calculator.py      # Stockfish UCI integration
 │   ├── move_interpreter.py     # Chess move → robot actions
+│   ├── move_decomposer.py      # Move → action stages + VLM prompts
 │   ├── coordinate_mapper.py    # Chess squares → pixel coordinates
 │   ├── highlight_renderer.py   # Color-coded overlay rendering
 │   ├── guidance_system.py      # High-level orchestrator
@@ -372,6 +373,78 @@ The following files are deprecated and should NOT be used:
 - 8GB+ RAM
 - Optional: USB cameras for live testing
 - Optional: Stockfish for move calculation
+
+## VLM Training Data Generation
+
+The system includes VLM (Vision-Language Model) training data generation for robot learning:
+
+### Move Decomposition
+
+The `guidance.move_decomposer` module converts chess moves into robot-executable action stages:
+
+```python
+from guidance.move_decomposer import decompose_move, piece_symbol_to_name
+
+# Decompose a move into stages
+stages = decompose_move(board, move)
+
+# Each stage contains:
+# - description: Technical description (e.g., "Remove B from f1 (captured)")
+# - vlm_prompt: Natural language (e.g., "Pick up white bishop from f1 and place in graveyard left of board.")
+# - pickup_square: Source square or None for graveyard
+# - place_square: Destination square or None for graveyard
+# - piece: Piece symbol (for graveyard -> board moves)
+```
+
+### VLM Prompt Examples (with Color Conditioning)
+
+Prompts include color conditioning to match the visual overlays shown to the VLA:
+
+**Normal Move (e2e4)**:
+```
+VLM Prompt: Pick up white pawn from red e2 and place on blue e4.
+```
+
+**Capture (Nxe5)**:
+```
+Stage 1 VLM Prompt: Pick up black pawn from red e5 and place in orange graveyard left of board.
+Stage 2 VLM Prompt: Pick up white knight from red c3 and place on blue e5.
+```
+
+**Promotion with Capture (g2f1Q)**:
+```
+Stage 1 VLM Prompt: Pick up white bishop from red f1 and place in orange graveyard left of board.
+Stage 2 VLM Prompt: Pick up black pawn from red g2 and place in orange graveyard left of board.
+Stage 3 VLM Prompt: Pick up black queen from purple graveyard left of board and place on blue f1.
+```
+
+**Color Conditioning Key**:
+- 🔴 RED: Pickup square (source)
+- 🔵 BLUE: Place square (destination)
+- 🟠 ORANGE: Graveyard for discarded pieces (captures)
+- 🟣 PURPLE: Graveyard piece for promotion (source)
+
+### Virtual Camera for VLA Training
+
+Use `virtual_overlay_demo.py` to stream live overlays to a virtual camera for VLA training:
+
+```bash
+# Setup v4l2loopback (one-time)
+sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam" exclusive_caps=1
+
+# Stream live overlays to /dev/video7
+python scripts/virtual_overlay_demo.py
+
+# View stream with low latency
+ffplay -fflags nobuffer -flags low_delay -framedrop /dev/video7
+```
+
+The script:
+1. Captures live 720p feed at 30fps
+2. Detects board and calculates best move
+3. For each stage, overlays color-coded highlights and streams to virtual camera
+4. User presses ENTER to save final frame for that stage
+5. Outputs stage frames with VLM prompts for training
 
 ## Development Workflow
 

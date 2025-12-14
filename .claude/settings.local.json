@@ -24,7 +24,8 @@
       "Bash(xargs:*)",
       "Bash(for class in {0..11})",
       "Bash(do echo -n 'Class $class: ')",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []

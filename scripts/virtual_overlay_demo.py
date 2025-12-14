@@ -42,6 +42,7 @@ from guidance.board_detector import BoardDetector
 from guidance.move_calculator import MoveCalculator
 from guidance.coordinate_mapper import CoordinateMapper
 from guidance.highlight_renderer import HighlightRenderer
+from guidance.move_decomposer import decompose_move, generate_vlm_prompt, piece_symbol_to_name
 from PIL import Image
 import numpy as np
 
@@ -53,161 +54,6 @@ def print_board(board: chess.Board):
     print("=" * 40)
     print(board)
     print("=" * 40)
-
-
-def decompose_move(board: chess.Board, move: chess.Move) -> list:
-    """
-    Decompose a chess move into stages for overlay generation.
-
-    Each stage is a dict with:
-    - description: Human-readable description
-    - pickup_square: Square to pick piece from (or None for graveyard)
-    - place_square: Square to place piece on (or None for graveyard)
-    - piece: Piece type being moved (for graveyard -> board moves)
-
-    Args:
-        board: Current board state (before move is applied)
-        move: Chess move to decompose
-
-    Returns:
-        List of stage dictionaries
-    """
-    stages = []
-    from_square = chess.square_name(move.from_square)
-    to_square = chess.square_name(move.to_square)
-
-    # Get piece being moved
-    moving_piece = board.piece_at(move.from_square)
-    if not moving_piece:
-        return stages
-
-    # Check for capture
-    captured_piece = board.piece_at(move.to_square)
-
-    # Check for castling
-    is_castling = board.is_castling(move)
-
-    # Check for promotion
-    is_promotion = move.promotion is not None
-
-    # CASTLING: King first, then rook
-    if is_castling:
-        # King move
-        stages.append({
-            "description": f"Move {moving_piece.symbol().upper()} from {from_square} to {to_square} (castling)",
-            "pickup_square": from_square,
-            "place_square": to_square,
-            "piece": None
-        })
-
-        # Determine rook move
-        # Kingside castling (e1g1 or e8g8): rook from h file to f file
-        # Queenside castling (e1c1 or e8c8): rook from a file to d file
-        if to_square in ["g1", "g8"]:  # Kingside
-            rank = "1" if moving_piece.color == chess.WHITE else "8"
-            rook_from = f"h{rank}"
-            rook_to = f"f{rank}"
-        else:  # Queenside
-            rank = "1" if moving_piece.color == chess.WHITE else "8"
-            rook_from = f"a{rank}"
-            rook_to = f"d{rank}"
-
-        stages.append({
-            "description": f"Move rook from {rook_from} to {rook_to} (castling)",
-            "pickup_square": rook_from,
-            "place_square": rook_to,
-            "piece": None
-        })
-
-        return stages
-
-    # PROMOTION WITH CAPTURE
-    if is_promotion and captured_piece:
-        # Stage 1: Remove captured piece
-        piece_name = captured_piece.symbol().upper() if captured_piece.color == chess.WHITE else captured_piece.symbol().lower()
-        stages.append({
-            "description": f"Remove {piece_name} from {to_square} (captured)",
-            "pickup_square": to_square,
-            "place_square": None,  # To graveyard
-            "piece": None
-        })
-
-        # Stage 2: Remove pawn
-        pawn_name = moving_piece.symbol().upper() if moving_piece.color == chess.WHITE else moving_piece.symbol().lower()
-        stages.append({
-            "description": f"Remove {pawn_name} from {from_square}",
-            "pickup_square": from_square,
-            "place_square": None,  # To graveyard
-            "piece": None
-        })
-
-        # Stage 3: Place promoted piece
-        promotion_piece_type = chess.piece_name(move.promotion)
-        promotion_symbol = chess.Piece(move.promotion, moving_piece.color).symbol()
-        stages.append({
-            "description": f"Place {promotion_symbol} on {to_square} (promotion from graveyard)",
-            "pickup_square": None,  # From graveyard
-            "place_square": to_square,
-            "piece": promotion_symbol
-        })
-
-        return stages
-
-    # PROMOTION WITHOUT CAPTURE
-    if is_promotion:
-        # Stage 1: Remove pawn
-        pawn_name = moving_piece.symbol().upper() if moving_piece.color == chess.WHITE else moving_piece.symbol().lower()
-        stages.append({
-            "description": f"Remove {pawn_name} from {from_square}",
-            "pickup_square": from_square,
-            "place_square": None,  # To graveyard
-            "piece": None
-        })
-
-        # Stage 2: Place promoted piece
-        promotion_piece_type = chess.piece_name(move.promotion)
-        promotion_symbol = chess.Piece(move.promotion, moving_piece.color).symbol()
-        stages.append({
-            "description": f"Place {promotion_symbol} on {to_square} (promotion from graveyard)",
-            "pickup_square": None,  # From graveyard
-            "place_square": to_square,
-            "piece": promotion_symbol
-        })
-
-        return stages
-
-    # CAPTURE (non-promotion)
-    if captured_piece:
-        # Stage 1: Remove captured piece to graveyard
-        piece_name = captured_piece.symbol().upper() if captured_piece.color == chess.WHITE else captured_piece.symbol().lower()
-        stages.append({
-            "description": f"Remove {piece_name} from {to_square} (captured)",
-            "pickup_square": to_square,
-            "place_square": None,  # To graveyard
-            "piece": None
-        })
-
-        # Stage 2: Move attacking piece
-        attacker_name = moving_piece.symbol().upper() if moving_piece.color == chess.WHITE else moving_piece.symbol().lower()
-        stages.append({
-            "description": f"Move {attacker_name} from {from_square} to {to_square}",
-            "pickup_square": from_square,
-            "place_square": to_square,
-            "piece": None
-        })
-
-        return stages
-
-    # NORMAL MOVE (no capture, no special moves)
-    piece_name = moving_piece.symbol().upper() if moving_piece.color == chess.WHITE else moving_piece.symbol().lower()
-    stages.append({
-        "description": f"Move {piece_name} from {from_square} to {to_square}",
-        "pickup_square": from_square,
-        "place_square": to_square,
-        "piece": None
-    })
-
-    return stages
 
 
 def get_available_cameras():
@@ -1331,6 +1177,7 @@ def main():
                         print("\n" + "-" * 60)
                         print(f"Stage {i}/{len(stages)}: {stage['description']}")
                         print("-" * 60)
+                        print(f"  VLM Prompt: {stage['vlm_prompt']}")
 
                         # Display stage details
                         if stage["pickup_square"]:

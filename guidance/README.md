@@ -76,6 +76,40 @@ actions = MoveInterpreter.decompose_move(move, board)
 # Castling: [king pickup, king place, rook pickup, rook place]
 ```
 
+#### `move_decomposer.py`
+Chess move decomposition with VLM-friendly natural language prompts:
+```python
+from guidance.move_decomposer import decompose_move, piece_symbol_to_name
+import chess
+
+board = chess.Board()
+move = chess.Move.from_uci("e2e4")
+
+# Decompose move into stages with VLM prompts
+stages = decompose_move(board, move)
+# [{"description": "Move P from e2 to e4",
+#   "vlm_prompt": "Pick up white pawn from e2 and place on e4.",
+#   "pickup_square": "e2",
+#   "place_square": "e4",
+#   "piece": None}]
+
+# Convert piece symbols to natural language
+piece_name = piece_symbol_to_name("P")  # "white pawn"
+```
+
+**VLM Prompt Examples (with color conditioning):**
+- Normal move (e2e4): `"Pick up white pawn from red e2 and place on blue e4."`
+- Capture (Nxe5): Stage 1: `"Pick up black pawn from red e5 and place in orange graveyard left of board."`, Stage 2: `"Pick up white knight from red c3 and place on blue e5."`
+- Promotion with capture (g2f1Q): Stage 1: `"Pick up white bishop from red f1 and place in orange graveyard left of board."`, Stage 2: `"Pick up black pawn from red g2 and place in orange graveyard left of board."`, Stage 3: `"Pick up black queen from purple graveyard left of board and place on blue f1."`
+
+**Color Conditioning:**
+- RED: Pickup square (source)
+- BLUE: Place square (destination)
+- ORANGE: Graveyard for discarded pieces (captures)
+- PURPLE: Graveyard piece for promotion (source)
+
+Used by `virtual_overlay_demo.py` for VLA training data generation.
+
 #### `coordinate_mapper.py`
 Map chess squares to pixel coordinates on transformed board:
 ```python
