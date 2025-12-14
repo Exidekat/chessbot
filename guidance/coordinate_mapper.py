@@ -103,6 +103,28 @@ class CoordinateMapper:
 
         return x, y
 
+    def get_left_graveyard_coords(self, transformed_image: Image.Image) -> Tuple[int, int]:
+        """
+        Get coordinates for left graveyard area (off-board piece storage).
+
+        Places graveyard to the left of the board, centered vertically.
+        Used for discard region in overlay generation.
+
+        Args:
+            transformed_image: Transformed board image
+
+        Returns:
+            (x, y) pixel coordinates for left graveyard
+        """
+        height = transformed_image.size[1]
+
+        # Place graveyard to the left of board, centered vertically
+        # Note: Negative x coordinate extends beyond image bounds - that's okay for overlay
+        x = -30  # 30 pixels to the left of board
+        y = height // 2
+
+        return x, y
+
     def _get_grid(self, transformed_image: Image.Image) -> Tuple[List[float], List[float]]:
         """
         Get or calculate grid coordinates for transformed image.

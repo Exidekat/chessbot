@@ -30,7 +30,7 @@ python scripts/capture_photo.py --device /dev/video0 --width 2592 --height 1944 
 
 ## Demo and Testing
 
-# Run full pipeline: capture YUYV 720p photo + detect board + calculate best move (auto-detects camera)
+# Run full pipeline: capture 4K MJPEG -> 720p photo + detect board + calculate best move (auto-detects camera)
 python scripts/best_move_demo.py
 
 # Run full pipeline with debug visualizations enabled
@@ -42,7 +42,7 @@ python scripts/best_move_demo.py --device /dev/video0
 # Run full pipeline without calculating best move (no Stockfish required)
 python scripts/best_move_demo.py --no-bestmove
 
-# Run full pipeline with custom corner detection parameters (optimized for YUYV 720p)
+# Run full pipeline with custom corner detection parameters (optimized for 720p)
 python scripts/best_move_demo.py --debug --corner-conf 0.005 --min-corner-dist 30
 
 # Run full pipeline with custom engine time limit
@@ -50,6 +50,26 @@ python scripts/best_move_demo.py --time 2.0
 
 # Run full pipeline with all custom parameters
 python scripts/best_move_demo.py --device /dev/video0 --debug --corner-conf 0.005 --min-corner-dist 30 --time 2.0
+
+## VLA Training Data Collection
+
+# Generate stage-by-stage move overlays for VLA training (captures photo, detects board, calculates best move, generates interactive overlays)
+python scripts/create_overlay_demo.py
+
+# Generate overlays with specific camera device
+python scripts/create_overlay_demo.py --device /dev/video0
+
+# Generate overlays with custom corner detection parameters
+python scripts/create_overlay_demo.py --corner-conf 0.005 --min-corner-dist 30
+
+# Generate overlays for black's turn instead of white's turn
+python scripts/create_overlay_demo.py --black
+
+# Generate overlays with board rotation (camera positioned on right side of board)
+python scripts/create_overlay_demo.py --right
+
+# Generate overlays with all custom parameters
+python scripts/create_overlay_demo.py --device /dev/video0 --right --black --corner-conf 0.005 --min-corner-dist 30
 
 ## Overlay Generation
 

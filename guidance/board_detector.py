@@ -975,6 +975,10 @@ class BoardDetector:
 
         detections, boxes = self.detect_pieces(image_path, use_preprocessing=False)
 
+        # Store original detections and boxes for later use (e.g., graveyard piece highlighting)
+        self.original_detections = detections
+        self.original_boxes = boxes
+
         if debug:
             print(f"[BoardDetector]   Found {len(detections)} detections")
             if len(detections) > 0:
@@ -991,6 +995,7 @@ class BoardDetector:
         # Get transform matrix
         M, maxWidth, maxHeight, margin = self.get_perspective_matrix(original_image, corners)
         self.top_margin = margin
+        self.perspective_matrix = M  # Store for later use (e.g., overlay generation)
 
         # Transform the image
         image_array = np.asarray(original_image)
