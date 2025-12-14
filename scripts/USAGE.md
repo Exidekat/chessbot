@@ -8,6 +8,9 @@ python scripts/download.py
 # Create default configuration file
 python scripts/create_config.py
 
+# Setup virtual camera device for live overlay streaming (one-time setup, requires sudo)
+sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam" exclusive_caps=1
+
 ## Camera Capture
 
 # Capture photo with auto-detected camera (1920x1080, saves to results/ with timestamp)
@@ -70,6 +73,20 @@ python scripts/create_overlay_demo.py --right
 
 # Generate overlays with all custom parameters
 python scripts/create_overlay_demo.py --device /dev/video0 --right --black --corner-conf 0.005 --min-corner-dist 30
+
+## Virtual Camera with Live Overlay (Advanced VLA Training)
+
+# Setup virtual camera device (one-time setup, requires sudo)
+sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam" exclusive_caps=1
+
+# Stream live 720p feed with move overlays to virtual camera /dev/video7 (continuously updates base image every ~1 second)
+python scripts/virtual_overlay_demo.py
+
+# Stream with specific camera device
+python scripts/virtual_overlay_demo.py --device /dev/video0
+
+# Stream with board rotation and custom parameters
+python scripts/virtual_overlay_demo.py --device /dev/video0 --right --black
 
 ## Overlay Generation
 
