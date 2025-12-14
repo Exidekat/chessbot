@@ -379,13 +379,72 @@ def main():
         default=30.0,
         help="Minimum distance between corners in pixels (default: 30.0)"
     )
+    parser.add_argument(
+        "--rotation",
+        type=str,
+        default=None,
+        choices=["left", "right", "top", "bottom"],
+        help="Camera rotation relative to board (default: right). Use 'top' for no rotation."
+    )
+    # Legacy aliases for common rotations
+    parser.add_argument(
+        "--left",
+        action="store_const",
+        const="left",
+        dest="rotation",
+        help="Shortcut for --rotation left"
+    )
+    parser.add_argument(
+        "--right",
+        action="store_const",
+        const="right",
+        dest="rotation",
+        help="Shortcut for --rotation right (default)"
+    )
+    parser.add_argument(
+        "--turn",
+        type=str,
+        default=None,
+        choices=["white", "black", "w", "b"],
+        help="Whose turn to calculate move for (default: white)"
+    )
+    # Convenient aliases for turn
+    parser.add_argument(
+        "--white",
+        action="store_const",
+        const="w",
+        dest="turn",
+        help="Calculate move for white (default)"
+    )
+    parser.add_argument(
+        "--black",
+        action="store_const",
+        const="b",
+        dest="turn",
+        help="Calculate move for black"
+    )
 
     args = parser.parse_args()
+
+    # Default to 'right' if no rotation specified (backward compatibility)
+    if args.rotation is None:
+        args.rotation = "right"
+
+    # Default to white's turn if not specified
+    if args.turn is None:
+        args.turn = "w"
+    elif args.turn == "white":
+        args.turn = "w"
+    elif args.turn == "black":
+        args.turn = "b"
 
     print("=" * 60)
     print("Best Move Demo - Unified Guidance System")
     print("=" * 60)
     print(f"Debug mode: {'enabled' if args.debug else 'disabled'}")
+    print(f"Board rotation: {args.rotation}")
+    turn_name = "White" if args.turn == "w" else "Black"
+    print(f"Calculate move for: {turn_name}")
     if args.debug:
         print(f"Corner confidence: {args.corner_conf}")
         print(f"Min corner distance: {args.min_corner_dist}")
@@ -442,8 +501,8 @@ def main():
     try:
         # Initialize BoardDetector
         print("Initializing BoardDetector...")
-        detector = BoardDetector()
-        print("[OK] BoardDetector initialized")
+        detector = BoardDetector(camera_position=args.rotation)
+        print(f"[OK] BoardDetector initialized (rotation: {args.rotation})")
         print()
 
         # Detect board state
@@ -452,7 +511,8 @@ def main():
             str(image_path),
             corner_conf=args.corner_conf,
             min_corner_distance=args.min_corner_dist,
-            debug=args.debug
+            debug=args.debug,
+            turn=args.turn
         )
         print("[OK] Board state detected")
         print()

@@ -597,49 +597,63 @@ class BoardDetector:
         self,
         detections: np.ndarray,
         boxes: object,
-        square: np.ndarray
-    ) -> str:
+        square: np.ndarray,
+        used_detections: set = None
+    ) -> tuple:
         """
         Match a detected piece to a square using IoU.
+
+        IMPORTANT: Each detection can only be assigned to ONE square.
+        This prevents duplicate piece assignments (e.g., one queen bbox
+        appearing on two squares).
 
         Args:
             detections: Array of detection bounding boxes
             boxes: YOLO boxes object
             square: Square polygon vertices
+            used_detections: Set of already-used detection indices (optional)
 
         Returns:
-            Piece notation or 'empty'
+            Tuple of (piece_notation, detection_index)
+            - piece_notation: 'r', 'n', 'b', 'q', 'k', 'p' (or uppercase) or 'empty'
+            - detection_index: Index of matched detection, or None if empty
         """
+        if used_detections is None:
+            used_detections = set()
+
         list_of_iou = []
 
-        for detection in detections:
+        for idx, detection in enumerate(detections):
+            # Skip if this detection was already assigned to another square
+            if idx in used_detections:
+                list_of_iou.append(0.0)  # Force IoU to 0 for used detections
+                continue
+
             box_x1, box_y1, box_x2, box_y2 = detection[0], detection[1], detection[2], detection[3]
 
-            # Handle tall pieces by cropping top
-            if box_y2 - box_y1 > 60:
-                box_complete = np.array([
-                    [box_x1, box_y1 + 40],
-                    [box_x2, box_y1 + 40],
-                    [box_x2, box_y2],
-                    [box_x1, box_y2]
-                ])
-            else:
-                box_complete = np.array([
-                    [box_x1, box_y1],
-                    [box_x2, box_y1],
-                    [box_x2, box_y2],
-                    [box_x1, box_y2]
-                ])
+            # Use ONLY the bottom 25% of the bbox for IoU calculation
+            # This ensures tall pieces (queens, kings) are placed correctly
+            # based on their base position, not their tall top portion
+            bbox_height = box_y2 - box_y1
+            bottom_25_start = box_y1 + (bbox_height * 0.75)  # Start at 75% down
 
-            list_of_iou.append(self.calculate_iou(box_complete, square))
+            box_bottom_quarter = np.array([
+                [box_x1, bottom_25_start],
+                [box_x2, bottom_25_start],
+                [box_x2, box_y2],
+                [box_x1, box_y2]
+            ])
+
+            list_of_iou.append(self.calculate_iou(box_bottom_quarter, square))
 
         if not list_of_iou or max(list_of_iou) <= 0.15:
-            return 'empty'
+            return ('empty', None)
 
         num = list_of_iou.index(max(list_of_iou))
         piece_class = int(boxes.cls[num].item())
+        piece_notation = self.piece_map.get(piece_class, 'empty')
 
-        return self.piece_map.get(piece_class, 'empty')
+        return (piece_notation, num)
 
     def create_squares(self, x_coords: List[float], y_coords: List[float]) -> List[List[np.ndarray]]:
         """
@@ -912,7 +926,8 @@ class BoardDetector:
         print(f"  → Detected {len(detections)} pieces")
 
     def detect_board_state(self, image_path: str, corner_conf: float = 0.1,
-                          min_corner_distance: float = 50.0, debug: bool = False) -> Tuple[str, Image.Image]:
+                          min_corner_distance: float = 50.0, debug: bool = False,
+                          turn: str = "w") -> Tuple[str, Image.Image]:
         """
         Detect complete board state from an image.
 
@@ -1017,20 +1032,27 @@ class BoardDetector:
 
         board_array = []
         matched_pieces = 0
+        used_detections = set()  # Track which detections have been assigned
+
         for row_idx, row in enumerate(squares):
             row_pieces = []
             for col_idx, square in enumerate(row):
-                piece = self.connect_square_to_detection(detections, boxes, square)
+                piece, detection_idx = self.connect_square_to_detection(
+                    detections, boxes, square, used_detections
+                )
                 row_pieces.append(piece)
-                if piece != 'empty':
+                if piece != 'empty' and detection_idx is not None:
+                    used_detections.add(detection_idx)  # Mark as used
                     matched_pieces += 1
                     if debug:
                         square_name = chr(ord('a') + col_idx) + str(8 - row_idx)
-                        print(f"[BoardDetector]     {square_name}: {piece}")
+                        print(f"[BoardDetector]     {square_name}: {piece} (detection #{detection_idx})")
             board_array.append(row_pieces)
 
         if debug:
             print(f"[BoardDetector]   Matched {matched_pieces} pieces to squares")
+            if len(detections) > matched_pieces:
+                print(f"[BoardDetector]   Warning: {len(detections) - matched_pieces} detections not assigned to any square")
 
         # Step 7: Rotate board based on camera position
         if debug:
@@ -1046,10 +1068,12 @@ class BoardDetector:
             print("[BoardDetector] Step 8: Converting to FEN...")
 
         fen_position = self.board_to_fen(board_array)
-        full_fen = f"{fen_position} w KQkq - 0 1"
+        full_fen = f"{fen_position} {turn} KQkq - 0 1"
 
         if debug:
+            turn_name = "White" if turn == "w" else "Black"
             print(f"[BoardDetector]   FEN: {full_fen}")
+            print(f"[BoardDetector]   Turn: {turn_name}")
             print("[BoardDetector] Detection complete!\n")
 
         return full_fen, transformed_image
