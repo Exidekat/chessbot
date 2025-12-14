@@ -232,3 +232,69 @@ class CoordinateMapper:
     def clear_cache(self):
         """Clear the grid cache."""
         self.grid_cache.clear()
+
+
+def rotate_square_for_camera(square: str, camera_position: str, inverse: bool = False) -> str:
+    """
+    Rotate a chess square notation based on camera position.
+
+    When camera is positioned at 'right', the square 'a1' (bottom-left from top view)
+    appears in a different position in the camera view. We need to map the chess
+    square to the actual physical square in the camera's perspective.
+
+    Args:
+        square: Chess square notation (e.g., "e4")
+        camera_position: Camera position relative to board
+                        - "top": No rotation (camera looking straight down)
+                        - "right": 90° counter-clockwise
+                        - "bottom": 180° rotation
+                        - "left": 90° clockwise
+        inverse: If True, convert from camera view back to chess notation
+                (default: False for chess → camera mapping)
+
+    Returns:
+        Rotated square notation
+
+    Example:
+        >>> # Camera mounted on right side of board
+        >>> rotate_square_for_camera("a1", "right")
+        'a8'  # a1 in chess coords appears at a8 position in camera view
+
+        >>> # Inverse mapping (camera → chess)
+        >>> rotate_square_for_camera("a8", "right", inverse=True)
+        'a1'  # What camera sees as a8 is actually a1 in chess coords
+    """
+    if camera_position == "top":
+        return square  # No rotation needed
+
+    # Parse square into file (0-7) and rank (0-7)
+    file = ord(square[0]) - ord('a')  # 0-7 (a-h)
+    rank = int(square[1]) - 1  # 0-7 (1-8)
+
+    # Apply rotation based on camera position
+    if camera_position == "right":
+        # 90° counter-clockwise (or clockwise if inverse)
+        if not inverse:
+            new_file = rank
+            new_rank = 7 - file
+        else:
+            new_file = 7 - rank
+            new_rank = file
+    elif camera_position == "bottom":
+        # 180° rotation (same in both directions)
+        new_file = 7 - file
+        new_rank = 7 - rank
+    elif camera_position == "left":
+        # 90° clockwise (or counter-clockwise if inverse)
+        if not inverse:
+            new_file = 7 - rank
+            new_rank = file
+        else:
+            new_file = rank
+            new_rank = 7 - file
+    else:
+        # Unknown position - return unchanged
+        return square
+
+    # Convert back to square notation
+    return chr(ord('a') + new_file) + str(new_rank + 1)

@@ -54,7 +54,7 @@ def create_data_yaml(dataset_dir: Path) -> Path:
 
 
 def train_model(data_yaml: Path, epochs: int = 150, batch_size: int = 16,
-                img_size: int = 640, model_size: str = 'm'):
+                img_size: int = 1280, model_size: str = 'm'):
     """
     Train YOLO model with optimized hyperparameters.
 
@@ -62,7 +62,7 @@ def train_model(data_yaml: Path, epochs: int = 150, batch_size: int = 16,
         data_yaml: Path to data.yaml configuration
         epochs: Number of training epochs
         batch_size: Batch size for training
-        img_size: Input image size
+        img_size: Input image size (default: 1280 to match 1280x720 camera resolution)
         model_size: YOLO model size (n, s, m, l, x)
     """
     print("\n" + "=" * 60)
@@ -176,8 +176,8 @@ def main():
     parser.add_argument(
         "--img-size",
         type=int,
-        default=640,
-        help="Input image size (default: 640)"
+        default=1280,
+        help="Input image size (default: 1280 to match 1280x720 camera resolution)"
     )
     parser.add_argument(
         "--model",

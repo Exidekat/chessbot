@@ -1,14 +1,41 @@
 # VLA Module
 
-Vision-Language-Action model integration for end-to-end robot control. This module provides a skeleton for future integration of models like Pi0 from HuggingFace for learned chess manipulation policies.
+Vision-Language-Action model integration using Physical Intelligence's π₀ (pi-zero) for end-to-end robot control with color-conditioned prompts.
 
 ## Overview
 
-The VLA (Vision-Language-Action) approach represents the next evolution beyond symbolic guidance:
+The VLA (Vision-Language-Action) approach represents the evolution beyond symbolic guidance:
 - **Guidance** (current): Symbolic YOLO detection → rule-based move execution
-- **VLA** (future): End-to-end learned policy from camera pixels to robot actions
+- **VLA** (integration): π₀ end-to-end learned policy from camera pixels to robot actions
 
-**Status**: Skeleton structure created for future implementation.
+**Status**: OpenPI submodule integrated, VLA scripts in development.
+
+## Quick Start
+
+```bash
+# 1. Initialize OpenPI submodule
+git submodule update --init --recursive
+
+# 2. Install OpenPI dependencies to ltx conda environment (CONDA-SAFE METHOD)
+conda activate ltx
+pip install -r vla/openpi_requirements.txt
+pip install -e submodules/openpi/packages/openpi-client/
+pip install -e submodules/openpi/
+
+# 3. Verify installation
+python vla/verify_openpi.py
+
+# 4. Collect training episodes
+python vla/vla_collect_episodes.py --output data/episodes/
+
+# 5. Fine-tune π₀ on chess data
+python vla/vla_finetune.py --episodes data/episodes/ --output checkpoints/
+
+# 6. Deploy fine-tuned model
+python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt
+```
+
+**Important:** Do NOT use `uv sync` as recommended by OpenPI documentation - it creates conflicting virtual environments. Always use the conda-safe pip installation method above. See `vla/INSTALL_OPENPI.md` for detailed installation instructions, troubleshooting, and dependency resolution.
 
 ## Planned Architecture
 

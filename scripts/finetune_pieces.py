@@ -20,7 +20,7 @@ from ultralytics import YOLO
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=640):
+def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=1280):
     """
     Fine-tune piece detection model.
 
@@ -29,7 +29,7 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=64
         base_model: Path to base model to fine-tune from
         output_dir: Directory for training outputs
         epochs: Number of training epochs
-        imgsz: Image size for training
+        imgsz: Image size for training (default: 1280 to match 1280x720 camera resolution)
     """
     print("=" * 60)
     print("PIECE DETECTION MODEL FINE-TUNING")

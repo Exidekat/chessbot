@@ -26,9 +26,17 @@ import gc
 # Add parent directory to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Import from new guidance module
+# Import from guidance module
 from guidance.board_detector import BoardDetector
 from guidance.move_calculator import MoveCalculator
+
+# Import shared utilities
+from utils.camera_helpers import (
+    get_available_cameras,
+    select_camera,
+    get_camera_index_from_device,
+    capture_4k_downscale
+)
 
 
 def print_board(board: chess.Board):
@@ -38,219 +46,6 @@ def print_board(board: chess.Board):
     print("=" * 40)
     print(board)
     print("=" * 40)
-
-
-def get_available_cameras():
-    """
-    Detect all available USB cameras.
-
-    Returns:
-        list: List of tuples (device_path, device_info)
-    """
-    cameras = []
-
-    # Method 1: Try v4l2 (Linux)
-    try:
-        result = subprocess.run(
-            ["v4l2-ctl", "--list-devices"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            current_device_name = None
-
-            for line in lines:
-                if line and not line.startswith('\t') and not line.startswith(' '):
-                    # Device name line
-                    current_device_name = line.strip().rstrip(':')
-                elif line.strip().startswith('/dev/video'):
-                    # Device path line
-                    device_path = line.strip()
-                    if current_device_name:
-                        cameras.append((device_path, current_device_name))
-
-            return cameras
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # Method 2: Fallback - try opening /dev/video* devices
-    print("v4l2-ctl not available, using fallback camera detection...")
-    for i in range(10):
-        device_path = f"/dev/video{i}"
-        if Path(device_path).exists():
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                # Try to read a frame to verify it's a real camera
-                ret, _ = cap.read()
-                if ret:
-                    cameras.append((device_path, f"Camera {i}"))
-                cap.release()
-
-    return cameras
-
-
-def select_camera(cameras):
-    """
-    Prompt user to select a camera from the list.
-
-    Args:
-        cameras: List of (device_path, device_info) tuples
-
-    Returns:
-        str: Selected device path
-    """
-    print("\n" + "=" * 60)
-    print("Multiple cameras detected:")
-    print("=" * 60)
-
-    for idx, (device_path, device_info) in enumerate(cameras, 1):
-        print(f"  [{idx}] {device_path} - {device_info}")
-
-    print("=" * 60)
-
-    while True:
-        try:
-            choice = input(f"\nSelect camera [1-{len(cameras)}]: ").strip()
-            idx = int(choice) - 1
-
-            if 0 <= idx < len(cameras):
-                selected = cameras[idx][0]
-                print(f"[OK] Selected: {selected}")
-                return selected
-            else:
-                print(f"Invalid selection. Please enter a number between 1 and {len(cameras)}.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-        except KeyboardInterrupt:
-            print("\n\n[X] Cancelled by user")
-            sys.exit(1)
-
-
-def get_camera_index_from_device(device_path):
-    """
-    Extract camera index from device path (e.g., /dev/video0 -> 0).
-
-    Args:
-        device_path: Path to video device
-
-    Returns:
-        int: Camera index for OpenCV
-    """
-    try:
-        # Extract number from /dev/video{N}
-        if device_path.startswith('/dev/video'):
-            return int(device_path.replace('/dev/video', ''))
-    except ValueError:
-        pass
-
-    # Fallback: try to parse as integer
-    try:
-        return int(device_path)
-    except ValueError:
-        print(f"[X] Cannot parse device path: {device_path}")
-        sys.exit(1)
-
-
-def capture_4k_downscale(device_path, output_path):
-    """
-    Capture 4K MJPEG video for 1 second, then downscale best frame to 1280x720.
-
-    This approach uses the camera's 4K MJPEG mode (which produces better quality)
-    and downscales to the 720p resolution required by detection models.
-
-    Args:
-        device_path: Camera device path
-        output_path: Path to save the captured image
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    camera_index = get_camera_index_from_device(device_path)
-
-    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
-
-    # Configure camera for MJPEG 3840x2160 (4K)
-    print(f"[CameraCapture] Setting MJPEG 3840x2160 @ 30fps format...")
-    try:
-        subprocess.run([
-            "v4l2-ctl",
-            f"--device={device_path}",
-            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
-            "--set-parm=30"
-        ], check=True, capture_output=True, text=True)
-        print(f"[CameraCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
-    except subprocess.CalledProcessError as e:
-        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
-        print(f"[CameraCapture] Continuing with OpenCV defaults...")
-
-    # Open camera with V4L2 backend
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-
-    if not cap.isOpened():
-        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
-        return False
-
-    # Explicitly set resolution and FPS in OpenCV
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-
-    # Verify resolution and FPS
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
-
-    if width != 3840 or height != 2160:
-        print(f"[CameraCapture] Warning: Expected 3840x2160, got {width}x{height}")
-        print(f"[CameraCapture] Attempting to continue with available resolution")
-
-    # Capture frames for 1 second
-    print(f"[CameraCapture] Capturing 4K frames for 1 second...")
-    frames = []
-    start_time = time.time()
-    frame_count = 0
-
-    while time.time() - start_time < 1.0:
-        ret, frame = cap.read()
-        if not ret:
-            print(f"[CameraCapture] [X] Failed to read frame {frame_count + 1}")
-            del cap
-            gc.collect()
-            return False
-        frames.append(frame)
-        frame_count += 1
-
-    print(f"[CameraCapture] [OK] Captured {len(frames)} 4K frames")
-
-    # Release camera early (before processing)
-    del cap
-    gc.collect()
-    print("[CameraCapture] [OK] Camera released (GC)")
-
-    if not frames:
-        print(f"[CameraCapture] [X] No frames captured")
-        return False
-
-    # Use the middle frame (best chance of avoiding motion blur from start/end)
-    middle_idx = len(frames) // 2
-    best_frame = frames[middle_idx]
-    print(f"[CameraCapture] Using frame {middle_idx + 1}/{len(frames)} (middle frame)")
-
-    # Downscale to 1280x720 using high-quality interpolation
-    print(f"[CameraCapture] Downscaling from {best_frame.shape[1]}x{best_frame.shape[0]} to 1280x720...")
-    downscaled = cv2.resize(best_frame, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
-
-    # Save downscaled image
-    cv2.imwrite(str(output_path), downscaled)
-    print(f"[CameraCapture] [OK] Photo saved: {output_path}")
-    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
-
-    return True
 
 
 def capture_yuyv_720p(device_path, output_path):
@@ -340,10 +135,10 @@ def main():
         description="Best Move Demo - Unified Guidance System with Live Camera Capture"
     )
     parser.add_argument(
-        "--device",
+        "--global-camera",
         type=str,
         default=None,
-        help="Specific camera device (e.g., /dev/video0 or 0). If not specified, auto-detects."
+        help="Global/overhead camera device (e.g., /dev/video0). If not specified, auto-detects."
     )
     parser.add_argument(
         "--engine",
@@ -382,69 +177,29 @@ def main():
     parser.add_argument(
         "--rotation",
         type=str,
-        default=None,
+        default="right",
         choices=["left", "right", "top", "bottom"],
-        help="Camera rotation relative to board (default: right). Use 'top' for no rotation."
-    )
-    # Legacy aliases for common rotations
-    parser.add_argument(
-        "--left",
-        action="store_const",
-        const="left",
-        dest="rotation",
-        help="Shortcut for --rotation left"
-    )
-    parser.add_argument(
-        "--right",
-        action="store_const",
-        const="right",
-        dest="rotation",
-        help="Shortcut for --rotation right (default)"
+        help="Camera rotation relative to board (default: right)"
     )
     parser.add_argument(
         "--turn",
         type=str,
-        default=None,
-        choices=["white", "black", "w", "b"],
+        default="white",
+        choices=["white", "black"],
         help="Whose turn to calculate move for (default: white)"
-    )
-    # Convenient aliases for turn
-    parser.add_argument(
-        "--white",
-        action="store_const",
-        const="w",
-        dest="turn",
-        help="Calculate move for white (default)"
-    )
-    parser.add_argument(
-        "--black",
-        action="store_const",
-        const="b",
-        dest="turn",
-        help="Calculate move for black"
     )
 
     args = parser.parse_args()
 
-    # Default to 'right' if no rotation specified (backward compatibility)
-    if args.rotation is None:
-        args.rotation = "right"
-
-    # Default to white's turn if not specified
-    if args.turn is None:
-        args.turn = "w"
-    elif args.turn == "white":
-        args.turn = "w"
-    elif args.turn == "black":
-        args.turn = "b"
+    # Normalize turn to single letter for internal use
+    turn_letter = "w" if args.turn == "white" else "b"
 
     print("=" * 60)
     print("Best Move Demo - Unified Guidance System")
     print("=" * 60)
     print(f"Debug mode: {'enabled' if args.debug else 'disabled'}")
     print(f"Board rotation: {args.rotation}")
-    turn_name = "White" if args.turn == "w" else "Black"
-    print(f"Calculate move for: {turn_name}")
+    print(f"Calculate move for: {args.turn.capitalize()}")
     if args.debug:
         print(f"Corner confidence: {args.corner_conf}")
         print(f"Min corner distance: {args.min_corner_dist}")
@@ -456,9 +211,9 @@ def main():
     print("=" * 60)
 
     # Determine which camera to use
-    if args.device:
+    if args.global_camera:
         # User specified device
-        device_path = args.device
+        device_path = args.global_camera
         print(f"Using specified device: {device_path}")
     else:
         # Auto-detect cameras
@@ -512,7 +267,7 @@ def main():
             corner_conf=args.corner_conf,
             min_corner_distance=args.min_corner_dist,
             debug=args.debug,
-            turn=args.turn
+            turn=turn_letter
         )
         print("[OK] Board state detected")
         print()

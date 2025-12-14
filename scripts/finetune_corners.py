@@ -114,7 +114,7 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
     return str(temp_yaml_path)
 
 
-def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=640):
+def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=1280):
     """
     Fine-tune corner detection model.
 
@@ -123,7 +123,7 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=64
         base_model: Path to base model to fine-tune from
         output_dir: Directory for training outputs
         epochs: Number of training epochs
-        imgsz: Image size for training
+        imgsz: Image size for training (default: 1280 to match 1280x720 camera resolution)
     """
     print("=" * 60)
     print("CORNER DETECTION MODEL FINE-TUNING")
@@ -274,8 +274,8 @@ def main():
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=640,
-        help="Image size for training (default: 640)"
+        default=1280,
+        help="Image size for training (default: 1280 to match 1280x720 camera resolution)"
     )
 
     args = parser.parse_args()

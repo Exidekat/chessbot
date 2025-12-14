@@ -1,5 +1,7 @@
 # Script Usage Guide
 
+**NOTE**: This guide uses the new standardized argument names. See STANDARDIZATION.md for migration details from old argument names.
+
 ## Setup and Configuration
 
 # Download required YOLO models (run on first setup)
@@ -39,8 +41,8 @@ python scripts/best_move_demo.py
 # Run full pipeline with debug visualizations enabled
 python scripts/best_move_demo.py --debug
 
-# Run full pipeline with specific camera device
-python scripts/best_move_demo.py --device /dev/video0
+# Run full pipeline with specific global camera device (UPDATED ARG NAME)
+python scripts/best_move_demo.py --global-camera /dev/video0
 
 # Run full pipeline without calculating best move (no Stockfish required)
 python scripts/best_move_demo.py --no-bestmove
@@ -51,28 +53,28 @@ python scripts/best_move_demo.py --debug --corner-conf 0.005 --min-corner-dist 3
 # Run full pipeline with custom engine time limit
 python scripts/best_move_demo.py --time 2.0
 
-# Run full pipeline with all custom parameters
-python scripts/best_move_demo.py --device /dev/video0 --debug --corner-conf 0.005 --min-corner-dist 30 --time 2.0
+# Run full pipeline with all custom parameters (UPDATED ARG NAMES)
+python scripts/best_move_demo.py --global-camera /dev/video0 --debug --corner-conf 0.005 --min-corner-dist 30 --time 2.0 --turn white --rotation right
 
 ## VLA Training Data Collection
 
 # Generate stage-by-stage move overlays for VLA training (captures photo, detects board, calculates best move, generates interactive overlays)
 python scripts/create_overlay_demo.py
 
-# Generate overlays with specific camera device
-python scripts/create_overlay_demo.py --device /dev/video0
+# Generate overlays with specific camera device (UPDATED ARG NAME)
+python scripts/create_overlay_demo.py --global-camera /dev/video0
 
 # Generate overlays with custom corner detection parameters
 python scripts/create_overlay_demo.py --corner-conf 0.005 --min-corner-dist 30
 
-# Generate overlays for black's turn instead of white's turn
-python scripts/create_overlay_demo.py --black
+# Generate overlays for black's turn instead of white's turn (UPDATED ARG NAME)
+python scripts/create_overlay_demo.py --turn black
 
 # Generate overlays with board rotation (camera positioned on right side of board)
-python scripts/create_overlay_demo.py --right
+python scripts/create_overlay_demo.py --rotation right
 
-# Generate overlays with all custom parameters
-python scripts/create_overlay_demo.py --device /dev/video0 --right --black --corner-conf 0.005 --min-corner-dist 30
+# Generate overlays with all custom parameters (UPDATED ARG NAMES)
+python scripts/create_overlay_demo.py --global-camera /dev/video0 --rotation right --turn black --corner-conf 0.005 --min-corner-dist 30
 
 ## Virtual Camera with Live Overlay (Advanced VLA Training)
 
@@ -82,11 +84,31 @@ sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam
 # Stream live 720p feed with move overlays to virtual camera /dev/video7 (continuously updates base image every ~1 second)
 python scripts/virtual_overlay_demo.py
 
-# Stream with specific camera device
-python scripts/virtual_overlay_demo.py --device /dev/video0
+# Stream with specific camera device (UPDATED ARG NAME)
+python scripts/virtual_overlay_demo.py --global-camera /dev/video0
 
-# Stream with board rotation and custom parameters
-python scripts/virtual_overlay_demo.py --device /dev/video0 --right --black
+# Stream with board rotation and custom parameters (UPDATED ARG NAMES)
+python scripts/virtual_overlay_demo.py --global-camera /dev/video0 --rotation right --turn black
+
+## VLA Deployment (Physical Intelligence π₀.₅ Model)
+
+# Deploy π₀.₅ base model for chess robot control (auto-detects cameras)
+python vla/vla_deploy.py --no-robot
+
+# Deploy with specific cameras (global overhead + gripper)
+python vla/vla_deploy.py --no-robot --global-camera /dev/video4 --gripper-camera /dev/video0
+
+# Deploy with fine-tuned checkpoint instead of base weights
+python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt --no-robot
+
+# Deploy for black's turn with board rotation
+python vla/vla_deploy.py --no-robot --turn black --rotation right
+
+# Deploy with SO-100 robot arm connected (requires hardware)
+python vla/vla_deploy.py --global-camera /dev/video4 --gripper-camera /dev/video0 --robot-port /dev/ttyUSB0
+
+# Deploy with all custom parameters
+python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt --global-camera /dev/video4 --gripper-camera /dev/video0 --turn white --rotation right --corner-conf 0.005 --min-corner-dist 30
 
 ## Overlay Generation
 

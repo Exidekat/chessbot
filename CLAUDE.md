@@ -13,6 +13,10 @@ ChessBot is a modular chess robot system with YOLO-based computer vision, multi-
 - **Python Environment**: Always use the 'ltx' conda environment for testing
 - **Package Installation**: Install packages to 'ltx' environment, never 'base'
 - If import errors occur, update requirements.txt and request user to install to ltx environment
+- **Git Submodules**: This project uses git submodules for external dependencies
+  - `submodules/openpi`: Physical Intelligence's π₀ VLA model (vision-language-action)
+  - `submodules/real-life-chess-vision`: Original chess vision reference
+  - Initialize submodules: `git submodule update --init --recursive`
 
 ## Common Commands
 
@@ -91,7 +95,14 @@ chessbot/
 │   └── camera_manager.py       # Unified interface
 │
 ├── controls/           # ROS robot control (SKELETON - awaiting hardware)
-├── vla/                # Future VLA integration (SKELETON)
+├── vla/                # π₀ VLA integration
+│   ├── vla_deploy.py           # Deploy π₀ model for inference
+│   ├── vla_collect_episodes.py # Collect training episodes
+│   └── vla_finetune.py         # Fine-tune π₀ on chess data
+│
+├── submodules/         # External dependencies (git submodules)
+│   ├── openpi/                 # Physical Intelligence π₀ VLA
+│   └── real-life-chess-vision/ # Original chess vision reference
 ├── viz/                # Web-based visualization tool
 │   ├── api.py                  # FastAPI server with WebSocket
 │   ├── stream_manager.py       # JPEG frame encoding
@@ -445,6 +456,93 @@ The script:
 3. For each stage, overlays color-coded highlights and streams to virtual camera
 4. User presses ENTER to save final frame for that stage
 5. Outputs stage frames with VLM prompts for training
+
+## π₀ VLA Integration
+
+The ChessBot system integrates with Physical Intelligence's π₀ (pi-zero) vision-language-action model for end-to-end robot learning.
+
+### VLA Workflow
+
+**Phase 1: Episode Collection**
+```bash
+# Collect training episodes with color-conditioned prompts
+python vla/vla_collect_episodes.py --output data/episodes/
+```
+- Uses `virtual_overlay_demo.py` to stream overlays to /dev/video7
+- Records each move stage with synchronized video + VLM prompt
+- Saves episodes in OpenPI-compatible format
+
+**Phase 2: Fine-tuning**
+```bash
+# Fine-tune π₀ on collected chess episodes
+python vla/vla_finetune.py --episodes data/episodes/ --output checkpoints/
+```
+- Fine-tunes base π₀ model on chess-specific data
+- Uses color-conditioned prompts for multimodal alignment
+- Outputs fine-tuned checkpoint for deployment
+
+**Phase 3: Deployment**
+```bash
+# Deploy fine-tuned model for inference
+python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt
+```
+- Loads fine-tuned model
+- Processes live camera feed + board state
+- Generates action sequences for robot execution
+
+### OpenPI Submodule
+
+The π₀ model is integrated via git submodule at `submodules/openpi/`:
+
+```bash
+# Initialize OpenPI submodule (first time)
+git submodule update --init --recursive
+
+# Install OpenPI dependencies to ltx conda environment (CONDA-SAFE METHOD)
+conda activate ltx
+pip install -r vla/openpi_requirements.txt
+pip install -e submodules/openpi/packages/openpi-client/
+pip install -e submodules/openpi/
+
+# Verify installation
+python vla/verify_openpi.py
+```
+
+**Note:** Do NOT use `uv sync` as recommended by OpenPI docs - it creates conflicting virtual environments. Instead, use the conda-safe installation method above. See `vla/INSTALL_OPENPI.md` for detailed installation instructions and troubleshooting.
+
+**Requirements:**
+- GPU: NVIDIA with >8GB VRAM for inference, >22.5GB for LoRA fine-tuning
+- OS: Ubuntu 22.04 (tested)
+- Python: 3.11+ (installed in ltx conda environment)
+- CUDA: 12.x (for JAX/PyTorch GPU support)
+
+**Model Variants:**
+- π₀: Flow-based VLA (base model)
+- π₀-FAST: Autoregressive VLA with FAST action tokenizer
+- π₀.₅: Upgraded version with better open-world generalization
+
+See `submodules/openpi/README.md` for detailed OpenPI documentation.
+
+### VLA Scripts (Planned)
+
+Three scripts will handle the complete VLA pipeline:
+
+1. **`vla/vla_collect_episodes.py`**: Episode data collection
+   - Interfaces with virtual_overlay_demo.py
+   - Records synchronized video + prompts + robot actions
+   - Saves in OpenPI training format
+
+2. **`vla/vla_finetune.py`**: Model fine-tuning
+   - Loads base π₀ checkpoint
+   - Fine-tunes on chess episodes (LoRA or full)
+   - Validates on held-out episodes
+   - Saves fine-tuned checkpoint
+
+3. **`vla/vla_deploy.py`**: Inference deployment
+   - Loads fine-tuned model
+   - Processes camera feed + board state
+   - Generates color-conditioned actions
+   - Interfaces with robot control system
 
 ## Development Workflow
 

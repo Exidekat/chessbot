@@ -896,10 +896,10 @@ def main():
         description="Create Overlay Demo - Generate stage-by-stage move overlays for VLA training"
     )
     parser.add_argument(
-        "--device",
+        "--global-camera",
         type=str,
         default=None,
-        help="Specific camera device (e.g., /dev/video0 or 0). If not specified, auto-detects."
+        help="Global/overhead camera device (e.g., /dev/video0). If not specified, auto-detects."
     )
     parser.add_argument(
         "--engine",
@@ -942,14 +942,6 @@ def main():
         choices=["left", "right", "top", "bottom"],
         help="Camera rotation relative to board (default: right). Use 'top' for no rotation."
     )
-    # Legacy aliases for common rotations
-    parser.add_argument(
-        "--left",
-        action="store_const",
-        const="left",
-        dest="rotation",
-        help="Shortcut for --rotation left"
-    )
     parser.add_argument(
         "--right",
         action="store_const",
@@ -960,8 +952,8 @@ def main():
     parser.add_argument(
         "--turn",
         type=str,
-        default=None,
-        choices=["white", "black", "w", "b"],
+        default="white",
+        choices=["white", "black"],
         help="Whose turn to calculate move for (default: white)"
     )
     # Convenient aliases for turn
@@ -986,13 +978,8 @@ def main():
     if args.rotation is None:
         args.rotation = "right"
 
-    # Default to white's turn if not specified
-    if args.turn is None:
-        args.turn = "w"
-    elif args.turn == "white":
-        args.turn = "w"
-    elif args.turn == "black":
-        args.turn = "b"
+    # Normalize turn to single letter for internal use
+    turn_letter = "w" if args.turn == "white" else "b"
 
     # Force debug mode (required for transformed image output)
     args.debug = True
@@ -1013,9 +1000,9 @@ def main():
     print("=" * 60)
 
     # Determine which camera to use
-    if args.device:
+    if args.global_camera:
         # User specified device
-        device_path = args.device
+        device_path = args.global_camera
         print(f"Using specified device: {device_path}")
     else:
         # Auto-detect cameras

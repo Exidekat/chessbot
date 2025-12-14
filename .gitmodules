@@ -1,3 +1,6 @@
 [submodule "submodules/real-life-chess-vision"]
 	path = submodules/real-life-chess-vision
 	url = https://github.com/shainisan/real-life-chess-vision
+[submodule "submodules/openpi"]
+	path = submodules/openpi
+	url = https://github.com/Physical-Intelligence/openpi.git
