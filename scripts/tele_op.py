@@ -8,6 +8,7 @@ Features:
 3. Interactive menu with options:
    - Exit: Cleanly disconnect all robots
    - Tele-op Leader/Follower: Mirror leader arm movements on follower arm
+   - Adjust Home Positions: Home-to-Home tele-op with ability to save new home positions
 4. Leader/Follower tele-op at 15Hz control rate
 5. Automatic torque release on exit
 
@@ -649,6 +650,12 @@ def run_interactive_menu(robots: List[RobotController]):
                 # After returning, reset robots to home
                 reset_robots_to_home(robots)
 
+            elif choice == 3:
+                # Adjust Home Positions
+                run_adjust_home_positions(robots, keyboard)
+                # After returning, reset robots to home
+                reset_robots_to_home(robots)
+
 
 def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Optional[int]:
     """
@@ -675,6 +682,7 @@ def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Op
         print("OPTIONS:")
         print("  [1] Exit")
         print("  [2] Tele-op Leader/Follower")
+        print("  [3] Adjust Home Positions")
         print("=" * 115)
         print("\nPress number key to select option...")
 
@@ -683,6 +691,8 @@ def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Op
             return 1  # Exit
         elif key == '2':
             return 2  # Tele-op
+        elif key == '3':
+            return 3  # Adjust Home
 
 
 def select_robot_port(robots: List[RobotController], keyboard: KeyboardInput,
@@ -887,6 +897,242 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         key = keyboard.get_key(timeout=0.01)
         if key == 'ESC':
             teleop_active = False
+
+        # Maintain 15 Hz loop rate
+        elapsed = time.time() - loop_start
+        sleep_time = loop_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+def save_joint_home_to_config(robot: RobotController, joint_idx: int, new_home_rad: float) -> bool:
+    """
+    Save a new home position for a joint to the robot's config file.
+
+    Args:
+        robot: The robot controller
+        joint_idx: Joint index (0-5)
+        new_home_rad: New home position in radians
+
+    Returns:
+        bool: True if save successful
+    """
+    config_path = get_config_path_for_port(robot.port)
+
+    if not config_path.exists():
+        print(f"[ERROR] Config file not found: {config_path}")
+        return False
+
+    try:
+        # Read existing config
+        rows = []
+        with open(config_path, 'r') as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            for row in reader:
+                rows.append(row)
+
+        # Update the specific joint's home position
+        if joint_idx < len(rows):
+            rows[joint_idx]['home_rad'] = f"{new_home_rad:.6f}"
+            rows[joint_idx]['home_deg'] = f"{np.degrees(new_home_rad):.2f}"
+
+        # Write back to file
+        with open(config_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        # Update in-memory config
+        robot.joint_configs[joint_idx].home_rad = new_home_rad
+
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Failed to save config: {e}")
+        return False
+
+
+def run_adjust_home_positions(robots: List[RobotController], keyboard: KeyboardInput):
+    """
+    Run Home-to-Home tele-op mode for adjusting home positions.
+
+    Movement calculation: Follower Target = Follower Home + (Leader Current - Leader Home)
+
+    Features:
+    - Home-to-Home relative movement
+    - Press 0-5 to save current follower joint position as new home
+    - ESC returns to main menu
+    """
+    # Step 1: Select leader
+    leader = select_robot_port(robots, keyboard, "Select LEADER Arm Port")
+    if leader is None:
+        return
+
+    # Step 2: Select follower (excluding leader)
+    follower = select_robot_port(robots, keyboard, "Select FOLLOWER Arm Port",
+                                  exclude_port=leader.port)
+    if follower is None:
+        return
+
+    # Check follower has port-specific config (required for saving)
+    if follower.config_source != "port-specific":
+        clear_screen()
+        print("=" * 60)
+        print("!! ERROR !!")
+        print("=" * 60)
+        print()
+        print(f"  Follower {follower.port} does not have a port-specific config.")
+        print(f"  Config source: {follower.config_source}")
+        print()
+        print("  To adjust home positions, the follower must have a")
+        print("  port-specific config file to save changes to.")
+        print()
+        print("  Run calibration first:")
+        print(f"    python scripts/create_so100_config.py --port {follower.port}")
+        print()
+        print("=" * 60)
+        print("\n  Press any key to return...")
+        keyboard.get_key(timeout=10.0)
+        return
+
+    # Step 3: Workspace warning
+    if not show_workspace_warning(keyboard):
+        return
+
+    # Step 4: Prepare for tele-op
+    leader.stop_control_loop()
+    follower.stop_control_loop()
+
+    # Disable torque on leader (freely movable)
+    leader.release_torque()
+
+    # Enable torque on follower
+    follower.enable_torque()
+
+    # Get home positions
+    leader_home = np.array([c.home_rad for c in leader.joint_configs])
+    follower_home = np.array([c.home_rad for c in follower.joint_configs])
+
+    # Step 5: Run Home-to-Home tele-op loop at 15Hz
+    teleop_active = True
+    loop_interval = 1.0 / 15.0  # 15 Hz
+    last_save_message = ""
+    save_message_time = 0
+
+    while teleop_active:
+        loop_start = time.time()
+
+        # Read leader position
+        leader_state = leader.arm.get_state()
+        leader_positions = leader_state.joint_positions
+
+        # Calculate follower targets using Home-to-Home formula:
+        # Follower Target = Follower Home + (Leader Current - Leader Home)
+        leader_delta = leader_positions - leader_home
+        follower_targets = follower_home + leader_delta
+
+        # Send to follower (direct position mode)
+        for motor_id, target_rad in enumerate(follower_targets, start=1):
+            # Convert radians to encoder counts (0-4095)
+            encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
+            encoder_value = max(0, min(4095, encoder_value))
+
+            # Send position command directly to motor
+            packet = [
+                *follower.arm.HEADER,
+                motor_id,
+                0x05,
+                follower.arm.INSTR_WRITE,
+                follower.arm.REG_GOAL_POSITION,
+                encoder_value & 0xFF,
+                (encoder_value >> 8) & 0xFF
+            ]
+            checksum = follower.arm._calculate_checksum(packet[2:])
+            packet.append(checksum)
+            follower.arm.serial.write(bytes(packet))
+            time.sleep(0.002)
+
+        # Read actual follower position
+        follower_state = follower.arm.get_state()
+        follower_positions = follower_state.joint_positions
+
+        # Update display
+        clear_screen()
+        print("=" * 90)
+        print("Adjust Home Positions - Home-to-Home Tele-op")
+        print("=" * 90)
+        print()
+        print(f"  LEADER:   {leader.port}")
+        print(f"  FOLLOWER: {follower.port}")
+        print()
+        print("-" * 90)
+
+        # Show positions
+        leader_deg = np.degrees(leader_positions)
+        follower_deg = np.degrees(follower_positions)
+        follower_home_deg = np.degrees(follower_home)
+        follower_target_deg = np.degrees(follower_targets)
+
+        header = f"{'':20}"
+        for j in range(6):
+            header += f"{'Joint ' + str(j):>11}"
+        print(header)
+        print("-" * 90)
+
+        leader_row = f"{'LEADER':20}"
+        for pos in leader_deg:
+            leader_row += f"{pos:>11.1f}"
+        print(leader_row)
+
+        follower_row = f"{'FOLLOWER':20}"
+        for pos in follower_deg:
+            follower_row += f"{pos:>11.1f}"
+        print(follower_row)
+
+        home_row = f"{'FOLLOWER HOME':20}"
+        for pos in follower_home_deg:
+            home_row += f"{pos:>11.1f}"
+        print(home_row)
+
+        target_row = f"{'TARGET':20}"
+        for pos in follower_target_deg:
+            target_row += f"{pos:>11.1f}"
+        print(target_row)
+
+        print("-" * 90)
+        print()
+        print(f"  Control Rate: 15 Hz | Time: {time.strftime('%H:%M:%S')}")
+        print()
+
+        # Show save message if recent
+        if last_save_message and (time.time() - save_message_time) < 3.0:
+            print(f"  {last_save_message}")
+        else:
+            last_save_message = ""
+
+        print()
+        print("=" * 90)
+        print("  Press [0-5] to save current follower joint position as new HOME")
+        print("  Press [ESC] to return to Main Menu")
+        print("=" * 90)
+
+        # Check for key press
+        key = keyboard.get_key(timeout=0.01)
+        if key == 'ESC':
+            teleop_active = False
+        elif key and key.isdigit():
+            joint_idx = int(key)
+            if 0 <= joint_idx <= 5:
+                # Save current follower position as new home
+                current_pos = follower_positions[joint_idx]
+                if save_joint_home_to_config(follower, joint_idx, current_pos):
+                    # Update local follower_home array
+                    follower_home[joint_idx] = current_pos
+                    last_save_message = f"[OK] Joint {joint_idx} home saved: {np.degrees(current_pos):.1f} deg"
+                else:
+                    last_save_message = f"[ERROR] Failed to save joint {joint_idx}"
+                save_message_time = time.time()
 
         # Maintain 15 Hz loop rate
         elapsed = time.time() - loop_start

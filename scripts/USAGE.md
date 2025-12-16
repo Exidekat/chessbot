@@ -36,6 +36,7 @@ python scripts/tele_op.py --config-dir data/
 # Interactive Menu Options:
 #   [1] Exit - Cleanly disconnect all robots
 #   [2] Tele-op Leader/Follower - Mirror leader arm movements on follower at 15Hz
+#   [3] Adjust Home Positions - Home-to-Home tele-op with ability to save new home positions
 
 ## Camera Capture
 
