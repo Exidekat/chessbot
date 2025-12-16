@@ -263,19 +263,18 @@ class Pi0VLA:
             gripper_frame_resized = (gripper_frame_resized * 255).astype(np.uint8)
 
         # Get current robot state
+        # SO-100 has 6 motors total: motors 1-5 are arm joints, motor 6 is gripper
+        # joint_positions is [6] array containing all motors
         if robot_state:
-            joint_positions = robot_state.joint_positions  # [6]
-            gripper_pos = robot_state.gripper_position     # scalar
+            state_6d = robot_state.joint_positions.astype(np.float32)  # [6] all motors
         else:
-            # SO-100 has 6 joints: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper
-            joint_positions = np.zeros(5)  # 5 arm joints
-            gripper_pos = 0.5
+            # Placeholder state when no robot connected
+            state_6d = np.zeros(6, dtype=np.float32)
+            state_6d[5] = 0.5  # Gripper (motor 6) at 50% open
 
-        # Create state vector - SO-100 has 6D state (5 arm joints + gripper)
-        # Pad to 32D as expected by model config
-        state_6d = np.concatenate([joint_positions, [gripper_pos]]).astype(np.float32)
+        # Pad to 32D as expected by π₀ model config
         state_32d = np.zeros(32, dtype=np.float32)
-        state_32d[:6] = state_6d  # Use first 6 dims for SO-100 state
+        state_32d[:6] = state_6d  # First 6 dims = SO-100 state (5 arm + 1 gripper)
 
         # Step 2: Create raw observation dict using model's expected key names
         # Model expects: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb
@@ -332,13 +331,33 @@ class Pi0VLA:
             action = action[0]
 
         # Map action to SO-100 control
-        # TODO: Implement proper action space conversion based on policy output
-        # For now, extract gripper action and keep current joint positions
-        gripper_action = float(action[-1]) if len(action) > 0 else 0.5
+        # π₀ outputs normalized action deltas (typically -1 to 1 range)
+        # We need to:
+        # 1. Extract first 6 dimensions (SO-100 joints)
+        # 2. Scale from normalized space to radians
+        # 3. Apply as delta to current position
+
+        if len(action) >= 6:
+            # Extract 6D action deltas (normalized, likely -1 to 1)
+            action_deltas_normalized = action[:6]
+
+            # Scale to radians: assuming actions are in [-1, 1], map to small delta range
+            # Use conservative scaling: ±0.1 radians (~5.7 degrees) per step
+            max_delta_rad = 0.1
+            action_deltas_rad = action_deltas_normalized * max_delta_rad
+
+            # Apply delta to current state
+            predicted_joints = state_6d + action_deltas_rad
+
+            # Wraparound to [0, 2π) using modulo (continuous rotation joints)
+            predicted_joints = predicted_joints % (2 * np.pi)
+        else:
+            # Fallback: keep current positions
+            print(f"[VLA WARN] Action dimension mismatch: got {len(action)}, expected 6")
+            predicted_joints = state_6d
 
         predicted_action = {
-            "joint_positions": joint_positions,  # Keep current positions
-            "gripper": np.clip(gripper_action, 0.0, 1.0),
+            "joint_positions": predicted_joints,
             "confidence": 1.0
         }
 
@@ -359,16 +378,12 @@ class Pi0VLA:
             print("[VLA] No robot arm connected, skipping execution")
             return False
 
-        # Send joint position command
+        # Send joint position command (all 6 motors)
         success = self.robot_arm.move_joints(
             action["joint_positions"],
             speed=speed,
             blocking=False  # Non-blocking for continuous control
         )
-
-        if success:
-            # Update gripper
-            self.robot_arm.set_gripper(action["gripper"], blocking=False)
 
         return success
 
@@ -397,6 +412,18 @@ def vla_control_loop(
     print(f"Press ENTER to stop VLA control...")
     print("=" * 60)
 
+    # Open cameras once and keep them open
+    global_cap = cv2.VideoCapture(get_camera_index_from_device(global_camera), cv2.CAP_V4L2)
+    global_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    global_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    global_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    global_cap.set(cv2.CAP_PROP_FPS, 30)
+
+    gripper_cap = cv2.VideoCapture(get_camera_index_from_device(gripper_camera), cv2.CAP_V4L2)
+    gripper_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    gripper_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    gripper_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
     # Thread-safe stop flag
     stop_event = threading.Event()
 
@@ -411,50 +438,64 @@ def vla_control_loop(
     frame_count = 0
     action_count = 0
 
-    while not stop_event.is_set():
-        # Check timeout
-        if time.time() - start_time > duration:
-            print("\n[VLA] Control timeout reached")
-            break
+    try:
+        while not stop_event.is_set():
+            loop_start = time.time()
 
-        # Capture frames
-        global_frame = capture_720p_frame(global_camera)
-        gripper_frame = capture_gripper_frame(gripper_camera)
+            # Check timeout
+            if time.time() - start_time > duration:
+                print("\n[VLA] Control timeout reached")
+                break
 
-        if global_frame is None or gripper_frame is None:
-            print("[VLA] Failed to capture frames, retrying...")
-            time.sleep(0.1)
-            continue
+            # Capture frames (fast - cameras already open)
+            ret1, global_frame = global_cap.read()
+            ret2, gripper_frame = gripper_cap.read()
 
-        # Get current robot state
-        robot_state = None
-        if vla.robot_arm:
-            robot_state = vla.robot_arm.get_state()
+            if not ret1 or not ret2:
+                continue
 
-        # Get VLA action prediction
-        action = vla.predict_action(
-            global_frame,
-            gripper_frame,
-            language_prompt,
-            robot_state=robot_state
-        )
+            # Resize gripper to 224x224
+            gripper_frame = cv2.resize(gripper_frame, (224, 224))
 
-        # Execute action on SO-100
-        if vla.execute_action(action, speed=0.3):
-            action_count += 1
+            # Get current robot state
+            robot_state = None
+            if vla.robot_arm:
+                robot_state = vla.robot_arm.get_state()
 
-        # Print status every 10 frames
-        if frame_count % 10 == 0:
-            if robot_state:
-                print(f"[VLA] Frame {frame_count}: "
-                      f"joints={robot_state.joint_positions[:3]}, "
-                      f"gripper={robot_state.gripper_position:.2f}, "
-                      f"confidence={action['confidence']:.3f}")
-            else:
-                print(f"[VLA] Frame {frame_count}: action={action}")
+            # Get VLA action prediction
+            action = vla.predict_action(
+                global_frame,
+                gripper_frame,
+                language_prompt,
+                robot_state=robot_state
+            )
 
-        frame_count += 1
-        time.sleep(0.033)  # ~30 Hz control loop
+            # Execute action on SO-100
+            if vla.execute_action(action, speed=0.5):
+                action_count += 1
+
+            # Print status every 30 frames
+            if frame_count % 30 == 0:
+                elapsed = time.time() - start_time
+                hz = frame_count / elapsed if elapsed > 0 else 0
+                if robot_state:
+                    print(f"[VLA] Frame {frame_count}: {hz:.1f} Hz, "
+                          f"joints[0-2]=[{robot_state.joint_positions[0]:.2f}, "
+                          f"{robot_state.joint_positions[1]:.2f}, "
+                          f"{robot_state.joint_positions[2]:.2f}]")
+
+            frame_count += 1
+
+            # Maintain ~15 Hz loop rate
+            loop_time = time.time() - loop_start
+            sleep_time = max(0, (1.0/15) - loop_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    finally:
+        # Clean up cameras
+        global_cap.release()
+        gripper_cap.release()
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)
@@ -561,7 +602,7 @@ def main():
     robot_arm = None
     if not args.no_robot and SO100_AVAILABLE:
         try:
-            robot_arm = SO100Arm(port=args.robot_port, baudrate=115200)
+            robot_arm = SO100Arm(port=args.robot_port, baudrate=1000000)  # Feetech protocol: 1 Mbps
             if robot_arm.connect():
                 print(f"[OK] SO-100 connected on {args.robot_port}")
                 state = robot_arm.get_state()

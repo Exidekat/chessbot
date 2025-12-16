@@ -10,8 +10,28 @@ python scripts/download.py
 # Create default configuration file
 python scripts/create_config.py
 
+# Calibrate SO-100 robot arm (saves to data/so100_config_ttyACM0.csv)
+python scripts/create_so100_config.py --port /dev/ttyACM0
+
+# Calibrate second SO-100 robot (saves to data/so100_config_ttyACM1.csv)
+python scripts/create_so100_config.py --port /dev/ttyACM1
+
+# Calibrate with custom output path
+python scripts/create_so100_config.py --port /dev/ttyACM0 --output data/my_robot_config.csv
+
 # Setup virtual camera device for live overlay streaming (one-time setup, requires sudo)
 sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam" exclusive_caps=1
+
+## Robot Control (SO-100)
+
+# Teleoperation with direct position control (default) - scans ports, loads port-specific configs, homes joints
+python scripts/tele_op.py
+
+# Teleoperation with adaptive PID controller enabled
+python scripts/tele_op.py --adaptive
+
+# Teleoperation with custom config directory
+python scripts/tele_op.py --config-dir data/
 
 ## Camera Capture
 
