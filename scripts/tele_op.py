@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-SO-100 Teleoperation Script with Direct Position or Adaptive PID Control
+SO-100 Teleoperation Script with Interactive Menu
 
 Features:
 1. Direct position control (default) or Adaptive PID (--adaptive flag)
 2. Port-specific configuration loading with torque safety
-3. Stage 1: Move all joints to home position from calibration config
-4. Stage 2: Live status display of all connected SO-100 robots
+3. Interactive menu with options:
+   - Exit: Cleanly disconnect all robots
+   - Tele-op Leader/Follower: Mirror leader arm movements on follower arm
+4. Leader/Follower tele-op at 15Hz control rate
 5. Automatic torque release on exit
+
+Torque Safety:
+- Robots with port-specific configs: Torque ENABLED, homed to calibrated positions
+- Robots without port-specific configs: Torque DISABLED for safety
 
 Usage:
     python scripts/tele_op.py [--config-dir data/] [--adaptive]
@@ -20,6 +26,9 @@ import csv
 import threading
 import signal
 import os
+import select
+import termios
+import tty
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -490,57 +499,400 @@ def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
-def display_status_table(robots: List[RobotController]):
+class KeyboardInput:
+    """Non-blocking keyboard input handler for Linux terminals."""
+
+    def __init__(self):
+        self.old_settings = None
+
+    def __enter__(self):
+        """Set terminal to raw mode for character-by-character input."""
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        return self
+
+    def __exit__(self, *args):
+        """Restore terminal settings."""
+        if self.old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+    def get_key(self, timeout: float = 0.1) -> Optional[str]:
+        """
+        Get a single keypress with timeout.
+
+        Returns:
+            str: The key pressed, or None if timeout
+            Special keys: 'ESC' for escape, 'ENTER' for enter
+        """
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            char = sys.stdin.read(1)
+            if char == '\x1b':  # Escape sequence
+                # Check for arrow keys or plain escape
+                rlist2, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if rlist2:
+                    # Arrow key or other escape sequence - consume it
+                    sys.stdin.read(2)
+                    return None
+                return 'ESC'
+            elif char == '\n' or char == '\r':
+                return 'ENTER'
+            elif char.isdigit():
+                return char
+            else:
+                return char
+        return None
+
+
+def get_menu_choice(prompt_lines: List[str], num_options: int, keyboard: KeyboardInput) -> Optional[int]:
     """
-    Display live status table of all robots.
-    Updates every second until interrupted.
+    Display a menu and get user choice via number key.
+
+    Args:
+        prompt_lines: Lines to display as the menu
+        num_options: Number of valid options (1 to num_options)
+        keyboard: KeyboardInput instance
+
+    Returns:
+        int: Selected option (1-indexed), or None if ESC pressed
+    """
+    while True:
+        clear_screen()
+        for line in prompt_lines:
+            print(line)
+
+        key = keyboard.get_key(timeout=0.1)
+        if key == 'ESC':
+            return None
+        elif key and key.isdigit():
+            choice = int(key)
+            if 1 <= choice <= num_options:
+                return choice
+        time.sleep(0.05)
+
+
+def reset_robots_to_home(robots: List[RobotController]):
+    """
+    Reset all robots with port-specific configs to home position with torque enabled.
+    Disable torque on robots without port-specific configs.
+    """
+    for robot in robots:
+        if robot.config_source == "port-specific":
+            # Stop any running control loop
+            robot.stop_control_loop()
+            # Enable torque
+            robot.enable_torque()
+            # Set home targets
+            robot.set_home_targets()
+            # Start control loop
+            robot.start_control_loop()
+        else:
+            # Disable torque for safety
+            robot.release_torque()
+
+
+def build_status_table(robots: List[RobotController]) -> List[str]:
+    """Build status table lines for display."""
+    lines = []
+
+    # Header
+    header = f"{'Robot Port':<20}{'Config':<15}{'Torque':<10}{'Mode':<12}"
+    for j in range(1, 7):
+        header += f"{'J' + str(j):>8}"
+
+    lines.append("-" * 115)
+    lines.append(header)
+    lines.append("-" * 115)
+
+    # Robot rows
+    for robot in robots:
+        positions = robot.get_positions_deg()
+        torque_status = "ON" if robot.torque_enabled else "OFF"
+        control_mode = "PID" if robot.use_adaptive_pid else "Direct"
+        row = f"{robot.port:<20}{robot.config_source:<15}{torque_status:<10}{control_mode:<12}"
+        for pos in positions:
+            row += f"{pos:>8.1f}"
+        lines.append(row)
+
+    lines.append("-" * 115)
+    return lines
+
+
+def run_interactive_menu(robots: List[RobotController]):
+    """
+    Run interactive menu system for Stage 2.
+
+    Features:
+    - Main menu with status table
+    - Exit option
+    - Tele-op Leader/Follower mode
     """
     print("\n" + "=" * 80)
-    print("Stage 2: Live Status Display")
+    print("Stage 2: Interactive Menu")
     print("=" * 80)
-    print("Press Ctrl+C to exit and release torque\n")
 
-    try:
+    # Initialize robots to home positions
+    reset_robots_to_home(robots)
+
+    with KeyboardInput() as keyboard:
         while True:
-            # Build table header
-            header = f"{'Robot Port':<20}{'Config':<15}{'Torque':<10}{'Mode':<12}"
-            for j in range(1, 7):
-                header += f"{'J' + str(j):>8}"
+            choice = show_main_menu(robots, keyboard)
 
-            # Clear and print
-            clear_screen()
-            print("=" * 115)
-            print("SO-100 Teleoperation - Live Status")
-            print("=" * 115)
-            print("Press Ctrl+C to exit and release torque\n")
-            print(header)
-            print("-" * 115)
+            if choice is None or choice == 1:
+                # Exit
+                print("\n\nExiting...")
+                return
 
-            # Print each robot's status
-            for robot in robots:
-                positions = robot.get_positions_deg()
-                torque_status = "ON" if robot.torque_enabled else "OFF"
-                control_mode = "PID" if robot.use_adaptive_pid else "Direct"
-                row = f"{robot.port:<20}{robot.config_source:<15}{torque_status:<10}{control_mode:<12}"
-                for pos in positions:
-                    row += f"{pos:>8.1f}"
-                print(row)
+            elif choice == 2:
+                # Tele-op Leader/Follower
+                run_teleop_leader_follower(robots, keyboard)
+                # After returning, reset robots to home
+                reset_robots_to_home(robots)
 
-            print("-" * 115)
-            print(f"\nLast updated: {time.strftime('%H:%M:%S')}")
 
-            # Show PID gains only for enabled robots using adaptive PID
-            enabled_adaptive_robots = [r for r in robots if r.torque_enabled and r.use_adaptive_pid]
-            if enabled_adaptive_robots:
-                print("\nPID Gains (Kp, Ki, Kd) for first enabled robot:")
-                for i, pid in enumerate(enabled_adaptive_robots[0].pid_controllers):
-                    kp, ki, kd = pid.get_gains()
-                    print(f"  Joint {i}: Kp={kp:.3f}, Ki={ki:.4f}, Kd={kd:.3f}")
+def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Optional[int]:
+    """
+    Display main menu with status table and options.
 
-            time.sleep(1.0)
+    Returns:
+        int: Selected option, or None for exit
+    """
+    while True:
+        clear_screen()
+        print("=" * 115)
+        print("SO-100 Teleoperation - Main Menu")
+        print("=" * 115)
+        print()
 
-    except KeyboardInterrupt:
-        print("\n\nExiting...")
+        # Status table
+        for line in build_status_table(robots):
+            print(line)
+
+        print()
+        print(f"Last updated: {time.strftime('%H:%M:%S')}")
+        print()
+        print("=" * 115)
+        print("OPTIONS:")
+        print("  [1] Exit")
+        print("  [2] Tele-op Leader/Follower")
+        print("=" * 115)
+        print("\nPress number key to select option...")
+
+        key = keyboard.get_key(timeout=0.5)
+        if key == 'ESC' or key == '1':
+            return 1  # Exit
+        elif key == '2':
+            return 2  # Tele-op
+
+
+def select_robot_port(robots: List[RobotController], keyboard: KeyboardInput,
+                      title: str, exclude_port: Optional[str] = None) -> Optional[RobotController]:
+    """
+    Display submenu to select a robot port.
+
+    Args:
+        robots: List of connected robots
+        keyboard: Keyboard input handler
+        title: Menu title (e.g., "Select Leader Arm Port")
+        exclude_port: Port to exclude from selection (for follower selection)
+
+    Returns:
+        RobotController: Selected robot, or None if cancelled
+    """
+    available_robots = [r for r in robots if r.port != exclude_port]
+
+    if not available_robots:
+        return None
+
+    while True:
+        clear_screen()
+        print("=" * 60)
+        print(title)
+        print("=" * 60)
+        print()
+        print("Available ports:")
+        print()
+
+        for i, robot in enumerate(available_robots, start=1):
+            config_info = f"({robot.config_source})"
+            print(f"  [{i}] {robot.port} {config_info}")
+
+        print()
+        print("  [ESC] Cancel - Return to Main Menu")
+        print()
+        print("=" * 60)
+        print("\nPress number key to select port...")
+
+        key = keyboard.get_key(timeout=0.1)
+        if key == 'ESC':
+            return None
+        elif key and key.isdigit():
+            choice = int(key)
+            if 1 <= choice <= len(available_robots):
+                return available_robots[choice - 1]
+
+        time.sleep(0.05)
+
+
+def show_workspace_warning(keyboard: KeyboardInput) -> bool:
+    """
+    Display workspace clearance warning.
+
+    Returns:
+        bool: True if user confirmed, False if cancelled
+    """
+    clear_screen()
+    print("=" * 60)
+    print("!! WARNING - WORKSPACE CLEARANCE !!")
+    print("=" * 60)
+    print()
+    print("  Before starting Tele-op Leader/Follower mode:")
+    print()
+    print("  1. Ensure the FOLLOWER arm has clear workspace")
+    print("  2. Remove any obstacles that could cause collision")
+    print("  3. Keep hands away from the follower arm")
+    print("  4. The follower will MIRROR the leader's movements")
+    print()
+    print("=" * 60)
+    print()
+    print("  Press [ENTER] to confirm and start")
+    print("  Press [ESC] to cancel")
+    print()
+
+    while True:
+        key = keyboard.get_key(timeout=0.1)
+        if key == 'ESC':
+            return False
+        elif key == 'ENTER':
+            return True
+        time.sleep(0.05)
+
+
+def run_teleop_leader_follower(robots: List[RobotController], keyboard: KeyboardInput):
+    """
+    Run the tele-op leader/follower mode.
+
+    1. Select leader port
+    2. Select follower port
+    3. Show workspace warning
+    4. Run tele-op loop at 15Hz
+    5. ESC returns to main menu
+    """
+    # Step 1: Select leader
+    leader = select_robot_port(robots, keyboard, "Select LEADER Arm Port")
+    if leader is None:
+        return
+
+    # Step 2: Select follower (excluding leader)
+    follower = select_robot_port(robots, keyboard, "Select FOLLOWER Arm Port",
+                                  exclude_port=leader.port)
+    if follower is None:
+        return
+
+    # Step 3: Workspace warning
+    if not show_workspace_warning(keyboard):
+        return
+
+    # Step 4: Prepare for tele-op
+    # Stop any control loops
+    leader.stop_control_loop()
+    follower.stop_control_loop()
+
+    # Disable torque on leader (freely movable)
+    leader.release_torque()
+
+    # Enable torque on follower
+    follower.enable_torque()
+
+    # Step 5: Run tele-op loop at 15Hz
+    teleop_active = True
+    loop_interval = 1.0 / 15.0  # 15 Hz
+
+    while teleop_active:
+        loop_start = time.time()
+
+        # Read leader position
+        leader_state = leader.arm.get_state()
+        leader_positions = leader_state.joint_positions
+
+        # Send to follower (direct position mode)
+        for motor_id, target_rad in enumerate(leader_positions, start=1):
+            # Convert radians to encoder counts (0-4095)
+            encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
+            encoder_value = max(0, min(4095, encoder_value))
+
+            # Send position command directly to motor
+            packet = [
+                *follower.arm.HEADER,
+                motor_id,
+                0x05,
+                follower.arm.INSTR_WRITE,
+                follower.arm.REG_GOAL_POSITION,
+                encoder_value & 0xFF,
+                (encoder_value >> 8) & 0xFF
+            ]
+            checksum = follower.arm._calculate_checksum(packet[2:])
+            packet.append(checksum)
+            follower.arm.serial.write(bytes(packet))
+            time.sleep(0.002)
+
+        # Update display
+        clear_screen()
+        print("=" * 80)
+        print("Live Tele-op - In Progress")
+        print("=" * 80)
+        print()
+        print(f"  LEADER:   {leader.port}")
+        print(f"  FOLLOWER: {follower.port}")
+        print()
+        print("-" * 80)
+
+        # Show positions
+        leader_deg = np.degrees(leader_positions)
+        follower_state = follower.arm.get_state()
+        follower_deg = np.degrees(follower_state.joint_positions)
+
+        header = f"{'':15}"
+        for j in range(1, 7):
+            header += f"{'Joint ' + str(j):>12}"
+        print(header)
+        print("-" * 80)
+
+        leader_row = f"{'LEADER':15}"
+        for pos in leader_deg:
+            leader_row += f"{pos:>12.1f}"
+        print(leader_row)
+
+        follower_row = f"{'FOLLOWER':15}"
+        for pos in follower_deg:
+            follower_row += f"{pos:>12.1f}"
+        print(follower_row)
+
+        # Show error
+        error_row = f"{'ERROR':15}"
+        for l, f in zip(leader_deg, follower_deg):
+            error_row += f"{abs(l - f):>12.1f}"
+        print(error_row)
+
+        print("-" * 80)
+        print()
+        print(f"  Control Rate: 15 Hz")
+        print(f"  Time: {time.strftime('%H:%M:%S')}")
+        print()
+        print("=" * 80)
+        print("  Press [ESC] to stop and return to Main Menu")
+        print("=" * 80)
+
+        # Check for ESC key
+        key = keyboard.get_key(timeout=0.01)
+        if key == 'ESC':
+            teleop_active = False
+
+        # Maintain 15 Hz loop rate
+        elapsed = time.time() - loop_start
+        sleep_time = loop_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 
 def cleanup_handler(signum, frame):
@@ -616,47 +968,23 @@ def main():
 
     print(f"\n[OK] Connected to {len(robots)} robot(s)")
 
-    # Stage 1: Move to home positions (only for robots with port-specific configs)
-    print("\n" + "=" * 80)
-    print("Stage 1: Moving to Home Positions")
-    print("=" * 80)
-
+    # Show config summary
+    print("\nConfiguration summary:")
     for robot in robots:
-        if robot.config_source == "port-specific":
-            print(f"\n{robot.port}: Port-specific config found")
-            print(f"  Enabling torque on all 6 joints...")
-            robot.enable_torque()
-            print(f"  Setting home targets and starting PID control...")
-            robot.set_home_targets()
-            robot.start_control_loop()
-        else:
-            print(f"\n{robot.port}: No port-specific config ({robot.config_source})")
-            print(f"  Torque DISABLED for safety - robot will be freely movable")
-            robot.release_torque()
-
-    # Wait for homing to complete (only for robots with torque enabled)
-    enabled_robots = [r for r in robots if r.config_source == "port-specific"]
-    if enabled_robots:
-        print("\nRobots with port-specific configs are moving to home positions...")
-        print("Waiting 5 seconds for settling...")
-        time.sleep(5.0)
-
-    # Show current positions
-    print("\nCurrent positions after homing:")
-    for robot in robots:
-        positions = robot.get_positions_deg()
-        status = "ENABLED" if robot.config_source == "port-specific" else "DISABLED"
-        print(f"  {robot.port} [{status}]: {[f'{p:.1f}' for p in positions]}")
+        status = "ENABLED (has port-specific config)" if robot.config_source == "port-specific" else f"DISABLED ({robot.config_source} config)"
+        print(f"  {robot.port}: {status}")
 
     # Wait for user to proceed
     print("\n" + "-" * 80)
-    input("Press ENTER to continue to Stage 2 (Live Status Display)...")
+    input("Press ENTER to continue to Interactive Menu...")
 
-    # Stage 2: Live status display
+    # Run interactive menu (handles homing and tele-op)
     try:
-        display_status_table(robots)
+        run_interactive_menu(robots)
     except Exception as e:
-        print(f"Error in status display: {e}")
+        print(f"Error in interactive menu: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Cleanup: stop control loops and release torque
         print("\nCleaning up...")

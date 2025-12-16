@@ -24,14 +24,18 @@ sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam
 
 ## Robot Control (SO-100)
 
-# Teleoperation with direct position control (default) - scans ports, loads port-specific configs, homes joints
+# Teleoperation with interactive menu - scans ports, loads port-specific configs, shows menu
 python scripts/tele_op.py
 
-# Teleoperation with adaptive PID controller enabled
+# Teleoperation with adaptive PID controller enabled (affects homing and follower control)
 python scripts/tele_op.py --adaptive
 
 # Teleoperation with custom config directory
 python scripts/tele_op.py --config-dir data/
+
+# Interactive Menu Options:
+#   [1] Exit - Cleanly disconnect all robots
+#   [2] Tele-op Leader/Follower - Mirror leader arm movements on follower at 15Hz
 
 ## Camera Capture
 
