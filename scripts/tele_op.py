@@ -744,37 +744,62 @@ def select_robot_port(robots: List[RobotController], keyboard: KeyboardInput,
         time.sleep(0.05)
 
 
-def show_workspace_warning(keyboard: KeyboardInput) -> bool:
+def show_workspace_warning(keyboard: KeyboardInput, show_mode_selection: bool = False) -> Tuple[bool, Optional[str]]:
     """
-    Display workspace clearance warning.
+    Display workspace clearance warning with optional tele-op mode selection.
+
+    Args:
+        keyboard: Keyboard input handler
+        show_mode_selection: If True, show mode selection (for option [2])
 
     Returns:
-        bool: True if user confirmed, False if cancelled
+        Tuple[bool, Optional[str]]: (confirmed, mode)
+            - confirmed: True if user confirmed, False if cancelled
+            - mode: "home-to-home" or "encpos-to-encpos" (None if cancelled)
     """
-    clear_screen()
-    print("=" * 60)
-    print("!! WARNING - WORKSPACE CLEARANCE !!")
-    print("=" * 60)
-    print()
-    print("  Before starting Tele-op Leader/Follower mode:")
-    print()
-    print("  1. Ensure the FOLLOWER arm has clear workspace")
-    print("  2. Remove any obstacles that could cause collision")
-    print("  3. Keep hands away from the follower arm")
-    print("  4. The follower will MIRROR the leader's movements")
-    print()
-    print("=" * 60)
-    print()
-    print("  Press [ENTER] to confirm and start")
-    print("  Press [ESC] to cancel")
-    print()
+    selected_mode = "home-to-home"  # Default
 
     while True:
+        clear_screen()
+        print("=" * 70)
+        print("!! WARNING - WORKSPACE CLEARANCE !!")
+        print("=" * 70)
+        print()
+        print("  Before starting Tele-op Leader/Follower mode:")
+        print()
+        print("  1. Ensure the FOLLOWER arm has clear workspace")
+        print("  2. Remove any obstacles that could cause collision")
+        print("  3. Keep hands away from the follower arm")
+        print("  4. The follower will MIRROR the leader's movements")
+        print()
+
+        if show_mode_selection:
+            print("=" * 70)
+            print("  SELECT TELE-OP MODE:")
+            print()
+            h2h_marker = " [*]" if selected_mode == "home-to-home" else " [ ]"
+            e2e_marker = " [*]" if selected_mode == "encpos-to-encpos" else " [ ]"
+            print(f"  [1]{h2h_marker} Home-to-Home     (relative to home positions)")
+            print(f"  [2]{e2e_marker} EncPos-to-EncPos (direct encoder mirroring)")
+            print()
+
+        print("=" * 70)
+        print()
+        print("  Press [ENTER] to confirm and start")
+        if show_mode_selection:
+            print("  Press [1] or [2] to change mode")
+        print("  Press [ESC] to cancel")
+        print()
+
         key = keyboard.get_key(timeout=0.1)
         if key == 'ESC':
-            return False
+            return False, None
         elif key == 'ENTER':
-            return True
+            return True, selected_mode
+        elif show_mode_selection and key == '1':
+            selected_mode = "home-to-home"
+        elif show_mode_selection and key == '2':
+            selected_mode = "encpos-to-encpos"
         time.sleep(0.05)
 
 
@@ -784,8 +809,8 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
 
     1. Select leader port
     2. Select follower port
-    3. Show workspace warning
-    4. Run tele-op loop at 15Hz
+    3. Show workspace warning with mode selection
+    4. Run tele-op loop at 15Hz (Home-to-Home or EncPos-to-EncPos)
     5. ESC returns to main menu
     """
     # Step 1: Select leader
@@ -799,8 +824,9 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
     if follower is None:
         return
 
-    # Step 3: Workspace warning
-    if not show_workspace_warning(keyboard):
+    # Step 3: Workspace warning with mode selection
+    confirmed, teleop_mode = show_workspace_warning(keyboard, show_mode_selection=True)
+    if not confirmed:
         return
 
     # Step 4: Prepare for tele-op
@@ -814,9 +840,14 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
     # Enable torque on follower
     follower.enable_torque()
 
+    # Get home positions for Home-to-Home mode
+    leader_home = np.array([c.home_rad for c in leader.joint_configs])
+    follower_home = np.array([c.home_rad for c in follower.joint_configs])
+
     # Step 5: Run tele-op loop at 15Hz
     teleop_active = True
     loop_interval = 1.0 / 15.0  # 15 Hz
+    mode_display = "Home-to-Home" if teleop_mode == "home-to-home" else "EncPos-to-EncPos"
 
     while teleop_active:
         loop_start = time.time()
@@ -825,8 +856,17 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         leader_state = leader.arm.get_state()
         leader_positions = leader_state.joint_positions
 
+        # Calculate follower targets based on mode
+        if teleop_mode == "home-to-home":
+            # Home-to-Home: Follower Target = Follower Home + (Leader Current - Leader Home)
+            leader_delta = leader_positions - leader_home
+            follower_targets = follower_home + leader_delta
+        else:
+            # EncPos-to-EncPos: Direct mirroring
+            follower_targets = leader_positions
+
         # Send to follower (direct position mode)
-        for motor_id, target_rad in enumerate(leader_positions, start=1):
+        for motor_id, target_rad in enumerate(follower_targets, start=1):
             # Convert radians to encoder counts (0-4095)
             encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
             encoder_value = max(0, min(4095, encoder_value))
@@ -849,11 +889,12 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         # Update display
         clear_screen()
         print("=" * 80)
-        print("Live Tele-op - In Progress")
+        print(f"Live Tele-op - In Progress ({mode_display})")
         print("=" * 80)
         print()
         print(f"  LEADER:   {leader.port}")
         print(f"  FOLLOWER: {follower.port}")
+        print(f"  MODE:     {mode_display}")
         print()
         print("-" * 80)
 
@@ -861,6 +902,7 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         leader_deg = np.degrees(leader_positions)
         follower_state = follower.arm.get_state()
         follower_deg = np.degrees(follower_state.joint_positions)
+        target_deg = np.degrees(follower_targets)
 
         header = f"{'':15}"
         for j in range(1, 7):
@@ -878,10 +920,15 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
             follower_row += f"{pos:>12.1f}"
         print(follower_row)
 
-        # Show error
+        target_row = f"{'TARGET':15}"
+        for pos in target_deg:
+            target_row += f"{pos:>12.1f}"
+        print(target_row)
+
+        # Show error (between follower and target)
         error_row = f"{'ERROR':15}"
-        for l, f in zip(leader_deg, follower_deg):
-            error_row += f"{abs(l - f):>12.1f}"
+        for t, f in zip(target_deg, follower_deg):
+            error_row += f"{abs(t - f):>12.1f}"
         print(error_row)
 
         print("-" * 80)
@@ -996,8 +1043,9 @@ def run_adjust_home_positions(robots: List[RobotController], keyboard: KeyboardI
         keyboard.get_key(timeout=10.0)
         return
 
-    # Step 3: Workspace warning
-    if not show_workspace_warning(keyboard):
+    # Step 3: Workspace warning (no mode selection - always Home-to-Home for this option)
+    confirmed, _ = show_workspace_warning(keyboard, show_mode_selection=False)
+    if not confirmed:
         return
 
     # Step 4: Prepare for tele-op
