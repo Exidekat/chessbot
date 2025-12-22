@@ -32,7 +32,9 @@
       "Bash(for script in best_move_demo.py create_overlay_demo.py virtual_overlay_demo.py)",
       "Bash(do)",
       "Bash(echo:*)",
-      "Bash(timeout 5 python:*)"
+      "Bash(timeout 5 python:*)",
+      "Bash(timeout 10 python:*)",
+      "Bash(timeout 3 python:*)"
     ],
     "deny": [],
     "ask": []

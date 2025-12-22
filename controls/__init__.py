@@ -1,7 +1,7 @@
 """
 Controls Module
 
-Robot hardware control with SO-100 arm integration.
+Robot hardware control with SO-100 arm integration and high-level controller.
 """
 
 # SO-100 arm control (implemented)
@@ -10,6 +10,21 @@ try:
     SO100_AVAILABLE = True
 except ImportError:
     SO100_AVAILABLE = False
+
+# SO-100 robot controller with Joint 0 stability system
+try:
+    from .robot_controller import (
+        RobotController,
+        JointConfig,
+        load_joint_configs_for_port,
+        load_joint_configs,
+        scan_so100_ports,
+        get_config_path_for_port,
+        get_port_name,
+    )
+    ROBOT_CONTROLLER_AVAILABLE = True
+except ImportError:
+    ROBOT_CONTROLLER_AVAILABLE = False
 
 # Planned ROS components (not yet implemented)
 # from .robot_arm import RobotArm
@@ -20,6 +35,13 @@ except ImportError:
 __all__ = [
     'SO100Arm',
     'SO100State',
+    'RobotController',
+    'JointConfig',
+    'load_joint_configs_for_port',
+    'load_joint_configs',
+    'scan_so100_ports',
+    'get_config_path_for_port',
+    'get_port_name',
     # 'RobotArm',
     # 'MovementPrimitives',
     # 'CalibrationSystem',

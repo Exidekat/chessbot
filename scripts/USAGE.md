@@ -27,8 +27,8 @@ sudo modprobe v4l2loopback devices=1 video_nr=7 card_label="ChessBot Virtual Cam
 # Teleoperation with interactive menu - scans ports, loads port-specific configs, shows menu
 python scripts/tele_op.py
 
-# Teleoperation with adaptive PID controller enabled (affects homing and follower control)
-python scripts/tele_op.py --adaptive
+# Test mode - hold robots at home for 10 seconds then exit (no keyboard input required)
+python scripts/tele_op.py --test
 
 # Teleoperation with custom config directory
 python scripts/tele_op.py --config-dir data/
@@ -37,7 +37,9 @@ python scripts/tele_op.py --config-dir data/
 #   [1] Exit - Cleanly disconnect all robots
 #   [2] Tele-op Leader/Follower - Mirror leader arm movements on follower at 15Hz
 #       Mode selection: [1] Home-to-Home (default), [2] EncPos-to-EncPos
-#   [3] Adjust Home Positions - Home-to-Home tele-op with ability to save new home positions (press 0-5)
+#   [3] Adjust Home Positions - Save new home positions to config (press 0-5 to save joint)
+#       Mode selection: [1] Manual (default) - disable torque, manually position robot
+#                       [2] Tele-op - use leader arm to guide follower
 
 ## Camera Capture
 
