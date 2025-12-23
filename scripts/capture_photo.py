@@ -18,121 +18,15 @@ import sys
 import cv2
 from pathlib import Path
 from datetime import datetime
-import subprocess
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-def get_available_cameras():
-    """
-    Detect all available USB cameras.
-
-    Returns:
-        list: List of tuples (device_path, device_info)
-    """
-    cameras = []
-
-    # Method 1: Try v4l2 (Linux)
-    try:
-        result = subprocess.run(
-            ["v4l2-ctl", "--list-devices"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            current_device_name = None
-
-            for line in lines:
-                if line and not line.startswith('\t') and not line.startswith(' '):
-                    # Device name line
-                    current_device_name = line.strip().rstrip(':')
-                elif line.strip().startswith('/dev/video'):
-                    # Device path line
-                    device_path = line.strip()
-                    if current_device_name:
-                        cameras.append((device_path, current_device_name))
-
-            return cameras
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # Method 2: Fallback - try opening /dev/video* devices
-    print("v4l2-ctl not available, using fallback camera detection...")
-    for i in range(10):
-        device_path = f"/dev/video{i}"
-        if Path(device_path).exists():
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                # Try to read a frame to verify it's a real camera
-                ret, _ = cap.read()
-                if ret:
-                    cameras.append((device_path, f"Camera {i}"))
-                cap.release()
-
-    return cameras
-
-
-def select_camera(cameras):
-    """
-    Prompt user to select a camera from the list.
-
-    Args:
-        cameras: List of (device_path, device_info) tuples
-
-    Returns:
-        str: Selected device path
-    """
-    print("\n" + "=" * 60)
-    print("Multiple cameras detected:")
-    print("=" * 60)
-
-    for idx, (device_path, device_info) in enumerate(cameras, 1):
-        print(f"  [{idx}] {device_path} - {device_info}")
-
-    print("=" * 60)
-
-    while True:
-        try:
-            choice = input(f"\nSelect camera [1-{len(cameras)}]: ").strip()
-            idx = int(choice) - 1
-
-            if 0 <= idx < len(cameras):
-                selected = cameras[idx][0]
-                print(f"✓ Selected: {selected}")
-                return selected
-            else:
-                print(f"Invalid selection. Please enter a number between 1 and {len(cameras)}.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-        except KeyboardInterrupt:
-            print("\n\n✗ Cancelled by user")
-            sys.exit(1)
-
-
-def get_camera_index_from_device(device_path):
-    """
-    Extract camera index from device path (e.g., /dev/video0 -> 0).
-
-    Args:
-        device_path: Path to video device
-
-    Returns:
-        int: Camera index for OpenCV
-    """
-    try:
-        # Extract number from /dev/video{N}
-        if device_path.startswith('/dev/video'):
-            return int(device_path.replace('/dev/video', ''))
-    except ValueError:
-        pass
-
-    # Fallback: try to parse as integer
-    try:
-        return int(device_path)
-    except ValueError:
-        print(f"✗ Cannot parse device path: {device_path}")
-        sys.exit(1)
+from utils.camera_helpers import (
+    get_available_cameras,
+    select_camera,
+    get_camera_index_from_device
+)
 
 
 def capture_photo(device_path, output_path, preview=True, width=None, height=None):

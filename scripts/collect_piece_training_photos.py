@@ -21,20 +21,7 @@ from datetime import datetime
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-def get_camera_index_from_device(device_path):
-    """Extract camera index from device path."""
-    try:
-        if device_path.startswith('/dev/video'):
-            return int(device_path.replace('/dev/video', ''))
-    except ValueError:
-        pass
-
-    try:
-        return int(device_path)
-    except ValueError:
-        print(f"[X] Cannot parse device path: {device_path}")
-        sys.exit(1)
+from utils.camera_helpers import get_camera_index_from_device
 
 
 def capture_training_photos(device_path, output_dir, count=30):

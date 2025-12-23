@@ -118,6 +118,50 @@ python scripts/virtual_overlay_demo.py --global-camera /dev/video0
 # Stream with board rotation and custom parameters (UPDATED ARG NAMES)
 python scripts/virtual_overlay_demo.py --global-camera /dev/video0 --rotation right --turn black
 
+## VLA Episode Collection (Training Data Recording)
+
+# Prerequisites: v4l2loopback loaded, tele_op.py running in Terminal 1
+# Terminal 1: Run tele-op to control robot (required for episode collection)
+python scripts/tele_op.py
+
+# Terminal 2: Collect VLA training episodes at 15 FPS (passive recording from tele-op)
+python scripts/collect_vla_episodes.py --output data/episodes/
+
+# Collect with specific cameras
+python scripts/collect_vla_episodes.py --output data/episodes/ --global-camera /dev/video7 --gripper-camera /dev/video0
+
+# Collect at custom frame rate (30 FPS)
+python scripts/collect_vla_episodes.py --output data/episodes/ --fps 30
+
+# Collect with custom chess engine
+python scripts/collect_vla_episodes.py --output data/episodes/ --engine /usr/local/bin/stockfish
+
+# Collect with board rotation (camera positioned on right side)
+python scripts/collect_vla_episodes.py --output data/episodes/ --rotation right
+
+# Collect without LeRobot (raw file storage fallback)
+python scripts/collect_vla_episodes.py --output data/episodes/ --no-lerobot
+
+## VLA Episode Validation (Training Data Review)
+
+# Interactive episode review (list, info, playback, mark good/bad, export)
+python scripts/validate_vla_episodes.py --dataset data/episodes/
+
+# List all episodes with basic info
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --list
+
+# Show detailed info for specific episode
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --info 0
+
+# Playback specific episode (controls: SPACE=pause, A/D=seek, W/S=speed, Q=quit)
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --play 0
+
+# Export good episodes only to new directory
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/episodes_filtered/
+
+# Force raw file mode (disable LeRobot)
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --no-lerobot
+
 ## VLA Deployment (Physical Intelligence π₀.₅ Model)
 
 # Deploy π₀.₅ base model for chess robot control (auto-detects cameras)

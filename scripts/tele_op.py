@@ -26,9 +26,6 @@ import time
 import csv
 import signal
 import os
-import select
-import termios
-import tty
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +41,8 @@ from controls.robot_controller import (
     scan_so100_ports,
     get_config_path_for_port,
 )
+from utils.state_cache import StateCache
+from utils.keyboard_input import KeyboardInput
 
 
 # Global list of connected robots for cleanup
@@ -53,51 +52,6 @@ _connected_robots: List[RobotController] = []
 def clear_screen():
     """Clear terminal screen."""
     os.system('cls' if os.name == 'nt' else 'clear')
-
-
-class KeyboardInput:
-    """Non-blocking keyboard input handler for Linux terminals."""
-
-    def __init__(self):
-        self.old_settings = None
-
-    def __enter__(self):
-        """Set terminal to raw mode for character-by-character input."""
-        self.old_settings = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
-        return self
-
-    def __exit__(self, *args):
-        """Restore terminal settings."""
-        if self.old_settings:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
-
-    def get_key(self, timeout: float = 0.1) -> Optional[str]:
-        """
-        Get a single keypress with timeout.
-
-        Returns:
-            str: The key pressed, or None if timeout
-            Special keys: 'ESC' for escape, 'ENTER' for enter
-        """
-        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-        if rlist:
-            char = sys.stdin.read(1)
-            if char == '\x1b':  # Escape sequence
-                # Check for arrow keys or plain escape
-                rlist2, _, _ = select.select([sys.stdin], [], [], 0.01)
-                if rlist2:
-                    # Arrow key or other escape sequence - consume it
-                    sys.stdin.read(2)
-                    return None
-                return 'ESC'
-            elif char == '\n' or char == '\r':
-                return 'ENTER'
-            elif char.isdigit():
-                return char
-            else:
-                return char
-        return None
 
 
 def get_menu_choice(prompt_lines: List[str], num_options: int, keyboard: KeyboardInput) -> Optional[int]:
@@ -174,7 +128,7 @@ def build_status_table(robots: List[RobotController]) -> List[str]:
     return lines
 
 
-def run_interactive_menu(robots: List[RobotController]):
+def run_interactive_menu(robots: List[RobotController], cache: StateCache):
     """
     Run interactive menu system for Stage 2.
 
@@ -182,6 +136,10 @@ def run_interactive_menu(robots: List[RobotController]):
     - Main menu with status table
     - Exit option
     - Tele-op Leader/Follower mode
+
+    Args:
+        robots: List of connected RobotController instances
+        cache: StateCache for sharing joint positions with VLA episode collection
     """
     print("\n" + "=" * 80)
     print("Stage 2: Interactive Menu")
@@ -201,7 +159,7 @@ def run_interactive_menu(robots: List[RobotController]):
 
             elif choice == 2:
                 # Tele-op Leader/Follower
-                run_teleop_leader_follower(robots, keyboard)
+                run_teleop_leader_follower(robots, keyboard, cache)
                 # After returning, reset robots to home
                 reset_robots_to_home(robots)
 
@@ -358,7 +316,7 @@ def show_workspace_warning(keyboard: KeyboardInput, show_mode_selection: bool = 
         time.sleep(0.05)
 
 
-def run_teleop_leader_follower(robots: List[RobotController], keyboard: KeyboardInput):
+def run_teleop_leader_follower(robots: List[RobotController], keyboard: KeyboardInput, cache: StateCache):
     """
     Run the tele-op leader/follower mode.
 
@@ -458,6 +416,13 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         follower_state = follower.arm.get_state()
         follower_deg = np.degrees(follower_state.joint_positions)
         target_deg = np.degrees(follower_targets)
+
+        # Write follower joint positions to cache for VLA recording
+        cache.update_joint_positions(
+            positions=follower_state.joint_positions.tolist(),
+            gripper_state=float(follower_state.joint_positions[5]),  # Joint 6 is gripper
+            source="robot"
+        )
 
         header = f"{'':15}"
         for j in range(1, 7):
@@ -959,6 +924,9 @@ def main():
     args = parser.parse_args()
     config_dir = Path(args.config_dir)
 
+    # Initialize state cache for VLA episode collection
+    cache = StateCache("data/state_cache.json")
+
     # Register signal handlers for cleanup
     signal.signal(signal.SIGINT, cleanup_handler)
     signal.signal(signal.SIGTERM, cleanup_handler)
@@ -1074,7 +1042,7 @@ def main():
 
     # Run interactive menu (handles homing and tele-op)
     try:
-        run_interactive_menu(robots)
+        run_interactive_menu(robots, cache)
     except Exception as e:
         print(f"Error in interactive menu: {e}")
         import traceback

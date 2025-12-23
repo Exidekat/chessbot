@@ -35,7 +35,11 @@ class StateCache:
             "move_type": None,
             "action_sequence": [],
             "action_index": 0,
-            "actions_remaining": 0
+            "actions_remaining": 0,
+            "joint_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # NEW: 6 joints in radians
+            "joint_velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], # NEW: optional velocities
+            "gripper_state": 0.0,         # NEW: gripper position (joint 6)
+            "last_joint_update": 0.0      # NEW: timestamp of last update
         },
         "guidance_state": {
             "best_move": None,
@@ -244,6 +248,36 @@ class StateCache:
             if 0 <= idx < len(actions):
                 return deepcopy(actions[idx])
             return None
+
+    def update_joint_positions(
+        self,
+        positions: List[float],
+        velocities: Optional[List[float]] = None,
+        gripper_state: float = 0.0,
+        source: str = "robot"
+    ):
+        """
+        Update robot joint positions for VLA training data collection.
+
+        This method enables passive observation of robot state by collect_vla_episodes.py
+        without requiring a second serial connection to the robot. tele_op.py writes
+        joint positions here, and collect_vla_episodes.py reads them.
+
+        Args:
+            positions: List of 6 joint angles in radians
+            velocities: Optional list of 6 joint velocities (rad/s)
+            gripper_state: Gripper position (joint 6 in radians)
+            source: Source of update (default: "robot")
+        """
+        with self.lock:
+            self._state["robot_state"]["joint_positions"] = positions
+            if velocities:
+                self._state["robot_state"]["joint_velocities"] = velocities
+            self._state["robot_state"]["gripper_state"] = gripper_state
+            self._state["robot_state"]["last_joint_update"] = time.time()
+            self._state["metadata"]["timestamp"] = time.time()
+            self._state["metadata"]["last_updated_by"] = source
+            self._save()
 
     def validate(self) -> bool:
         """

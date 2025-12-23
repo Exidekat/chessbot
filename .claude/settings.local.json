@@ -34,7 +34,9 @@
       "Bash(echo:*)",
       "Bash(timeout 5 python:*)",
       "Bash(timeout 10 python:*)",
-      "Bash(timeout 3 python:*)"
+      "Bash(timeout 3 python:*)",
+      "Bash(chmod:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

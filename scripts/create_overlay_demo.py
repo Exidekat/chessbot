@@ -29,10 +29,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import from guidance module
 from guidance.board_detector import BoardDetector
 from guidance.move_calculator import MoveCalculator
-from guidance.coordinate_mapper import CoordinateMapper, rotate_square_for_camera
-from guidance.highlight_renderer import HighlightRenderer
 from guidance.move_decomposer import decompose_move
-from PIL import Image
+from guidance import rotate_square_for_camera, apply_stage_overlay_to_frame
 import numpy as np
 
 # Import shared utilities
@@ -53,347 +51,8 @@ def print_board(board: chess.Board):
     print("=" * 40)
 
 
-def get_available_cameras():
-    """
-    Detect all available USB cameras.
-
-    Returns:
-        list: List of tuples (device_path, device_info)
-    """
-    cameras = []
-
-    # Method 1: Try v4l2 (Linux)
-    try:
-        result = subprocess.run(
-            ["v4l2-ctl", "--list-devices"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            current_device_name = None
-
-            for line in lines:
-                if line and not line.startswith('\t') and not line.startswith(' '):
-                    # Device name line
-                    current_device_name = line.strip().rstrip(':')
-                elif line.strip().startswith('/dev/video'):
-                    # Device path line
-                    device_path = line.strip()
-                    if current_device_name:
-                        cameras.append((device_path, current_device_name))
-
-            return cameras
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # Method 2: Fallback - try opening /dev/video* devices
-    print("v4l2-ctl not available, using fallback camera detection...")
-    for i in range(10):
-        device_path = f"/dev/video{i}"
-        if Path(device_path).exists():
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                # Try to read a frame to verify it's a real camera
-                ret, _ = cap.read()
-                if ret:
-                    cameras.append((device_path, f"Camera {i}"))
-                cap.release()
-
-    return cameras
-
-
-def select_camera(cameras):
-    """
-    Prompt user to select a camera from the list.
-
-    Args:
-        cameras: List of (device_path, device_info) tuples
-
-    Returns:
-        str: Selected device path
-    """
-    print("\n" + "=" * 60)
-    print("Multiple cameras detected:")
-    print("=" * 60)
-
-    for idx, (device_path, device_info) in enumerate(cameras, 1):
-        print(f"  [{idx}] {device_path} - {device_info}")
-
-    print("=" * 60)
-
-    while True:
-        try:
-            choice = input(f"\nSelect camera [1-{len(cameras)}]: ").strip()
-            idx = int(choice) - 1
-
-            if 0 <= idx < len(cameras):
-                selected = cameras[idx][0]
-                print(f"[OK] Selected: {selected}")
-                return selected
-            else:
-                print(f"Invalid selection. Please enter a number between 1 and {len(cameras)}.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-        except KeyboardInterrupt:
-            print("\n\n[X] Cancelled by user")
-            sys.exit(1)
-
-
-def get_camera_index_from_device(device_path):
-    """
-    Extract camera index from device path (e.g., /dev/video0 -> 0).
-
-    Args:
-        device_path: Path to video device
-
-    Returns:
-        int: Camera index for OpenCV
-    """
-    try:
-        # Extract number from /dev/video{N}
-        if device_path.startswith('/dev/video'):
-            return int(device_path.replace('/dev/video', ''))
-    except ValueError:
-        pass
-
-    # Fallback: try to parse as integer
-    try:
-        return int(device_path)
-    except ValueError:
-        print(f"[X] Cannot parse device path: {device_path}")
-        sys.exit(1)
-
-
-def capture_4k_downscale(device_path, output_path):
-    """
-    Capture 4K MJPEG video for 1 second, then downscale best frame to 1280x720.
-
-    This approach uses the camera's 4K MJPEG mode (which produces better quality)
-    and downscales to the 720p resolution required by detection models.
-
-    Args:
-        device_path: Camera device path
-        output_path: Path to save the captured image
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    camera_index = get_camera_index_from_device(device_path)
-
-    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
-
-    # Configure camera for MJPEG 3840x2160 (4K)
-    print(f"[CameraCapture] Setting MJPEG 3840x2160 @ 30fps format...")
-    try:
-        subprocess.run([
-            "v4l2-ctl",
-            f"--device={device_path}",
-            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
-            "--set-parm=30"
-        ], check=True, capture_output=True, text=True)
-        print(f"[CameraCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
-    except subprocess.CalledProcessError as e:
-        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
-        print(f"[CameraCapture] Continuing with OpenCV defaults...")
-
-    # Open camera with V4L2 backend
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-
-    if not cap.isOpened():
-        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
-        return False
-
-    # Explicitly set resolution and FPS in OpenCV
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-
-    # Verify resolution and FPS
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
-
-    if width != 3840 or height != 2160:
-        print(f"[CameraCapture] Warning: Expected 3840x2160, got {width}x{height}")
-        print(f"[CameraCapture] Attempting to continue with available resolution")
-
-    # Capture frames for 1 second
-    print(f"[CameraCapture] Capturing 4K frames for 1 second...")
-    frames = []
-    start_time = time.time()
-    frame_count = 0
-
-    while time.time() - start_time < 1.0:
-        ret, frame = cap.read()
-        if not ret:
-            print(f"[CameraCapture] [X] Failed to read frame {frame_count + 1}")
-            del cap
-            gc.collect()
-            return False
-        frames.append(frame)
-        frame_count += 1
-
-    print(f"[CameraCapture] [OK] Captured {len(frames)} 4K frames")
-
-    # Release camera early (before processing)
-    del cap
-    gc.collect()
-    print("[CameraCapture] [OK] Camera released (GC)")
-
-    if not frames:
-        print(f"[CameraCapture] [X] No frames captured")
-        return False
-
-    # Use the middle frame (best chance of avoiding motion blur from start/end)
-    middle_idx = len(frames) // 2
-    best_frame = frames[middle_idx]
-    print(f"[CameraCapture] Using frame {middle_idx + 1}/{len(frames)} (middle frame)")
-
-    # Downscale to 1280x720 using high-quality interpolation
-    print(f"[CameraCapture] Downscaling from {best_frame.shape[1]}x{best_frame.shape[0]} to 1280x720...")
-    downscaled = cv2.resize(best_frame, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
-
-    # Save downscaled image
-    cv2.imwrite(str(output_path), downscaled)
-    print(f"[CameraCapture] [OK] Photo saved: {output_path}")
-    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
-
-    return True
-
-
-def capture_yuyv_720p(device_path, output_path):
-    """
-    DEPRECATED: Direct 720p YUYV capture (kept for fallback).
-    Use capture_4k_downscale() instead for better quality.
-
-    Capture a 1280x720 YUYV photo from the specified camera.
-
-    Args:
-        device_path: Camera device path
-        output_path: Path to save the captured image
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    camera_index = get_camera_index_from_device(device_path)
-
-    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
-
-    # Configure camera for YUYV 1280x720 (uncompressed)
-    print(f"[CameraCapture] Setting YUYV 1280x720 @ 10fps format...")
-    try:
-        subprocess.run([
-            "v4l2-ctl",
-            f"--device={device_path}",
-            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV",
-            "--set-parm=10"
-        ], check=True, capture_output=True, text=True)
-        print(f"[CameraCapture] [OK] Format set to YUYV 1280x720 @ 10fps")
-    except subprocess.CalledProcessError as e:
-        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
-        print(f"[CameraCapture] Continuing with OpenCV defaults...")
-
-    # Open camera with V4L2 backend
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-
-    if not cap.isOpened():
-        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
-        return False
-
-    # Explicitly set resolution and FPS in OpenCV (v4l2-ctl may not persist)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 10)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
-
-    # Verify resolution and FPS
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
-
-    if width != 1280 or height != 720:
-        print(f"[CameraCapture] Warning: Expected 1280x720, got {width}x{height}")
-        print(f"[CameraCapture] Camera may not support YUYV at 720p, using available resolution")
-
-    # Capture 2 frames (1 for warmup, use the 2nd frame)
-    # Reduced to minimize time before power-cycle with YUYV
-    print("[CameraCapture] Warming up camera and capturing...")
-    frame = None
-    for i in range(2):
-        ret, frame = cap.read()
-        if not ret:
-            print(f"[CameraCapture] [X] Failed to read frame {i+1}/2")
-            # Note: Not calling cap.release() due to WBC-0E01 quirk
-            del cap
-            gc.collect()
-            return False
-
-    # Save image directly (no transformations - same as training scripts)
-    cv2.imwrite(str(output_path), frame)
-    print(f"[CameraCapture] [OK] Photo captured: {output_path}")
-    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
-
-    # Note: Not calling cap.release() due to WBC-0E01 quirk causing errno=19
-    # Instead, delete reference and force garbage collection
-    del cap
-    gc.collect()
-    print("[CameraCapture] [OK] Camera capture complete (GC release)")
-    return True
-
-
-def rotate_square_for_camera(square: str, camera_position: str, inverse: bool = False) -> str:
-    """
-    Rotate a chess square notation based on camera position.
-
-    When camera is positioned at 'right', the square 'a1' (bottom-left from top view)
-    appears in a different position in the camera view. We need to map the chess
-    square to the actual physical square in the camera's perspective.
-
-    Args:
-        square: Chess square notation (e.g., "e4")
-        camera_position: Camera position ('top', 'right', 'bottom', 'left')
-        inverse: If True, convert from camera view back to chess notation
-
-    Returns:
-        Rotated square notation
-    """
-    if camera_position == "top":
-        return square  # No rotation
-
-    file = ord(square[0]) - ord('a')  # 0-7
-    rank = int(square[1]) - 1  # 0-7
-
-    # Apply rotation based on camera position
-    if camera_position == "right":
-        # 90° counter-clockwise (or clockwise if inverse)
-        if not inverse:
-            new_file = rank
-            new_rank = 7 - file
-        else:
-            new_file = 7 - rank
-            new_rank = file
-    elif camera_position == "bottom":
-        # 180° rotation
-        new_file = 7 - file
-        new_rank = 7 - rank
-    elif camera_position == "left":
-        # 90° clockwise (or counter-clockwise if inverse)
-        if not inverse:
-            new_file = 7 - rank
-            new_rank = file
-        else:
-            new_file = rank
-            new_rank = 7 - file
-    else:
-        return square  # Unknown position
-
-    return chr(ord('a') + new_file) + str(new_rank + 1)
+# NOTE: Camera functions imported from utils.camera_helpers
+# NOTE: rotate_square_for_camera imported from guidance module
 
 
 def generate_stage_overlay(
@@ -408,6 +67,9 @@ def generate_stage_overlay(
     """
     Generate overlay for a single move stage on the ORIGINAL 720p image.
 
+    This is a file-based wrapper around apply_stage_overlay_to_frame() from
+    the shared guidance module. Loads image from disk, applies overlay, saves result.
+
     Args:
         stage: Stage dictionary from decompose_move()
         original_image_path: Path to original 720p captured image
@@ -417,165 +79,27 @@ def generate_stage_overlay(
         perspective_matrix: Perspective transform matrix (M)
         camera_position: Camera position for rotation handling
     """
-    # Load ORIGINAL 720p image
+    # Load original 720p image
     image = cv2.imread(original_image_path)
     if image is None:
         print(f"[X] Failed to load image: {original_image_path}")
         return
 
-    # Load transformed image for coordinate mapping
-    pil_transformed = Image.open(transformed_image_path)
+    # Apply overlay using shared module
+    result = apply_stage_overlay_to_frame(
+        frame=image,
+        stage=stage,
+        transformed_image_path=transformed_image_path,
+        detector=detector,
+        perspective_matrix=perspective_matrix,
+        camera_position=camera_position
+    )
 
-    # Initialize coordinate mapper
-    mapper = CoordinateMapper(board_detector=detector)
-
-    # Calculate inverse perspective matrix
-    # This transforms coordinates from transformed board back to original image
-    M_inv = cv2.invert(perspective_matrix)[1]
-
-    # Create overlay with transparency
-    overlay = image.copy()
-
-    # Color definitions (BGR format)
-    RED = (0, 0, 255)      # Pickup/remove
-    BLUE = (255, 0, 0)     # Place
-    ORANGE = (0, 165, 255) # Graveyard (discard)
-    PURPLE = (255, 0, 255) # Graveyard piece (promotion)
-
-    # Helper function to transform square bounds back to original image
-    def transform_square_to_original(square_name: str):
-        # Get square bounds on transformed image
-        x1, y1, x2, y2 = mapper.get_square_bounds(square_name, pil_transformed)
-
-        # Get all 4 corners of the square
-        corners = np.array([
-            [x1, y1],  # Top-left
-            [x2, y1],  # Top-right
-            [x2, y2],  # Bottom-right
-            [x1, y2]   # Bottom-left
-        ], dtype=np.float32)
-
-        # Transform corners back to original image
-        corners_reshaped = corners.reshape(1, -1, 2)
-        original_corners = cv2.perspectiveTransform(corners_reshaped, M_inv)
-        original_corners = original_corners.reshape(-1, 2).astype(np.int32)
-
-        return original_corners
-
-    # Render pickup square (red)
-    if stage["pickup_square"] is not None:
-        # Rotate square name to match camera position
-        rotated_square = rotate_square_for_camera(stage["pickup_square"], camera_position, inverse=True)
-        original_corners = transform_square_to_original(rotated_square)
-
-        # Draw filled quadrilateral with transparency
-        cv2.fillPoly(overlay, [original_corners], RED)
-        # Draw border
-        cv2.polylines(overlay, [original_corners], isClosed=True, color=RED, thickness=4)
-
-    # Render place square (blue)
-    if stage["place_square"] is not None:
-        # Rotate square name to match camera position
-        rotated_square = rotate_square_for_camera(stage["place_square"], camera_position, inverse=True)
-        original_corners = transform_square_to_original(rotated_square)
-
-        # Draw filled quadrilateral with transparency
-        cv2.fillPoly(overlay, [original_corners], BLUE)
-        # Draw border
-        cv2.polylines(overlay, [original_corners], isClosed=True, color=BLUE, thickness=4)
-
-    # Render graveyard
-    # If pickup is None -> taking FROM graveyard (highlight specific piece)
-    # If place is None -> placing TO graveyard (orange circle)
-    if stage["pickup_square"] is None and stage["piece"] is not None:
-        # Taking piece FROM graveyard - highlight the specific piece
-        # Find the piece in the original detections that is left of the board
-
-        # Load original image to get dimensions
-        original_img = cv2.imread(original_image_path)
-        img_height, img_width = original_img.shape[:2]
-
-        # Get the piece we're looking for
-        target_piece = stage["piece"]
-
-        # Piece class mapping (from BoardDetector.piece_map)
-        piece_to_class = {
-            'b': 0, 'k': 1, 'n': 2, 'p': 3, 'q': 4, 'r': 5,  # black pieces
-            'B': 6, 'K': 7, 'N': 8, 'P': 9, 'Q': 10, 'R': 11  # white pieces
-        }
-        target_class = piece_to_class.get(target_piece)
-
-        # Find all detections of this piece type that are left of the board
-        # Get board left edge by transforming the left edge of the transformed board
-        left_edge_transformed = np.array([[[0, pil_transformed.size[1] // 2]]], dtype=np.float32)
-        left_edge_original = cv2.perspectiveTransform(left_edge_transformed, M_inv)
-        board_left_x = int(left_edge_original[0][0][0])
-
-        # Find matching pieces in graveyard (left of board)
-        if hasattr(detector, 'original_detections') and hasattr(detector, 'original_boxes'):
-            detections = detector.original_detections
-            boxes = detector.original_boxes
-
-            matching_pieces = []
-            for i, detection in enumerate(detections):
-                x1, y1, x2, y2 = detection[:4]
-                box_center_x = (x1 + x2) / 2
-                cls = int(boxes.cls[i].item())
-
-                # Check if piece is left of board and matches target class
-                if box_center_x < board_left_x and cls == target_class:
-                    matching_pieces.append((i, detection, boxes.conf[i].item()))
-
-            if matching_pieces:
-                # Use the first matching piece (or highest confidence)
-                matching_pieces.sort(key=lambda x: x[2], reverse=True)  # Sort by confidence
-                idx, detection, conf = matching_pieces[0]
-
-                # Highlight this piece's bounding box with PURPLE
-                x1, y1, x2, y2 = map(int, detection[:4])
-                corners = np.array([
-                    [x1, y1],  # Top-left
-                    [x2, y1],  # Top-right
-                    [x2, y2],  # Bottom-right
-                    [x1, y2]   # Bottom-left
-                ], dtype=np.int32)
-
-                # Draw filled quadrilateral with transparency
-                cv2.fillPoly(overlay, [corners], PURPLE)
-                # Draw border
-                cv2.polylines(overlay, [corners], isClosed=True, color=PURPLE, thickness=4)
-            else:
-                # Fallback: use generic graveyard position
-                graveyard_x, graveyard_y = mapper.get_left_graveyard_coords(pil_transformed)
-                point = np.array([[[graveyard_x, graveyard_y]]], dtype=np.float32)
-                original_point = cv2.perspectiveTransform(point, M_inv)
-                gx, gy = int(original_point[0][0][0]), int(original_point[0][0][1])
-                cv2.circle(overlay, (gx, gy), 40, BLUE, -1)
-                cv2.circle(overlay, (gx, gy), 40, BLUE, 4)
-        else:
-            # Fallback if detections not available
-            graveyard_x, graveyard_y = mapper.get_left_graveyard_coords(pil_transformed)
-            point = np.array([[[graveyard_x, graveyard_y]]], dtype=np.float32)
-            original_point = cv2.perspectiveTransform(point, M_inv)
-            gx, gy = int(original_point[0][0][0]), int(original_point[0][0][1])
-            cv2.circle(overlay, (gx, gy), 40, BLUE, -1)
-            cv2.circle(overlay, (gx, gy), 40, BLUE, 4)
-
-    elif stage["place_square"] is None:
-        # Placing TO graveyard (discard) - use orange circle
-        graveyard_x, graveyard_y = mapper.get_left_graveyard_coords(pil_transformed)
-        point = np.array([[[graveyard_x, graveyard_y]]], dtype=np.float32)
-        original_point = cv2.perspectiveTransform(point, M_inv)
-        gx, gy = int(original_point[0][0][0]), int(original_point[0][0][1])
-        cv2.circle(overlay, (gx, gy), 40, ORANGE, -1)
-        cv2.circle(overlay, (gx, gy), 40, ORANGE, 4)
-
-    # Apply alpha blending (30% overlay, 70% original - more transparent)
-    result = cv2.addWeighted(overlay, 0.3, image, 0.7, 0)
-
-    # Save result
-    cv2.imwrite(output_path, result)
-    print(f"[OK] Overlay saved: {output_path}")
+    if result is not None:
+        cv2.imwrite(output_path, result)
+        print(f"[OK] Overlay saved: {output_path}")
+    else:
+        print(f"[X] Failed to generate overlay")
 
 
 def main():

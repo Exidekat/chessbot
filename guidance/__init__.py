@@ -11,6 +11,10 @@ from .move_interpreter import MoveInterpreter, MoveType
 from .coordinate_mapper import CoordinateMapper
 from .highlight_renderer import HighlightRenderer
 from .guidance_system import GuidanceSystem
+from .frame_overlay_renderer import (
+    rotate_square_for_camera,
+    apply_stage_overlay_to_frame
+)
 
 __all__ = [
     'BoardDetector',
@@ -20,4 +24,6 @@ __all__ = [
     'CoordinateMapper',
     'HighlightRenderer',
     'GuidanceSystem',
+    'rotate_square_for_camera',
+    'apply_stage_overlay_to_frame',
 ]
