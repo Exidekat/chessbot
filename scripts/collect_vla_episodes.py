@@ -7,23 +7,29 @@ Reads robot joint positions from state_cache.json (written by tele_op.py).
 
 Requirements:
 - tele_op.py running in another terminal (controls robot)
-- v4l2loopback loaded (for /dev/video7)
-- Both cameras connected (virtual + gripper)
+- v4l2loopback loaded (for /dev/video7 virtual camera output)
+- Physical cameras connected:
+  - Global camera: WBC-0E01 at /dev/video4
+  - Gripper camera: eMeet C950 at /dev/video1
 
 Usage:
     # Terminal 1: Start tele-op
     python scripts/tele_op.py
 
-    # Terminal 2: Start episode collection
+    # Terminal 2: Start episode collection (default cameras)
     python scripts/collect_vla_episodes.py --output data/episodes/
 
     # With specific cameras
-    python scripts/collect_vla_episodes.py --output data/episodes/ --global-camera /dev/video7 --gripper-camera /dev/video0
+    python scripts/collect_vla_episodes.py --output data/episodes/ \\
+        --global-camera /dev/video4 \\
+        --gripper-camera /dev/video1 \\
+        --virtual-camera /dev/video7
 """
 
 import argparse
 import time
 import cv2
+import chess
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -56,10 +62,11 @@ DEFAULT_FPS = 15
 FRAME_INTERVAL = 1.0 / DEFAULT_FPS  # 0.0667 seconds
 
 # LeRobot dataset features schema
+# Note: gripper is joint_5 in joint_positions (no separate gripper_state)
 DATASET_FEATURES = {
     "observation.global_camera": {
         "dtype": "video",
-        "shape": (720, 1280, 3),  # H, W, C (BGR from virtual camera)
+        "shape": (720, 1280, 3),  # H, W, C (BGR from global camera)
         "names": ["height", "width", "channels"]
     },
     "observation.gripper_camera": {
@@ -69,13 +76,8 @@ DATASET_FEATURES = {
     },
     "observation.joint_positions": {
         "dtype": "float32",
-        "shape": (6,),  # 6 SO-100 joints in radians
+        "shape": (6,),  # 6 SO-100 joints in radians (joint_5 is gripper)
         "names": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
-    },
-    "observation.gripper_state": {
-        "dtype": "float32",
-        "shape": (1,),  # Gripper position (joint 6)
-        "names": ["gripper"]
     },
     "action": {
         "dtype": "float32",
@@ -83,7 +85,9 @@ DATASET_FEATURES = {
         "names": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
     },
     "language_instruction": {
-        "dtype": "string"  # VLM prompt from move_decomposer
+        "dtype": "string",
+        "shape": (1,),  # VLM prompt from move_decomposer
+        "names": None
     }
 }
 
@@ -99,8 +103,9 @@ class EpisodeRecorder:
     def __init__(
         self,
         output_dir: str,
-        global_camera_device: str = "/dev/video7",
-        gripper_camera_device: str = "/dev/video0",
+        global_camera_device: str = "/dev/video4",
+        gripper_camera_device: str = "/dev/video1",
+        virtual_camera_device: str = "/dev/video7",
         fps: int = DEFAULT_FPS,
         engine_path: str = "stockfish",
         camera_rotation: str = "right",
@@ -111,8 +116,9 @@ class EpisodeRecorder:
 
         Args:
             output_dir: Directory to save episodes
-            global_camera_device: Virtual camera device path
-            gripper_camera_device: Gripper camera device path
+            global_camera_device: Physical global camera device (WBC-0E01)
+            gripper_camera_device: Physical gripper camera device (eMeet C950)
+            virtual_camera_device: Virtual camera output device (v4l2loopback)
             fps: Recording frame rate (default: 15)
             engine_path: Path to UCI chess engine
             camera_rotation: Camera rotation ('top', 'right', 'bottom', 'left')
@@ -123,6 +129,7 @@ class EpisodeRecorder:
 
         self.global_camera_device = global_camera_device
         self.gripper_camera_device = gripper_camera_device
+        self.virtual_camera_device = virtual_camera_device
         self.fps = fps
         self.frame_interval = 1.0 / fps
         self.camera_rotation = camera_rotation
@@ -170,6 +177,12 @@ class EpisodeRecorder:
                 self.dataset = LeRobotDataset(str(self.output_dir))
                 self.episode_count = len(self.dataset.episode_data_index["episode_index"].unique())
             else:
+                # Handle existing directory - LeRobot.create() fails if directory exists
+                if self.output_dir.exists():
+                    import shutil
+                    print(f"[INFO] Removing existing directory: {self.output_dir}")
+                    shutil.rmtree(self.output_dir)
+
                 print(f"[INFO] Creating new dataset at {self.output_dir}")
                 self.dataset = LeRobotDataset.create(
                     repo_id=f"local/chess_vla_{self.output_dir.name}",
@@ -230,9 +243,9 @@ class EpisodeRecorder:
             print(f"[OK] Gripper camera ready: {test_gripper.shape}")
 
             # Initialize virtual camera output (for streaming overlays)
-            print(f"[INFO] Starting virtual camera output: {self.global_camera_device}")
+            print(f"[INFO] Starting virtual camera output: {self.virtual_camera_device}")
             self.virtual_cam = VirtualCamera(
-                device_path=self.global_camera_device,
+                device_path=self.virtual_camera_device,
                 width=1280,
                 height=720
             )
@@ -273,28 +286,37 @@ class EpisodeRecorder:
             Dictionary with 'board', 'move', 'stages', or None if detection fails
         """
         try:
-            # Detect board state
+            # Detect board state (returns FEN string and transformed image)
             print("[INFO] Detecting board state...")
-            board, self.perspective_matrix = self.detector.detect_board_state(
+            fen, transformed_image = self.detector.detect_board_state(
                 board_image_path,
                 debug=True  # Save visualizations
             )
 
-            if board is None:
+            if fen is None:
                 print("[ERROR] Board detection failed")
                 return None
+
+            # Create chess.Board from FEN
+            try:
+                board = chess.Board(fen)
+            except ValueError as e:
+                print(f"[ERROR] Invalid FEN: {fen}")
+                return None
+
+            # Get perspective matrix from detector (stored during detection)
+            self.perspective_matrix = self.detector.perspective_matrix
 
             print(f"[OK] Board detected: {board.fen()}")
 
             # Calculate best move
             print("[INFO] Calculating best move...")
-            result = self.calculator.get_best_move(board)
+            move = self.calculator.calculate_best_move(board)
 
-            if result is None or result["best_move"] is None:
+            if move is None:
                 print("[ERROR] Move calculation failed")
                 return None
 
-            move = result["best_move"]
             print(f"[OK] Best move: {move.uci()} ({board.san(move)})")
 
             # Decompose move into stages
@@ -401,8 +423,8 @@ class EpisodeRecorder:
                 ret, gripper_frame = self.gripper_cam.read()
 
                 # Read robot state from cache (NO serial conflict!)
+                # Note: gripper is joint_5 in joint_positions
                 joint_positions = self.cache.get("robot_state.joint_positions")
-                gripper_state = self.cache.get("robot_state.gripper_state")
 
                 # Validate data
                 if global_frame is None:
@@ -416,7 +438,6 @@ class EpisodeRecorder:
                 if joint_positions is None or len(joint_positions) != 6:
                     print("[WARNING] Invalid joint positions, using zeros")
                     joint_positions = [0.0] * 6
-                    gripper_state = 0.0
 
                 # Apply overlay to global frame
                 overlayed_frame = apply_stage_overlay_to_frame(
@@ -439,7 +460,6 @@ class EpisodeRecorder:
                     "global_frame": overlayed_frame.copy(),
                     "gripper_frame": gripper_frame.copy(),
                     "joint_positions": np.array(joint_positions, dtype=np.float32),
-                    "gripper_state": float(gripper_state) if gripper_state is not None else 0.0,
                     "timestamp": time.time() - start_time,
                     "vlm_prompt": stage["vlm_prompt"]
                 })
@@ -496,7 +516,6 @@ class EpisodeRecorder:
                     "observation.global_camera": frame_data["global_frame"],
                     "observation.gripper_camera": frame_data["gripper_frame"],
                     "observation.joint_positions": frame_data["joint_positions"],
-                    "observation.gripper_state": np.array([frame_data["gripper_state"]], dtype=np.float32),
                     "action": frame_data["joint_positions"],  # Copy for action cloning
                     "episode_index": episode_index,
                     "frame_index": frame_idx,
@@ -665,8 +684,9 @@ Examples:
 
     # With specific cameras
     python scripts/collect_vla_episodes.py --output data/episodes/ \\
-        --global-camera /dev/video7 \\
-        --gripper-camera /dev/video0
+        --global-camera /dev/video4 \\
+        --gripper-camera /dev/video1 \\
+        --virtual-camera /dev/video7
 
     # Custom FPS and engine
     python scripts/collect_vla_episodes.py --output data/episodes/ \\
@@ -688,15 +708,22 @@ Examples:
     parser.add_argument(
         "--global-camera",
         type=str,
-        default="/dev/video7",
-        help="Virtual camera device path (default: /dev/video7)"
+        default="/dev/video4",
+        help="Physical global camera device (WBC-0E01, default: /dev/video4)"
     )
 
     parser.add_argument(
         "--gripper-camera",
         type=str,
-        default="/dev/video0",
-        help="Gripper camera device path (default: /dev/video0)"
+        default="/dev/video1",
+        help="Physical gripper camera device (eMeet C950, default: /dev/video1)"
+    )
+
+    parser.add_argument(
+        "--virtual-camera",
+        type=str,
+        default="/dev/video7",
+        help="Virtual camera output device (v4l2loopback, default: /dev/video7)"
     )
 
     parser.add_argument(
@@ -740,6 +767,7 @@ Examples:
         output_dir=args.output,
         global_camera_device=args.global_camera,
         gripper_camera_device=args.gripper_camera,
+        virtual_camera_device=args.virtual_camera,
         fps=args.fps,
         engine_path=args.engine,
         camera_rotation=args.rotation,

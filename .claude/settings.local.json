@@ -36,7 +36,13 @@
       "Bash(timeout 10 python:*)",
       "Bash(timeout 3 python:*)",
       "Bash(chmod:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(source:*)",
+      "Bash(conda activate:*)",
+      "Bash(timeout 15 python:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(for:*)",
+      "Bash(do echo \"=== $dev ===\")"
     ],
     "deny": [],
     "ask": []

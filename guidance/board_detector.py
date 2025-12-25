@@ -946,6 +946,15 @@ class BoardDetector:
         Returns:
             Tuple of (FEN string, transformed board image)
         """
+        # Normalize turn to single letter (handle "white"/"black" inputs)
+        if turn.lower() == "white":
+            turn = "w"
+        elif turn.lower() == "black":
+            turn = "b"
+        elif turn not in ("w", "b"):
+            print(f"[WARNING] Invalid turn '{turn}', defaulting to 'w'")
+            turn = "w"
+
         if debug:
             print("\n[BoardDetector] Starting detection...")
 
