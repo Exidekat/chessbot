@@ -297,12 +297,13 @@ class SO100Arm:
         """
         return (~sum(data)) & 0xFF
 
-    def _read_motor_position(self, motor_id: int) -> Optional[int]:
+    def _read_motor_position(self, motor_id: int, verbose: bool = False) -> Optional[int]:
         """
         Read current position from a single motor using Feetech protocol.
 
         Args:
             motor_id: Motor ID (1-6)
+            verbose: Print debug info on failures
 
         Returns:
             Optional[int]: Position in counts (0-4095), or None if read failed
@@ -333,18 +334,46 @@ class SO100Arm:
             if self.serial.in_waiting > 0:
                 response = self.serial.read(self.serial.in_waiting)
 
-                # Validate response length (minimum 7 bytes)
-                if len(response) >= 7:
+                # Validate response length (minimum 8 bytes for full response)
+                if len(response) >= 8:
+                    # Check error byte (bit flags)
+                    # 0x01 = Voltage Error (warning, position still valid)
+                    # 0x04 = Overheating (warning, position still valid)
+                    # 0x10 = Checksum Error (fatal - data corrupted)
+                    # 0x40 = Instruction Error (fatal - wrong command)
+                    error_code = response[4]
+                    fatal_errors = 0x10 | 0x40  # Checksum or Instruction errors
+                    if error_code & fatal_errors:
+                        if verbose:
+                            print(f"[SO100] Motor {motor_id}: Fatal error 0x{error_code:02X}, raw bytes: {[hex(b) for b in response]}")
+                        return None
+                    if error_code != 0 and verbose:
+                        print(f"[SO100] Motor {motor_id}: Warning error 0x{error_code:02X} (continuing)")
+
                     # Extract position (2 bytes: low, high)
                     pos_low = response[5]
                     pos_high = response[6]
-                    position = (pos_high << 8) | pos_low  # Combine to 14-bit value
+                    position = (pos_high << 8) | pos_low
+
+                    # Validate position is in valid range (0-4095 for 12-bit encoder)
+                    if position > self.COUNTS_PER_REV - 1:
+                        if verbose:
+                            print(f"[SO100] Motor {motor_id}: Invalid position {position} (0x{position:04X}), raw bytes: {[hex(b) for b in response]}")
+                        return None
+
                     return position
+                else:
+                    if verbose:
+                        print(f"[SO100] Motor {motor_id}: Short response ({len(response)} bytes): {[hex(b) for b in response]}")
+            else:
+                if verbose:
+                    print(f"[SO100] Motor {motor_id}: No response (0 bytes in buffer)")
 
             return None
 
         except (serial.SerialException, IndexError) as e:
-            # Silently fail (will retry on next update)
+            if verbose:
+                print(f"[SO100] Motor {motor_id}: Exception: {e}")
             return None
 
     def _read_all_motor_positions(self, verbose: bool = False) -> Optional[np.ndarray]:
@@ -360,7 +389,7 @@ class SO100Arm:
         positions = []
 
         for motor_id in self.MOTOR_IDS:
-            pos = self._read_motor_position(motor_id)
+            pos = self._read_motor_position(motor_id, verbose=verbose)
             if pos is None:
                 if verbose:
                     print(f"[SO100] Failed to read motor {motor_id}")

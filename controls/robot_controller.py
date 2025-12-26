@@ -91,7 +91,8 @@ class RobotController:
     JOINT_1_DEADBAND = 0.15  # radians (~8.6 degrees) - wider deadband
     JOINT_1_SMOOTHING_ALPHA = 0.2  # Low-pass filter coefficient (20% new target) - faster convergence
 
-    def __init__(self, port: str, joint_configs: List[JointConfig], config_source: str = "defaults"):
+    def __init__(self, port: str, joint_configs: List[JointConfig], config_source: str = "defaults",
+                 enable_stability_system: bool = True):
         """
         Initialize robot controller.
 
@@ -99,11 +100,13 @@ class RobotController:
             port: Serial port device path (e.g., /dev/ttyACM0)
             joint_configs: List of 6 JointConfig objects (one per joint)
             config_source: Source of config ("port-specific", "generic", or "defaults")
+            enable_stability_system: Enable joint 0/1 stability features (deadband, smoothing, speed limit)
         """
         self.port = port
         self.arm: Optional[SO100Arm] = None
         self.joint_configs = joint_configs
         self.config_source = config_source  # "port-specific", "generic", or "defaults"
+        self.enable_stability_system = enable_stability_system
         self.target_positions = np.zeros(6)
         self.last_sent_positions = np.zeros(6)  # Track last sent positions for joint 0 stability
         self.connected = False
@@ -167,31 +170,51 @@ class RobotController:
             print(f"[{self.port}] Failed to enable torque: {e}")
             return False
 
-    def release_torque(self):
-        """Disable torque on all motors."""
+    def release_torque(self) -> bool:
+        """
+        Disable torque on all motors with retry logic.
+
+        Returns:
+            bool: True if torque was successfully released
+        """
         if not self.arm or not self.connected:
-            return
+            return False
 
-        try:
-            # Send torque disable command to each motor
-            for motor_id in self.arm.MOTOR_IDS:
-                packet = [
-                    *self.arm.HEADER,
-                    motor_id,
-                    0x04,  # Length
-                    self.arm.INSTR_WRITE,
-                    self.arm.REG_TORQUE_ENABLE,
-                    0x00  # Disable torque
-                ]
-                checksum = self.arm._calculate_checksum(packet[2:])
-                packet.append(checksum)
-                self.arm.serial.write(bytes(packet))
-                time.sleep(0.005)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Send torque disable command to each motor
+                for motor_id in self.arm.MOTOR_IDS:
+                    packet = [
+                        *self.arm.HEADER,
+                        motor_id,
+                        0x04,  # Length
+                        self.arm.INSTR_WRITE,
+                        self.arm.REG_TORQUE_ENABLE,
+                        0x00  # Disable torque
+                    ]
+                    checksum = self.arm._calculate_checksum(packet[2:])
+                    packet.append(checksum)
+                    self.arm.serial.write(bytes(packet))
+                    time.sleep(0.005)
 
-            self.torque_enabled = False
-            print(f"[{self.port}] Torque released")
-        except Exception as e:
-            print(f"[{self.port}] Failed to release torque: {e}")
+                self.torque_enabled = False
+                print(f"[{self.port}] Torque released")
+                return True
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"[{self.port}] Torque release attempt {attempt + 1} failed, retrying...")
+                    time.sleep(0.1)
+                else:
+                    print(f"")
+                    print(f"[!!!] CRITICAL: Failed to release torque on {self.port}: {e}")
+                    print(f"[!!!] SAFETY WARNING: Robot may still have torque enabled!")
+                    print(f"[!!!] Power cycle the robot to release torque.")
+                    print(f"")
+                    return False
+
+        return False
 
     def set_target_positions(self, positions: np.ndarray):
         """
@@ -223,84 +246,134 @@ class RobotController:
         """
         Background control loop with direct position control.
 
-        Runs at 20 Hz and implements stability system for joints 0 and 1:
-        - Low-pass filtering of target positions
-        - Deadband with dynamic torque disable
-        - Speed limiting to prevent servo overshoot
+        Runs at 20 Hz. When stability system is enabled, implements:
+        - Low-pass filtering of target positions for joint 0
+        - Deadband with dynamic torque disable for joint 0
+        - Speed limiting for joints 0 and 1
+
+        When stability system is disabled, all joints use simple position control.
         """
         first_iteration = True
 
         while self.running and self.connected:
             try:
-                # Direct position mode with joint 0 stability improvements
-                state = self.arm.get_state()
-                current_positions = state.joint_positions
+                if self.enable_stability_system:
+                    # Stability mode: special handling for joints 0 and 1
+                    state = self.arm.get_state()
+                    current_positions = state.joint_positions
 
-                # Initialize last_sent_positions on first iteration
-                if first_iteration:
-                    self.last_sent_positions = current_positions.copy()
-                    first_iteration = False
+                    # Initialize last_sent_positions on first iteration
+                    if first_iteration:
+                        self.last_sent_positions = current_positions.copy()
+                        first_iteration = False
 
-                for motor_id, target_rad in enumerate(self.target_positions, start=1):
-                    joint_idx = motor_id - 1  # Convert to 0-indexed
+                    for motor_id, target_rad in enumerate(self.target_positions, start=1):
+                        joint_idx = motor_id - 1  # Convert to 0-indexed
 
-                    # Apply smoothing and deadband to joint 0 only
-                    # Joint 1 stability disabled - original oscillation is smaller than with damping
-                    if joint_idx == 0:
-                        # Joint 0: Low-pass filter and deadband
-                        smoothed_target = (self.JOINT_0_SMOOTHING_ALPHA * target_rad +
-                                          (1 - self.JOINT_0_SMOOTHING_ALPHA) * self.last_sent_positions[joint_idx])
-                        position_error = abs(current_positions[joint_idx] - smoothed_target)
-                        deadband = self.JOINT_0_DEADBAND
+                        # Apply smoothing and deadband to joint 0 only
+                        if joint_idx == 0:
+                            # Joint 0: Low-pass filter and deadband
+                            smoothed_target = (self.JOINT_0_SMOOTHING_ALPHA * target_rad +
+                                              (1 - self.JOINT_0_SMOOTHING_ALPHA) * self.last_sent_positions[joint_idx])
+                            position_error = abs(current_positions[joint_idx] - smoothed_target)
+                            deadband = self.JOINT_0_DEADBAND
 
-                        if position_error < deadband:
-                            # Disable torque - stops oscillation completely
+                            if position_error < deadband:
+                                # Disable torque - stops oscillation completely
+                                packet = [
+                                    *self.arm.HEADER,
+                                    motor_id,
+                                    0x04,
+                                    self.arm.INSTR_WRITE,
+                                    self.arm.REG_TORQUE_ENABLE,  # 0x28
+                                    0x00  # Disable torque
+                                ]
+                                checksum = self.arm._calculate_checksum(packet[2:])
+                                packet.append(checksum)
+                                self.arm.serial.write(bytes(packet))
+                                continue  # Skip position update
+
+                            # Outside deadband - ensure torque is enabled
                             packet = [
                                 *self.arm.HEADER,
                                 motor_id,
                                 0x04,
                                 self.arm.INSTR_WRITE,
                                 self.arm.REG_TORQUE_ENABLE,  # 0x28
-                                0x00  # Disable torque
+                                0x01  # Enable torque
                             ]
                             checksum = self.arm._calculate_checksum(packet[2:])
                             packet.append(checksum)
                             self.arm.serial.write(bytes(packet))
-                            continue  # Skip position update
+                            time.sleep(0.005)
 
-                        # Outside deadband - ensure torque is enabled
-                        packet = [
-                            *self.arm.HEADER,
-                            motor_id,
-                            0x04,
-                            self.arm.INSTR_WRITE,
-                            self.arm.REG_TORQUE_ENABLE,  # 0x28
-                            0x01  # Enable torque
-                        ]
-                        checksum = self.arm._calculate_checksum(packet[2:])
-                        packet.append(checksum)
-                        self.arm.serial.write(bytes(packet))
-                        time.sleep(0.005)
+                            final_target = smoothed_target
+                        else:
+                            # Other joints: no stability system
+                            final_target = target_rad
 
-                        final_target = smoothed_target
-                    else:
-                        # Other joints: no stability system
-                        final_target = target_rad
+                        # Convert radians to encoder counts (0-4095)
+                        encoder_value = int((final_target / (2 * np.pi)) * 4096) % 4096
+                        encoder_value = max(0, min(4095, encoder_value))
 
-                    # Convert radians to encoder counts (0-4095)
-                    encoder_value = int((final_target / (2 * np.pi)) * 4096) % 4096
+                        # For joints 0 and 1: send position command with speed limit
+                        if joint_idx in [0, 1]:
+                            speed_limit = 50  # Very slow speed to prevent hunting
 
-                    # Clamp to valid range
-                    encoder_value = max(0, min(4095, encoder_value))
+                            # Write position
+                            packet = [
+                                *self.arm.HEADER,
+                                motor_id,
+                                0x05,
+                                self.arm.INSTR_WRITE,
+                                self.arm.REG_GOAL_POSITION,  # 0x2A
+                                encoder_value & 0xFF,
+                                (encoder_value >> 8) & 0xFF
+                            ]
+                            checksum = self.arm._calculate_checksum(packet[2:])
+                            packet.append(checksum)
+                            self.arm.serial.write(bytes(packet))
+                            time.sleep(0.005)
 
-                    # For joints 0 and 1: send position command with speed limit to reduce servo overshoot
-                    # For other joints: send position command only
-                    if joint_idx in [0, 1]:
-                        # Joints 0 and 1: Write both position (0x2A) and speed (0x2E) registers
-                        # Speed range: 0-1500 (steps/sec), use very low speed to prevent overshoot
-                        speed_limit = 50  # Very slow speed to prevent internal controller hunting
+                            # Write speed limit
+                            packet = [
+                                *self.arm.HEADER,
+                                motor_id,
+                                0x05,
+                                self.arm.INSTR_WRITE,
+                                0x2E,  # Speed register
+                                speed_limit & 0xFF,
+                                (speed_limit >> 8) & 0xFF
+                            ]
+                            checksum = self.arm._calculate_checksum(packet[2:])
+                            packet.append(checksum)
+                            self.arm.serial.write(bytes(packet))
+                        else:
+                            # Other joints: normal position command
+                            packet = [
+                                *self.arm.HEADER,
+                                motor_id,
+                                0x05,
+                                self.arm.INSTR_WRITE,
+                                self.arm.REG_GOAL_POSITION,  # 0x2A
+                                encoder_value & 0xFF,
+                                (encoder_value >> 8) & 0xFF
+                            ]
+                            checksum = self.arm._calculate_checksum(packet[2:])
+                            packet.append(checksum)
+                            self.arm.serial.write(bytes(packet))
 
-                        # Write position
+                        time.sleep(0.005)  # Small delay between motors
+                        self.last_sent_positions[joint_idx] = final_target
+
+                else:
+                    # Simple mode: all joints treated equally
+                    for motor_id, target_rad in enumerate(self.target_positions, start=1):
+                        # Convert radians to encoder counts (0-4095)
+                        encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
+                        encoder_value = max(0, min(4095, encoder_value))
+
+                        # Simple position command
                         packet = [
                             *self.arm.HEADER,
                             motor_id,
@@ -314,39 +387,6 @@ class RobotController:
                         packet.append(checksum)
                         self.arm.serial.write(bytes(packet))
                         time.sleep(0.005)
-
-                        # Write speed limit
-                        packet = [
-                            *self.arm.HEADER,
-                            motor_id,
-                            0x05,
-                            self.arm.INSTR_WRITE,
-                            0x2E,  # Speed register
-                            speed_limit & 0xFF,
-                            (speed_limit >> 8) & 0xFF
-                        ]
-                        checksum = self.arm._calculate_checksum(packet[2:])
-                        packet.append(checksum)
-                        self.arm.serial.write(bytes(packet))
-                    else:
-                        # Other joints: normal position command
-                        packet = [
-                            *self.arm.HEADER,
-                            motor_id,
-                            0x05,
-                            self.arm.INSTR_WRITE,
-                            self.arm.REG_GOAL_POSITION,  # 0x2A
-                            encoder_value & 0xFF,
-                            (encoder_value >> 8) & 0xFF
-                        ]
-                        checksum = self.arm._calculate_checksum(packet[2:])
-                        packet.append(checksum)
-                        self.arm.serial.write(bytes(packet))
-
-                    time.sleep(0.005)  # Small delay between motors
-
-                    # Update last sent position for stability tracking
-                    self.last_sent_positions[joint_idx] = final_target
 
             except Exception as e:
                 pass  # Silently continue on errors

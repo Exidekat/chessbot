@@ -920,6 +920,11 @@ def main():
         action="store_true",
         help="Test mode: hold robots at home for 10 seconds then exit (no keyboard input required)"
     )
+    parser.add_argument(
+        "--no-stability",
+        action="store_true",
+        help="Disable joint 0/1 stability system (deadband, smoothing, speed limit)"
+    )
 
     args = parser.parse_args()
     config_dir = Path(args.config_dir)
@@ -946,7 +951,9 @@ def main():
 
     # Create robot controllers with port-specific configs
     print("\nLoading configurations for each robot...")
-    print("Control mode: Direct Position (with Joint 0 stability)")
+    stability_enabled = not args.no_stability
+    stability_status = "DISABLED" if args.no_stability else "ENABLED"
+    print(f"Control mode: Direct Position (Joint 0/1 stability: {stability_status})")
 
     robots: List[RobotController] = []
     for port in connected_ports:
@@ -954,7 +961,8 @@ def main():
             # Load port-specific config (or fall back to generic/defaults)
             joint_configs, config_source = load_joint_configs_for_port(port, config_dir)
 
-            robot = RobotController(port, joint_configs, config_source)
+            robot = RobotController(port, joint_configs, config_source,
+                                    enable_stability_system=stability_enabled)
             if robot.connect():
                 robots.append(robot)
                 _connected_robots.append(robot)  # Track for cleanup
