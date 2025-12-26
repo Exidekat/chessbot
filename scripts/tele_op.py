@@ -343,15 +343,15 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         return
 
     # Step 4: Prepare for tele-op
-    # Stop any control loops
+    # Stop leader control loop (we only read from it)
     leader.stop_control_loop()
-    follower.stop_control_loop()
 
     # Disable torque on leader (freely movable)
     leader.release_torque()
 
-    # Enable torque on follower
+    # Enable torque on follower and start control loop for stability
     follower.enable_torque()
+    follower.start_control_loop()
 
     # Get home positions for Home-to-Home mode
     leader_home = np.array([c.home_rad for c in leader.joint_configs])
@@ -378,26 +378,8 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
             # EncPos-to-EncPos: Direct mirroring
             follower_targets = leader_positions
 
-        # Send to follower (direct position mode)
-        for motor_id, target_rad in enumerate(follower_targets, start=1):
-            # Convert radians to encoder counts (0-4095)
-            encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
-            encoder_value = max(0, min(4095, encoder_value))
-
-            # Send position command directly to motor
-            packet = [
-                *follower.arm.HEADER,
-                motor_id,
-                0x05,
-                follower.arm.INSTR_WRITE,
-                follower.arm.REG_GOAL_POSITION,
-                encoder_value & 0xFF,
-                (encoder_value >> 8) & 0xFF
-            ]
-            checksum = follower.arm._calculate_checksum(packet[2:])
-            packet.append(checksum)
-            follower.arm.serial.write(bytes(packet))
-            time.sleep(0.002)
+        # Send to follower via control loop (applies stability features)
+        follower.set_target_positions(follower_targets)
 
         # Update display
         clear_screen()
@@ -738,14 +720,15 @@ def run_adjust_home_teleop(robots: List[RobotController], keyboard: KeyboardInpu
         return
 
     # Step 4: Prepare for tele-op
+    # Stop leader control loop (we only read from it)
     leader.stop_control_loop()
-    follower.stop_control_loop()
 
     # Disable torque on leader (freely movable)
     leader.release_torque()
 
-    # Enable torque on follower
+    # Enable torque on follower and start control loop for stability
     follower.enable_torque()
+    follower.start_control_loop()
 
     # Get home positions
     leader_home = np.array([c.home_rad for c in leader.joint_configs])
@@ -769,26 +752,8 @@ def run_adjust_home_teleop(robots: List[RobotController], keyboard: KeyboardInpu
         leader_delta = leader_positions - leader_home
         follower_targets = follower_home + leader_delta
 
-        # Send to follower (direct position mode)
-        for motor_id, target_rad in enumerate(follower_targets, start=1):
-            # Convert radians to encoder counts (0-4095)
-            encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
-            encoder_value = max(0, min(4095, encoder_value))
-
-            # Send position command directly to motor
-            packet = [
-                *follower.arm.HEADER,
-                motor_id,
-                0x05,
-                follower.arm.INSTR_WRITE,
-                follower.arm.REG_GOAL_POSITION,
-                encoder_value & 0xFF,
-                (encoder_value >> 8) & 0xFF
-            ]
-            checksum = follower.arm._calculate_checksum(packet[2:])
-            packet.append(checksum)
-            follower.arm.serial.write(bytes(packet))
-            time.sleep(0.002)
+        # Send to follower via control loop (applies stability features)
+        follower.set_target_positions(follower_targets)
 
         # Read actual follower position
         follower_state = follower.arm.get_state()

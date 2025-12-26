@@ -87,9 +87,13 @@ class RobotController:
     # Joint stability parameters (base joints oscillation fix)
     JOINT_0_DEADBAND = 0.1  # radians (~5.7 degrees)
     JOINT_0_SMOOTHING_ALPHA = 0.05  # Low-pass filter coefficient (only 5% new target)
+    JOINT_0_SPEED_LIMIT = 50  # steps/sec (very slow to prevent hunting)
 
     JOINT_1_DEADBAND = 0.15  # radians (~8.6 degrees) - wider deadband
     JOINT_1_SMOOTHING_ALPHA = 0.2  # Low-pass filter coefficient (20% new target) - faster convergence
+    JOINT_1_SPEED_LIMIT = 200  # steps/sec (faster than joint 0)
+
+    JOINT_2_TO_5_SPEED_LIMIT = 500  # steps/sec for joints 2-5 (J3-J6)
 
     def __init__(self, port: str, joint_configs: List[JointConfig], config_source: str = "defaults",
                  enable_stability_system: bool = True):
@@ -275,10 +279,12 @@ class RobotController:
                             # Joint 0: Low-pass filter and deadband
                             smoothed_target = (self.JOINT_0_SMOOTHING_ALPHA * target_rad +
                                               (1 - self.JOINT_0_SMOOTHING_ALPHA) * self.last_sent_positions[joint_idx])
-                            position_error = abs(current_positions[joint_idx] - smoothed_target)
+                            # Check deadband against ACTUAL target, not smoothed target
+                            # (smoothed target stays close to current position due to heavy filtering)
+                            target_error = abs(current_positions[joint_idx] - target_rad)
                             deadband = self.JOINT_0_DEADBAND
 
-                            if position_error < deadband:
+                            if target_error < deadband:
                                 # Disable torque - stops oscillation completely
                                 packet = [
                                     *self.arm.HEADER,
@@ -316,52 +322,42 @@ class RobotController:
                         encoder_value = int((final_target / (2 * np.pi)) * 4096) % 4096
                         encoder_value = max(0, min(4095, encoder_value))
 
-                        # For joints 0 and 1: send position command with speed limit
-                        if joint_idx in [0, 1]:
-                            speed_limit = 50  # Very slow speed to prevent hunting
-
-                            # Write position
-                            packet = [
-                                *self.arm.HEADER,
-                                motor_id,
-                                0x05,
-                                self.arm.INSTR_WRITE,
-                                self.arm.REG_GOAL_POSITION,  # 0x2A
-                                encoder_value & 0xFF,
-                                (encoder_value >> 8) & 0xFF
-                            ]
-                            checksum = self.arm._calculate_checksum(packet[2:])
-                            packet.append(checksum)
-                            self.arm.serial.write(bytes(packet))
-                            time.sleep(0.005)
-
-                            # Write speed limit
-                            packet = [
-                                *self.arm.HEADER,
-                                motor_id,
-                                0x05,
-                                self.arm.INSTR_WRITE,
-                                0x2E,  # Speed register
-                                speed_limit & 0xFF,
-                                (speed_limit >> 8) & 0xFF
-                            ]
-                            checksum = self.arm._calculate_checksum(packet[2:])
-                            packet.append(checksum)
-                            self.arm.serial.write(bytes(packet))
+                        # Determine speed limit for this joint
+                        if joint_idx == 0:
+                            speed_limit = self.JOINT_0_SPEED_LIMIT
+                        elif joint_idx == 1:
+                            speed_limit = self.JOINT_1_SPEED_LIMIT
                         else:
-                            # Other joints: normal position command
-                            packet = [
-                                *self.arm.HEADER,
-                                motor_id,
-                                0x05,
-                                self.arm.INSTR_WRITE,
-                                self.arm.REG_GOAL_POSITION,  # 0x2A
-                                encoder_value & 0xFF,
-                                (encoder_value >> 8) & 0xFF
-                            ]
-                            checksum = self.arm._calculate_checksum(packet[2:])
-                            packet.append(checksum)
-                            self.arm.serial.write(bytes(packet))
+                            speed_limit = self.JOINT_2_TO_5_SPEED_LIMIT
+
+                        # Write position
+                        packet = [
+                            *self.arm.HEADER,
+                            motor_id,
+                            0x05,
+                            self.arm.INSTR_WRITE,
+                            self.arm.REG_GOAL_POSITION,  # 0x2A
+                            encoder_value & 0xFF,
+                            (encoder_value >> 8) & 0xFF
+                        ]
+                        checksum = self.arm._calculate_checksum(packet[2:])
+                        packet.append(checksum)
+                        self.arm.serial.write(bytes(packet))
+                        time.sleep(0.005)
+
+                        # Write speed limit
+                        packet = [
+                            *self.arm.HEADER,
+                            motor_id,
+                            0x05,
+                            self.arm.INSTR_WRITE,
+                            0x2E,  # Speed register
+                            speed_limit & 0xFF,
+                            (speed_limit >> 8) & 0xFF
+                        ]
+                        checksum = self.arm._calculate_checksum(packet[2:])
+                        packet.append(checksum)
+                        self.arm.serial.write(bytes(packet))
 
                         time.sleep(0.005)  # Small delay between motors
                         self.last_sent_positions[joint_idx] = final_target
