@@ -437,6 +437,24 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         print()
         print(f"  Control Rate: 15 Hz")
         print(f"  Time: {time.strftime('%H:%M:%S')}")
+
+        # Show safety trigger status for follower
+        safety_status = []
+        for joint_idx in follower.SAFETY_ENABLED_JOINTS:
+            if follower.safety_triggered.get(joint_idx, False):
+                error = abs(follower_deg[joint_idx] - target_deg[joint_idx])
+                # Check if in recovery
+                recovery_start = follower.safety_recovery_start_time.get(joint_idx)
+                if recovery_start:
+                    recovery_elapsed = time.time() - recovery_start
+                    remaining = max(0, follower.SAFETY_RECOVERY_TIME - recovery_elapsed)
+                    safety_status.append(f"J{joint_idx + 1}: RECOVERING ({remaining:.1f}s)")
+                else:
+                    safety_status.append(f"J{joint_idx + 1}: TRIGGERED (err {error:.1f} deg)")
+        if safety_status:
+            print()
+            print(f"  [!!!] SAFETY: {', '.join(safety_status)}")
+
         print()
         print("=" * 80)
         print("  Press [ESC] to stop and return to Main Menu")
@@ -805,6 +823,23 @@ def run_adjust_home_teleop(robots: List[RobotController], keyboard: KeyboardInpu
         print("-" * 90)
         print()
         print(f"  Control Rate: 15 Hz | Time: {time.strftime('%H:%M:%S')}")
+
+        # Show safety trigger status for follower
+        safety_status = []
+        for joint_idx in follower.SAFETY_ENABLED_JOINTS:
+            if follower.safety_triggered.get(joint_idx, False):
+                error = abs(np.degrees(follower_positions[joint_idx]) - np.degrees(follower_targets[joint_idx]))
+                recovery_start = follower.safety_recovery_start_time.get(joint_idx)
+                if recovery_start:
+                    recovery_elapsed = time.time() - recovery_start
+                    remaining = max(0, follower.SAFETY_RECOVERY_TIME - recovery_elapsed)
+                    safety_status.append(f"J{joint_idx + 1}: RECOVERING ({remaining:.1f}s)")
+                else:
+                    safety_status.append(f"J{joint_idx + 1}: TRIGGERED (err {error:.1f} deg)")
+        if safety_status:
+            print()
+            print(f"  [!!!] SAFETY: {', '.join(safety_status)}")
+
         print()
 
         # Show save message if recent

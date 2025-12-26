@@ -95,6 +95,13 @@ class RobotController:
 
     JOINT_2_TO_5_SPEED_LIMIT = 500  # steps/sec for joints 2-5 (J3-J6)
 
+    # Joint safety trigger parameters (stuck-joint detection)
+    # CRITICAL: Must trigger BEFORE motor board releases all torques on failure
+    SAFETY_ERROR_THRESHOLD = 0.2  # radians (~11 degrees) - sensitive threshold
+    SAFETY_TIME_THRESHOLD = 0.5   # seconds - fast trigger to prevent board failure
+    SAFETY_RECOVERY_TIME = 1.0    # seconds - error must stay low this long to auto-reset
+    SAFETY_ENABLED_JOINTS = [5]   # J6 gripper only (for now)
+
     def __init__(self, port: str, joint_configs: List[JointConfig], config_source: str = "defaults",
                  enable_stability_system: bool = True):
         """
@@ -117,6 +124,11 @@ class RobotController:
         self.control_thread: Optional[threading.Thread] = None
         self.running = False
         self.torque_enabled = False
+
+        # Safety trigger state (stuck-joint detection)
+        self.safety_error_start_time = {}    # {joint_idx: start_time or None}
+        self.safety_triggered = {}            # {joint_idx: bool}
+        self.safety_recovery_start_time = {}  # {joint_idx: start_time or None}
 
     def connect(self) -> bool:
         """
@@ -220,14 +232,94 @@ class RobotController:
 
         return False
 
+    def _check_safety_trigger(self, joint_idx: int, current_pos: float, target_pos: float) -> bool:
+        """
+        Check if joint safety trigger should fire.
+
+        Monitors position error over time for configured joints.
+        If error exceeds threshold for too long, triggers protective action.
+        Auto-resets when error stays within bounds for SAFETY_RECOVERY_TIME.
+
+        Args:
+            joint_idx: Joint index (0-5)
+            current_pos: Current joint position in radians
+            target_pos: Target joint position in radians
+
+        Returns:
+            bool: True if safety triggered (caller should clamp + disable)
+        """
+        if joint_idx not in self.SAFETY_ENABLED_JOINTS:
+            return False
+
+        error = abs(current_pos - target_pos)
+
+        if error > self.SAFETY_ERROR_THRESHOLD:
+            # Error exceeds threshold
+            self.safety_recovery_start_time[joint_idx] = None  # Reset recovery timer
+
+            if not self.safety_triggered.get(joint_idx, False):
+                # Not yet triggered - start/check error timer
+                if joint_idx not in self.safety_error_start_time or self.safety_error_start_time[joint_idx] is None:
+                    self.safety_error_start_time[joint_idx] = time.time()
+
+                elapsed = time.time() - self.safety_error_start_time[joint_idx]
+                if elapsed > self.SAFETY_TIME_THRESHOLD:
+                    self.safety_triggered[joint_idx] = True
+                    return True
+            else:
+                # Already triggered - stay triggered
+                return True
+        else:
+            # Error within bounds
+            self.safety_error_start_time[joint_idx] = None  # Reset error timer
+
+            if self.safety_triggered.get(joint_idx, False):
+                # Currently triggered - check recovery timer
+                if joint_idx not in self.safety_recovery_start_time or self.safety_recovery_start_time[joint_idx] is None:
+                    self.safety_recovery_start_time[joint_idx] = time.time()
+
+                recovery_elapsed = time.time() - self.safety_recovery_start_time[joint_idx]
+                if recovery_elapsed > self.SAFETY_RECOVERY_TIME:
+                    # Error stayed low long enough - auto-reset
+                    self.safety_triggered[joint_idx] = False
+                    self.safety_recovery_start_time[joint_idx] = None
+                    return False
+                else:
+                    # Still in recovery period - stay triggered
+                    return True
+
+        return False
+
+    def reset_safety_trigger(self, joint_idx: int = None):
+        """
+        Reset safety trigger state (call after manual intervention).
+
+        Args:
+            joint_idx: Specific joint to reset, or None to reset all
+        """
+        if joint_idx is None:
+            self.safety_error_start_time.clear()
+            self.safety_triggered.clear()
+            self.safety_recovery_start_time.clear()
+        else:
+            self.safety_error_start_time[joint_idx] = None
+            self.safety_triggered[joint_idx] = False
+            self.safety_recovery_start_time[joint_idx] = None
+
     def set_target_positions(self, positions: np.ndarray):
         """
         Set target positions for all joints.
 
+        Safety-triggered joints are skipped (their targets remain clamped
+        until the safety trigger is reset).
+
         Args:
             positions: Array of 6 target positions in radians
         """
-        self.target_positions = positions.copy()
+        for i, pos in enumerate(positions):
+            # Don't update target for safety-triggered joints
+            if not self.safety_triggered.get(i, False):
+                self.target_positions[i] = pos
 
     def set_home_targets(self):
         """Set target positions to home positions from config."""
@@ -273,6 +365,26 @@ class RobotController:
 
                     for motor_id, target_rad in enumerate(self.target_positions, start=1):
                         joint_idx = motor_id - 1  # Convert to 0-indexed
+
+                        # Check safety trigger for stuck joints (e.g., gripper holding object)
+                        if self._check_safety_trigger(joint_idx, current_positions[joint_idx], target_rad):
+                            # Safety triggered - clamp target to current position
+                            self.target_positions[joint_idx] = current_positions[joint_idx]
+                            target_rad = current_positions[joint_idx]
+
+                            # Disable torque on this joint to prevent damage
+                            packet = [
+                                *self.arm.HEADER,
+                                motor_id,
+                                0x04,
+                                self.arm.INSTR_WRITE,
+                                self.arm.REG_TORQUE_ENABLE,
+                                0x00  # Disable torque
+                            ]
+                            checksum = self.arm._calculate_checksum(packet[2:])
+                            packet.append(checksum)
+                            self.arm.serial.write(bytes(packet))
+                            continue  # Skip position update for this joint
 
                         # Apply smoothing and deadband to joint 0 only
                         if joint_idx == 0:
@@ -364,7 +476,30 @@ class RobotController:
 
                 else:
                     # Simple mode: all joints treated equally
+                    # Still need current positions for safety checks
+                    state = self.arm.get_state()
+                    current_positions = state.joint_positions
+
                     for motor_id, target_rad in enumerate(self.target_positions, start=1):
+                        joint_idx = motor_id - 1
+
+                        # Check safety trigger for stuck joints
+                        if self._check_safety_trigger(joint_idx, current_positions[joint_idx], target_rad):
+                            # Safety triggered - clamp and disable
+                            self.target_positions[joint_idx] = current_positions[joint_idx]
+                            packet = [
+                                *self.arm.HEADER,
+                                motor_id,
+                                0x04,
+                                self.arm.INSTR_WRITE,
+                                self.arm.REG_TORQUE_ENABLE,
+                                0x00
+                            ]
+                            checksum = self.arm._calculate_checksum(packet[2:])
+                            packet.append(checksum)
+                            self.arm.serial.write(bytes(packet))
+                            continue
+
                         # Convert radians to encoder counts (0-4095)
                         encoder_value = int((target_rad / (2 * np.pi)) * 4096) % 4096
                         encoder_value = max(0, min(4095, encoder_value))
