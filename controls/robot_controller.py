@@ -84,16 +84,48 @@ def get_config_path_for_port(port: str, config_dir: Path = Path("data")) -> Path
 class RobotController:
     """Controller for a single SO-100 robot with direct position control."""
 
-    # Joint stability parameters (base joints oscillation fix)
-    JOINT_0_DEADBAND = 0.1  # radians (~5.7 degrees)
-    JOINT_0_SMOOTHING_ALPHA = 0.05  # Low-pass filter coefficient (only 5% new target)
-    JOINT_0_SPEED_LIMIT = 50  # steps/sec (very slow to prevent hunting)
+    # Joint stability parameters - per-joint configuration
+    # Each joint has: DEADBAND (rad), SMOOTHING_ALPHA (0-1), SPEED_LIMIT (steps/sec), ACCEL (steps/sec^2)
+    # - DEADBAND: Error threshold below which torque is disabled (prevents oscillation)
+    # - SMOOTHING_ALPHA: Low-pass filter coefficient (0=no change, 1=instant, 0.05=95% old)
+    # - SPEED_LIMIT: Maximum movement speed in encoder steps/sec (0-1500 range)
+    # - ACCEL: Acceleration limit (0=max/instant, 1-254 = limited, lower=slower ramp)
 
-    JOINT_1_DEADBAND = 0.15  # radians (~8.6 degrees) - wider deadband
-    JOINT_1_SMOOTHING_ALPHA = 0.2  # Low-pass filter coefficient (20% new target) - faster convergence
-    JOINT_1_SPEED_LIMIT = 200  # steps/sec (faster than joint 0)
+    # Joint 0 (Base) - prone to oscillation, needs heavy dampening
+    JOINT_0_DEADBAND = 0.1           # radians (~5.7 degrees)
+    JOINT_0_SMOOTHING_ALPHA = 0.05   # Low-pass filter (only 5% new target)
+    JOINT_0_SPEED_LIMIT = 500        # steps/sec
+    JOINT_0_ACCEL = 0                # max acceleration (0 = no limit)
 
-    JOINT_2_TO_5_SPEED_LIMIT = 500  # steps/sec for joints 2-5 (J3-J6)
+    # Joint 1 (Shoulder) - prone to oscillation, moderate dampening
+    JOINT_1_DEADBAND = 0.1           # radians (~5.7 degrees)
+    JOINT_1_SMOOTHING_ALPHA = 0.2    # Low-pass filter (20% new target)
+    JOINT_1_SPEED_LIMIT = 200        # steps/sec
+    JOINT_1_ACCEL = 0                # max acceleration
+
+    # Joint 2 (Elbow) - stable, no dampening needed
+    JOINT_2_DEADBAND = 0.0           # no deadband
+    JOINT_2_SMOOTHING_ALPHA = 1.0    # no smoothing (100% new target)
+    JOINT_2_SPEED_LIMIT = 1000       # steps/sec
+    JOINT_2_ACCEL = 0                # max acceleration
+
+    # Joint 3 (Wrist Pitch) - stable, no dampening needed
+    JOINT_3_DEADBAND = 0.0           # no deadband
+    JOINT_3_SMOOTHING_ALPHA = 1.0    # no smoothing
+    JOINT_3_SPEED_LIMIT = 1000       # steps/sec
+    JOINT_3_ACCEL = 0                # max acceleration
+
+    # Joint 4 (Wrist Roll) - stable, no dampening needed
+    JOINT_4_DEADBAND = 0.0           # no deadband
+    JOINT_4_SMOOTHING_ALPHA = 1.0    # no smoothing
+    JOINT_4_SPEED_LIMIT = 1000       # steps/sec
+    JOINT_4_ACCEL = 0                # max acceleration
+
+    # Joint 5 (Gripper) - stable, no dampening needed
+    JOINT_5_DEADBAND = 0.0           # no deadband
+    JOINT_5_SMOOTHING_ALPHA = 1.0    # no smoothing
+    JOINT_5_SPEED_LIMIT = 1000       # steps/sec
+    JOINT_5_ACCEL = 0                # max acceleration
 
     # Joint safety trigger parameters (stuck-joint detection)
     # CRITICAL: Must trigger BEFORE motor board releases all torques on failure
@@ -129,6 +161,22 @@ class RobotController:
         self.safety_error_start_time = {}    # {joint_idx: start_time or None}
         self.safety_triggered = {}            # {joint_idx: bool}
         self.safety_recovery_start_time = {}  # {joint_idx: start_time or None}
+
+    def _get_joint_deadband(self, joint_idx: int) -> float:
+        """Get deadband parameter for a joint."""
+        return getattr(self, f'JOINT_{joint_idx}_DEADBAND', 0.0)
+
+    def _get_joint_smoothing_alpha(self, joint_idx: int) -> float:
+        """Get smoothing alpha parameter for a joint."""
+        return getattr(self, f'JOINT_{joint_idx}_SMOOTHING_ALPHA', 1.0)
+
+    def _get_joint_speed_limit(self, joint_idx: int) -> int:
+        """Get speed limit parameter for a joint."""
+        return getattr(self, f'JOINT_{joint_idx}_SPEED_LIMIT', 500)
+
+    def _get_joint_accel(self, joint_idx: int) -> int:
+        """Get acceleration parameter for a joint."""
+        return getattr(self, f'JOINT_{joint_idx}_ACCEL', 0)
 
     def connect(self) -> bool:
         """
@@ -386,32 +434,40 @@ class RobotController:
                             self.arm.serial.write(bytes(packet))
                             continue  # Skip position update for this joint
 
-                        # Apply smoothing and deadband to joint 0 only
-                        if joint_idx == 0:
-                            # Joint 0: Low-pass filter and deadband
-                            smoothed_target = (self.JOINT_0_SMOOTHING_ALPHA * target_rad +
-                                              (1 - self.JOINT_0_SMOOTHING_ALPHA) * self.last_sent_positions[joint_idx])
-                            # Check deadband against ACTUAL target, not smoothed target
-                            # (smoothed target stays close to current position due to heavy filtering)
-                            target_error = abs(current_positions[joint_idx] - target_rad)
-                            deadband = self.JOINT_0_DEADBAND
+                        # Get per-joint stability parameters
+                        deadband = self._get_joint_deadband(joint_idx)
+                        smoothing_alpha = self._get_joint_smoothing_alpha(joint_idx)
+                        speed_limit = self._get_joint_speed_limit(joint_idx)
+                        accel = self._get_joint_accel(joint_idx)
 
-                            if target_error < deadband:
-                                # Disable torque - stops oscillation completely
-                                packet = [
-                                    *self.arm.HEADER,
-                                    motor_id,
-                                    0x04,
-                                    self.arm.INSTR_WRITE,
-                                    self.arm.REG_TORQUE_ENABLE,  # 0x28
-                                    0x00  # Disable torque
-                                ]
-                                checksum = self.arm._calculate_checksum(packet[2:])
-                                packet.append(checksum)
-                                self.arm.serial.write(bytes(packet))
-                                continue  # Skip position update
+                        # Apply low-pass filter (smoothing)
+                        # alpha=1.0 means no smoothing (100% new target)
+                        # alpha=0.05 means heavy smoothing (5% new, 95% old)
+                        smoothed_target = (smoothing_alpha * target_rad +
+                                          (1 - smoothing_alpha) * self.last_sent_positions[joint_idx])
 
-                            # Outside deadband - ensure torque is enabled
+                        # Check deadband against ACTUAL target, not smoothed target
+                        # (smoothed target stays close to current position due to heavy filtering)
+                        target_error = abs(current_positions[joint_idx] - target_rad)
+
+                        if deadband > 0 and target_error < deadband:
+                            # Inside deadband - disable torque to stop oscillation
+                            packet = [
+                                *self.arm.HEADER,
+                                motor_id,
+                                0x04,
+                                self.arm.INSTR_WRITE,
+                                self.arm.REG_TORQUE_ENABLE,  # 0x28
+                                0x00  # Disable torque
+                            ]
+                            checksum = self.arm._calculate_checksum(packet[2:])
+                            packet.append(checksum)
+                            self.arm.serial.write(bytes(packet))
+                            continue  # Skip position update
+
+                        # Outside deadband (or no deadband) - ensure torque is enabled
+                        if deadband > 0:
+                            # Only re-enable torque if we have deadband (might have disabled it)
                             packet = [
                                 *self.arm.HEADER,
                                 motor_id,
@@ -425,22 +481,11 @@ class RobotController:
                             self.arm.serial.write(bytes(packet))
                             time.sleep(0.005)
 
-                            final_target = smoothed_target
-                        else:
-                            # Other joints: no stability system
-                            final_target = target_rad
+                        final_target = smoothed_target
 
                         # Convert radians to encoder counts (0-4095)
                         encoder_value = int((final_target / (2 * np.pi)) * 4096) % 4096
                         encoder_value = max(0, min(4095, encoder_value))
-
-                        # Determine speed limit for this joint
-                        if joint_idx == 0:
-                            speed_limit = self.JOINT_0_SPEED_LIMIT
-                        elif joint_idx == 1:
-                            speed_limit = self.JOINT_1_SPEED_LIMIT
-                        else:
-                            speed_limit = self.JOINT_2_TO_5_SPEED_LIMIT
 
                         # Write position
                         packet = [
@@ -466,6 +511,20 @@ class RobotController:
                             0x2E,  # Speed register
                             speed_limit & 0xFF,
                             (speed_limit >> 8) & 0xFF
+                        ]
+                        checksum = self.arm._calculate_checksum(packet[2:])
+                        packet.append(checksum)
+                        self.arm.serial.write(bytes(packet))
+                        time.sleep(0.005)
+
+                        # Write acceleration limit
+                        packet = [
+                            *self.arm.HEADER,
+                            motor_id,
+                            0x04,  # Length: 1 byte data
+                            self.arm.INSTR_WRITE,
+                            0x29,  # Acceleration register (Goal Acceleration)
+                            accel & 0xFF  # Single byte (0-254)
                         ]
                         checksum = self.arm._calculate_checksum(packet[2:])
                         packet.append(checksum)

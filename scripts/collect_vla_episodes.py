@@ -71,7 +71,7 @@ DATASET_FEATURES = {
     },
     "observation.gripper_camera": {
         "dtype": "video",
-        "shape": (224, 224, 3),  # Gripper view (eMeet C950)
+        "shape": (360, 640, 3),  # Gripper view (eMeet C950 actual resolution)
         "names": ["height", "width", "channels"]
     },
     "observation.joint_positions": {
@@ -517,14 +517,12 @@ class EpisodeRecorder:
                     "observation.gripper_camera": frame_data["gripper_frame"],
                     "observation.joint_positions": frame_data["joint_positions"],
                     "action": frame_data["joint_positions"],  # Copy for action cloning
-                    "episode_index": episode_index,
-                    "frame_index": frame_idx,
-                    "timestamp": frame_data["timestamp"],
-                    "language_instruction": frame_data["vlm_prompt"]
+                    "language_instruction": frame_data["vlm_prompt"],
+                    "task": frame_data["vlm_prompt"]  # Required by LeRobot v0.4
                 })
 
             # Finalize episode (encode videos, write Parquet)
-            self.dataset.consolidate()
+            self.dataset.save_episode()
 
             print(f"[OK] Episode {episode_index} saved: {len(all_frames)} frames")
             self.episode_count += 1

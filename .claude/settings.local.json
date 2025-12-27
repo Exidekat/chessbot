@@ -42,7 +42,8 @@
       "Bash(timeout 15 python:*)",
       "WebFetch(domain:github.com)",
       "Bash(for:*)",
-      "Bash(do echo \"=== $dev ===\")"
+      "Bash(do echo \"=== $dev ===\")",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []
