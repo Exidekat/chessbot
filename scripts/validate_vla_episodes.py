@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Try to import LeRobot (optional dependency)
 try:
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
     LEROBOT_AVAILABLE = True
 except ImportError:
     LEROBOT_AVAILABLE = False
@@ -84,7 +84,9 @@ class EpisodeValidator:
 
     def _load_dataset(self):
         """Load dataset and enumerate episodes."""
-        if self.use_lerobot and (self.dataset_path / "meta.json").exists():
+        # LeRobot v0.4 uses meta/info.json instead of meta.json
+        lerobot_meta = (self.dataset_path / "meta" / "info.json").exists()
+        if self.use_lerobot and lerobot_meta:
             self._load_lerobot_dataset()
         else:
             self._load_raw_dataset()
@@ -100,25 +102,31 @@ class EpisodeValidator:
     def _load_lerobot_dataset(self):
         """Load LeRobot format dataset."""
         try:
-            self.dataset = LeRobotDataset(str(self.dataset_path))
+            # Local datasets need repo_id + root path
+            # repo_id format matches what collect_vla_episodes.py uses
+            repo_id = f"local/chess_vla_{self.dataset_path.name}"
+            self.dataset = LeRobotDataset(
+                repo_id=repo_id,
+                root=str(self.dataset_path),
+                download_videos=False
+            )
 
-            # Get unique episode indices
-            episode_indices = self.dataset.episode_data_index["episode_index"].unique()
+            # LeRobot v0.4: episode info is in meta.episodes
+            fps = self.dataset.fps
+            ep_dataset = self.dataset.meta.episodes
 
-            for ep_idx in episode_indices:
-                # Get episode frames
-                ep_data = self.dataset.episode_data_index[
-                    self.dataset.episode_data_index["episode_index"] == ep_idx
-                ]
-
-                frame_count = len(ep_data)
-                fps = self.dataset.fps
+            for i in range(len(ep_dataset)):
+                row = ep_dataset[i]
+                ep_idx = row["episode_index"]
+                frame_count = row["length"]
+                tasks = row["tasks"]
 
                 self.episodes.append({
                     "index": int(ep_idx),
                     "frame_count": frame_count,
                     "fps": fps,
                     "duration": frame_count / fps if fps > 0 else 0,
+                    "task": tasks[0] if tasks else "",
                     "format": "lerobot"
                 })
 
@@ -685,20 +693,21 @@ class EpisodeValidator:
 
     def list_episodes(self):
         """List all episodes with basic info."""
-        print(f"\n{'='*70}")
-        print(f"{'Idx':>5} | {'Frames':>7} | {'Duration':>10} | {'Quality':>10} | {'Move':<15}")
-        print(f"{'='*70}")
+        print(f"\n{'='*90}")
+        print(f"{'Idx':>5} | {'Frames':>7} | {'Duration':>10} | {'Quality':>10} | Task")
+        print(f"{'='*90}")
 
         for ep in self.episodes:
             idx = ep["index"]
             frames = ep["frame_count"]
             duration = f"{ep['duration']:.2f}s"
             quality = self.episode_qualities.get(idx, "unreviewed")
-            move = ep.get("move", "N/A")[:15]
+            # Use task for LeRobot format, move for raw format
+            task = ep.get("task", ep.get("move", "N/A"))
 
-            print(f"{idx:>5} | {frames:>7} | {duration:>10} | {quality:>10} | {move:<15}")
+            print(f"{idx:>5} | {frames:>7} | {duration:>10} | {quality:>10} | {task}")
 
-        print(f"{'='*70}")
+        print(f"{'='*90}")
         print(f"Total: {len(self.episodes)} episodes\n")
 
     def run_interactive_review(self):
@@ -816,8 +825,8 @@ Examples:
     parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
-        help="Path to episode dataset directory"
+        default="data/episodes",
+        help="Path to episode dataset directory (default: data/episodes)"
     )
 
     parser.add_argument(
