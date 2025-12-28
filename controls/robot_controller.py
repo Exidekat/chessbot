@@ -85,54 +85,61 @@ class RobotController:
     """Controller for a single SO-100 robot with direct position control."""
 
     # Joint stability parameters - per-joint configuration
-    # Each joint has: DEADBAND (rad), SMOOTHING_ALPHA (0-1), SPEED_LIMIT (steps/sec), ACCEL (steps/sec^2)
-    # - DEADBAND: Error threshold below which torque is disabled (prevents oscillation)
+    # Each joint has: DEADBAND, SMOOTHING_ALPHA, SPEED_LIMIT, ACCEL, TORQUE
+    # - DEADBAND: Error threshold (rad) below which torque is disabled (prevents oscillation)
     # - SMOOTHING_ALPHA: Low-pass filter coefficient (0=no change, 1=instant, 0.05=95% old)
     # - SPEED_LIMIT: Maximum movement speed in encoder steps/sec (0-1500 range)
     # - ACCEL: Acceleration limit (0=max/instant, 1-254 = limited, lower=slower ramp)
+    # - TORQUE: Torque limit as percentage (0-1000, where 1000 = 100% max torque)
 
-    # Joint 0 (Base) - prone to oscillation, needs heavy dampening
-    JOINT_0_DEADBAND = 0.1           # radians (~5.7 degrees)
-    JOINT_0_SMOOTHING_ALPHA = 0.05   # Low-pass filter (only 5% new target)
-    JOINT_0_SPEED_LIMIT = 500        # steps/sec
-    JOINT_0_ACCEL = 0                # max acceleration (0 = no limit)
+    # Joint 0 (Base) - prone to oscillation
+    JOINT_0_DEADBAND = 0.025           # radians (~5.7/4 degrees)
+    JOINT_0_SMOOTHING_ALPHA = 1.0   # Low-pass filter (only 5% new target) (disabled)
+    JOINT_0_SPEED_LIMIT = 1000        # steps/sec
+    JOINT_0_ACCEL = 0              # acceleration limit
+    JOINT_0_TORQUE = 50            # 5% max torque
 
-    # Joint 1 (Shoulder) - prone to oscillation, moderate dampening
-    JOINT_1_DEADBAND = 0.1           # radians (~5.7 degrees)
-    JOINT_1_SMOOTHING_ALPHA = 0.2    # Low-pass filter (20% new target)
-    JOINT_1_SPEED_LIMIT = 200        # steps/sec
-    JOINT_1_ACCEL = 0                # max acceleration
+    # Joint 1 (Shoulder) - prone to oscillation, fights gravity
+    JOINT_1_DEADBAND = 0.0           # no deadband (gravity-fighting)
+    JOINT_1_SMOOTHING_ALPHA = 1.0    # Low-pass filter (20% new target) (disabled)
+    JOINT_1_SPEED_LIMIT = 500        # steps/sec
+    JOINT_1_ACCEL = 50               # acceleration limit
+    JOINT_1_TORQUE = 300            # 30% max torque
 
     # Joint 2 (Elbow) - stable, no dampening needed
     JOINT_2_DEADBAND = 0.0           # no deadband
     JOINT_2_SMOOTHING_ALPHA = 1.0    # no smoothing (100% new target)
     JOINT_2_SPEED_LIMIT = 1000       # steps/sec
-    JOINT_2_ACCEL = 0                # max acceleration
+    JOINT_2_ACCEL = 0              # acceleration limit
+    JOINT_2_TORQUE = 200            # 20% max torque
 
     # Joint 3 (Wrist Pitch) - stable, no dampening needed
     JOINT_3_DEADBAND = 0.0           # no deadband
     JOINT_3_SMOOTHING_ALPHA = 1.0    # no smoothing
     JOINT_3_SPEED_LIMIT = 1000       # steps/sec
-    JOINT_3_ACCEL = 0                # max acceleration
+    JOINT_3_ACCEL = 100              # acceleration limit
+    JOINT_3_TORQUE = 200            # 20% max torque
 
     # Joint 4 (Wrist Roll) - stable, no dampening needed
     JOINT_4_DEADBAND = 0.0           # no deadband
     JOINT_4_SMOOTHING_ALPHA = 1.0    # no smoothing
     JOINT_4_SPEED_LIMIT = 1000       # steps/sec
-    JOINT_4_ACCEL = 0                # max acceleration
+    JOINT_4_ACCEL = 100              # acceleration limit
+    JOINT_4_TORQUE = 100            # 10% max torque
 
     # Joint 5 (Gripper) - stable, no dampening needed
     JOINT_5_DEADBAND = 0.0           # no deadband
     JOINT_5_SMOOTHING_ALPHA = 1.0    # no smoothing
     JOINT_5_SPEED_LIMIT = 1000       # steps/sec
-    JOINT_5_ACCEL = 0                # max acceleration
+    JOINT_5_ACCEL = 100              # acceleration limit
+    JOINT_5_TORQUE = 100            # 10% max torque
 
     # Joint safety trigger parameters (stuck-joint detection)
     # CRITICAL: Must trigger BEFORE motor board releases all torques on failure
     SAFETY_ERROR_THRESHOLD = 0.2  # radians (~11 degrees) - sensitive threshold
     SAFETY_TIME_THRESHOLD = 0.5   # seconds - fast trigger to prevent board failure
-    SAFETY_RECOVERY_TIME = 1.0    # seconds - error must stay low this long to auto-reset
-    SAFETY_ENABLED_JOINTS = [5]   # J6 gripper only (for now)
+    SAFETY_RECOVERY_TIME = 0.5    # seconds - error must stay low this long to auto-reset
+    SAFETY_ENABLED_JOINTS = []   # Use 5 for gripper (not needed for now)
 
     def __init__(self, port: str, joint_configs: List[JointConfig], config_source: str = "defaults",
                  enable_stability_system: bool = True):
@@ -177,6 +184,10 @@ class RobotController:
     def _get_joint_accel(self, joint_idx: int) -> int:
         """Get acceleration parameter for a joint."""
         return getattr(self, f'JOINT_{joint_idx}_ACCEL', 0)
+
+    def _get_joint_torque(self, joint_idx: int) -> int:
+        """Get torque limit parameter for a joint (0-1000, where 1000 = 100%)."""
+        return getattr(self, f'JOINT_{joint_idx}_TORQUE', 1000)
 
     def connect(self) -> bool:
         """
@@ -439,6 +450,7 @@ class RobotController:
                         smoothing_alpha = self._get_joint_smoothing_alpha(joint_idx)
                         speed_limit = self._get_joint_speed_limit(joint_idx)
                         accel = self._get_joint_accel(joint_idx)
+                        torque = self._get_joint_torque(joint_idx)
 
                         # Apply low-pass filter (smoothing)
                         # alpha=1.0 means no smoothing (100% new target)
@@ -525,6 +537,21 @@ class RobotController:
                             self.arm.INSTR_WRITE,
                             0x29,  # Acceleration register (Goal Acceleration)
                             accel & 0xFF  # Single byte (0-254)
+                        ]
+                        checksum = self.arm._calculate_checksum(packet[2:])
+                        packet.append(checksum)
+                        self.arm.serial.write(bytes(packet))
+                        time.sleep(0.005)
+
+                        # Write torque limit
+                        packet = [
+                            *self.arm.HEADER,
+                            motor_id,
+                            0x05,  # Length: 2 byte data
+                            self.arm.INSTR_WRITE,
+                            0x30,  # Torque Limit register (SRAM, runtime)
+                            torque & 0xFF,
+                            (torque >> 8) & 0xFF
                         ]
                         checksum = self.arm._calculate_checksum(packet[2:])
                         packet.append(checksum)
