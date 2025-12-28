@@ -109,6 +109,7 @@ class EpisodeRecorder:
         fps: int = DEFAULT_FPS,
         engine_path: str = "stockfish",
         camera_rotation: str = "right",
+        turn: str = "black",
         use_lerobot: bool = True
     ):
         """
@@ -122,6 +123,7 @@ class EpisodeRecorder:
             fps: Recording frame rate (default: 15)
             engine_path: Path to UCI chess engine
             camera_rotation: Camera rotation ('top', 'right', 'bottom', 'left')
+            turn: Whose turn to calculate move for ('white' or 'black')
             use_lerobot: Whether to use LeRobot dataset format
         """
         self.output_dir = Path(output_dir)
@@ -133,6 +135,7 @@ class EpisodeRecorder:
         self.fps = fps
         self.frame_interval = 1.0 / fps
         self.camera_rotation = camera_rotation
+        self.turn = "w" if turn == "white" else "b"  # Normalize to single letter
         self.use_lerobot = use_lerobot and LEROBOT_AVAILABLE
 
         # Initialize components
@@ -297,7 +300,8 @@ class EpisodeRecorder:
             print("[INFO] Detecting board state...")
             fen, transformed_image = self.detector.detect_board_state(
                 board_image_path,
-                debug=True  # Save visualizations
+                debug=True,  # Save visualizations
+                turn=self.turn
             )
 
             if fen is None:
@@ -754,6 +758,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--turn",
+        type=str,
+        choices=["white", "black"],
+        default="black",
+        help="Whose turn to calculate move for (default: black)"
+    )
+
+    parser.add_argument(
         "--no-lerobot",
         action="store_true",
         help="Disable LeRobot dataset format (use raw files)"
@@ -776,6 +788,7 @@ Examples:
         fps=args.fps,
         engine_path=args.engine,
         camera_rotation=args.rotation,
+        turn=args.turn,
         use_lerobot=not args.no_lerobot
     )
 

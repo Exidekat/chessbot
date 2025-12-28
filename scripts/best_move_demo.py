@@ -184,9 +184,9 @@ def main():
     parser.add_argument(
         "--turn",
         type=str,
-        default="white",
+        default="black",
         choices=["white", "black"],
-        help="Whose turn to calculate move for (default: white)"
+        help="Whose turn to calculate move for (default: black)"
     )
 
     args = parser.parse_args()
