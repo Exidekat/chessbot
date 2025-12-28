@@ -171,11 +171,18 @@ class EpisodeRecorder:
             return
 
         try:
-            # Check if dataset already exists
-            if (self.output_dir / "meta.json").exists():
+            # LeRobot v0.4 uses meta/info.json
+            lerobot_meta = self.output_dir / "meta" / "info.json"
+            repo_id = f"local/chess_vla_{self.output_dir.name}"
+
+            if lerobot_meta.exists():
                 print(f"[INFO] Loading existing dataset from {self.output_dir}")
-                self.dataset = LeRobotDataset(str(self.output_dir))
-                self.episode_count = len(self.dataset.episode_data_index["episode_index"].unique())
+                self.dataset = LeRobotDataset(
+                    repo_id=repo_id,
+                    root=str(self.output_dir),
+                    download_videos=False
+                )
+                self.episode_count = self.dataset.num_episodes
             else:
                 # Handle existing directory - LeRobot.create() fails if directory exists
                 if self.output_dir.exists():
@@ -185,7 +192,7 @@ class EpisodeRecorder:
 
                 print(f"[INFO] Creating new dataset at {self.output_dir}")
                 self.dataset = LeRobotDataset.create(
-                    repo_id=f"local/chess_vla_{self.output_dir.name}",
+                    repo_id=repo_id,
                     root=str(self.output_dir),
                     fps=self.fps,
                     features=DATASET_FEATURES,
