@@ -60,6 +60,8 @@ except ImportError:
 # Constants
 DEFAULT_FPS = 15
 FRAME_INTERVAL = 1.0 / DEFAULT_FPS  # 0.0667 seconds
+POSITION_TOLERANCE_DEG = 2.0  # Degrees tolerance for position mismatch warning
+POSITION_TOLERANCE_RAD = POSITION_TOLERANCE_DEG * (np.pi / 180.0)  # ~0.0349 radians
 
 # LeRobot dataset features schema
 # Note: gripper is joint_5 in joint_positions (no separate gripper_state)
@@ -498,6 +500,23 @@ class EpisodeRecorder:
             print(f"     Duration: {duration:.2f}s")
             print(f"     Actual FPS: {actual_fps:.2f}")
 
+            # Check for position mismatch between start and end
+            if len(episode_frames) >= 2:
+                start_positions = episode_frames[0]["joint_positions"]
+                end_positions = episode_frames[-1]["joint_positions"]
+                mismatched_joints = []
+
+                for i in range(len(start_positions)):
+                    diff_rad = abs(start_positions[i] - end_positions[i])
+                    diff_deg = diff_rad * (180.0 / np.pi)
+                    if diff_rad > POSITION_TOLERANCE_RAD:
+                        mismatched_joints.append((i, diff_deg))
+
+                if mismatched_joints:
+                    print(f"\n[WARNING] Position mismatch detected (>{POSITION_TOLERANCE_DEG} deg):")
+                    for joint_idx, diff_deg in mismatched_joints:
+                        print(f"          Joint {joint_idx}: {diff_deg:.1f} degrees difference")
+
             return episode_frames
 
         except KeyboardInterrupt:
@@ -639,19 +658,49 @@ class EpisodeRecorder:
 
                     # Record each stage
                     all_frames = []
+                    episode_aborted = False
 
                     for stage_idx, stage in enumerate(move_info["stages"]):
-                        frames = self._record_stage(stage, stage_idx, len(move_info["stages"]))
+                        # Retry loop for each stage
+                        while True:
+                            frames = self._record_stage(stage, stage_idx, len(move_info["stages"]))
 
-                        if frames is None:
-                            print("[WARNING] Stage recording failed, skipping episode")
-                            all_frames = None
-                            break
+                            if frames is None:
+                                print("[WARNING] Stage recording failed, skipping episode")
+                                episode_aborted = True
+                                break
 
-                        all_frames.extend(frames)
+                            # Ask if user wants to keep or retry
+                            print("\n[PROMPT] Keep this recording? (ENTER=Keep, R=Retry, Q=Abort episode)")
+                            while True:
+                                key = self.keyboard.get_key(timeout=0.1)
+                                if key == 'ENTER':
+                                    # Keep recording, move to next stage
+                                    all_frames.extend(frames)
+                                    break
+                                elif key in ('r', 'R'):
+                                    # Retry this stage
+                                    print("[INFO] Retrying stage...")
+                                    break
+                                elif key in ('q', 'Q'):
+                                    # Abort entire episode
+                                    print("[INFO] Aborting episode...")
+                                    episode_aborted = True
+                                    break
 
-                    if all_frames is None or len(all_frames) == 0:
-                        print("[WARNING] No frames recorded, skipping episode")
+                            # Check if we should keep this recording or retry
+                            if key == 'ENTER':
+                                break  # Exit retry loop, move to next stage
+                            elif episode_aborted:
+                                break  # Exit retry loop, abort episode
+                            # Otherwise key was 'r'/'R', continue retry loop
+
+                        if episode_aborted:
+                            break  # Exit stage loop
+
+                    if episode_aborted or all_frames is None or len(all_frames) == 0:
+                        print("[WARNING] Episode aborted or no frames recorded, skipping")
+                        print("[PROMPT] Press ENTER to start next episode (Ctrl+C to quit)...")
                         continue
 
                     # Save episode
