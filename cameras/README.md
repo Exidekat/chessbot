@@ -5,8 +5,8 @@ Multi-camera stream management for the chess robot system. Consolidates two real
 ## Overview
 
 The cameras module provides a unified interface for accessing all visual streams needed by the system:
-1. **Global Camera** - Overhead view for board state detection
-2. **Gripper Camera** - Arm-mounted view for precision manipulation
+1. **Global Camera** - Overhead view for board state detection (WBC-0E01, 1280x720)
+2. **Gripper Camera** - Arm-mounted view for VLA (eMeet C950, 224x224)
 3. **Guidance Overlay** - Static PNG with visual highlights (loaded on-demand)
 
 **Resource Efficiency**: Only the two physical cameras run continuously with threaded capture. The guidance overlay is loaded from disk only when the guidance system signals via flag file - no polling, no wasted resources.
@@ -183,31 +183,65 @@ while robot.is_moving():
     # Adjust movement if needed
 ```
 
-### VLA Data Collection (Future)
-```python
-from cameras import CameraManager
-from vla.data_collection import EpisodeRecorder
+### VLA Episode Collection
 
-cameras = CameraManager(config)
-cameras.start()
+```bash
+# Terminal 1: Run tele-op
+python scripts/tele_op.py
 
-recorder = EpisodeRecorder()
-recorder.start_episode(metadata={'move': 'e2e4'})
-
-# Record synchronized frames throughout episode
-while episode_active:
-    frames = cameras.get_all_frames()
-
-    recorder.record_timestep(
-        global_frame=frames['global'],
-        gripper_frame=frames['gripper'],
-        overlay_frame=frames['overlay'],  # Guidance highlights
-        robot_state=robot.get_state(),
-        action=action
-    )
-
-recorder.end_episode(success=True)
+# Terminal 2: Collect episodes at 15 FPS
+python scripts/collect_vla_episodes.py --output data/episodes/
 ```
+
+See [scripts/USAGE.md](../scripts/USAGE.md) for full episode collection workflow.
+
+## Additional Utilities
+
+### `live_camera_capture.py`
+
+Threaded camera capture for VLA scripts with minimal latency:
+
+```python
+from cameras.live_camera_capture import LiveCameraCapture
+
+capture = LiveCameraCapture("/dev/video0")
+capture.start()  # Background thread at 30fps
+
+frame = capture.get_latest_frame()  # Thread-safe, returns 720p BGR
+
+capture.stop()
+```
+
+**Features:**
+- Configures camera for native 720p MJPEG at 30fps
+- Buffer size = 1 for minimal latency
+- Thread-safe frame access
+
+### `virtual_camera.py`
+
+Output frames to a virtual camera via v4l2loopback + ffmpeg:
+
+```python
+from cameras.virtual_camera import VirtualCamera
+
+vcam = VirtualCamera("/dev/video7", width=1280, height=720)
+vcam.start()
+
+vcam.write_frame(frame)  # Queue frame for output (non-blocking)
+
+vcam.stop()
+```
+
+**Setup (one-time):**
+```bash
+sudo modprobe v4l2loopback devices=1 video_nr=7 \
+    card_label="ChessBot Virtual Cam" exclusive_caps=1
+```
+
+**Features:**
+- Low-latency streaming via ffmpeg pipe
+- Automatic frame resizing if needed
+- Used for VLA training with virtual camera input
 
 ## Configuration
 
@@ -226,17 +260,17 @@ cameras:
 
 ## Stream Specifications
 
-### Global Camera
+### Global Camera (WBC-0E01)
 - **Purpose**: Board state detection, overall monitoring
-- **Resolution**: 1280x720 (configurable)
-- **Frame Rate**: ~30 FPS (hardware dependent)
+- **Resolution**: 1280x720 (fixed for YOLO consistency)
+- **Frame Rate**: 30 FPS MJPEG
 - **Mounting**: Overhead, bird's-eye view of full board
 - **Format**: BGR (OpenCV standard)
 
-### Gripper Camera
-- **Purpose**: Close-up manipulation feedback
-- **Resolution**: 640x480 (sufficient for gripper view)
-- **Frame Rate**: ~30 FPS (hardware dependent)
+### Gripper Camera (eMeet C950)
+- **Purpose**: Close-up manipulation feedback, VLA input
+- **Resolution**: 224x224 (VLA input size)
+- **Frame Rate**: 30 FPS
 - **Mounting**: On robot arm/gripper
 - **Format**: BGR (OpenCV standard)
 
@@ -249,14 +283,18 @@ cameras:
 
 ## Development Status
 
-- [x] `global_camera.py` - Complete with threaded capture
-- [x] `gripper_camera.py` - Complete with threaded capture
-- [x] `overlay_generator.py` - Complete with flag-based updates
-- [x] `camera_manager.py` - Complete unified interface
-- [x] Module exports and documentation
-- [ ] Hardware testing with physical cameras
-- [ ] Calibration integration
-- [ ] Visual servoing implementation
+**Completed:**
+- `global_camera.py` - Threaded capture (WBC-0E01, 1280x720)
+- `gripper_camera.py` - Threaded capture (eMeet C950, 224x224)
+- `overlay_generator.py` - Flag-based updates
+- `camera_manager.py` - Unified interface
+- `live_camera_capture.py` - VLA threaded capture utility
+- `virtual_camera.py` - v4l2loopback output for VLA training
+- Hardware testing with physical cameras
+
+**Planned:**
+- Calibration integration
+- Visual servoing implementation
 
 ## Troubleshooting
 

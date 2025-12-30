@@ -43,7 +43,8 @@
       "WebFetch(domain:github.com)",
       "Bash(for:*)",
       "Bash(do echo \"=== $dev ===\")",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(git -C /home/exidekat/chessbot log --oneline --all -30)"
     ],
     "deny": [],
     "ask": []

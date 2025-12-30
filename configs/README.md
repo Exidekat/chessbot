@@ -9,7 +9,7 @@ YAML-based configuration management for the chess robot system. Provides central
 Run the interactive configuration wizard to detect cameras and set up the system:
 
 ```bash
-python create_config.py
+python scripts/create_config.py
 ```
 
 The wizard will:
@@ -265,7 +265,7 @@ if errors:
 
 **Solution**: Run model download script first:
 ```bash
-python download.py
+python scripts/download.py
 ```
 
 ### Config File Corrupted

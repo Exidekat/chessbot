@@ -1,14 +1,14 @@
 # VLA Module
 
-Vision-Language-Action model integration using Physical Intelligence's π₀ (pi-zero) for end-to-end robot control with color-conditioned prompts.
+Vision-Language-Action model integration using Physical Intelligence's pi0.5 for end-to-end robot control with color-conditioned prompts.
 
 ## Overview
 
 The VLA (Vision-Language-Action) approach represents the evolution beyond symbolic guidance:
-- **Guidance** (current): Symbolic YOLO detection → rule-based move execution
-- **VLA** (integration): π₀ end-to-end learned policy from camera pixels to robot actions
+- **Guidance** (current): Symbolic YOLO detection -> rule-based move execution
+- **VLA** (future): pi0.5 end-to-end learned policy from camera pixels to robot actions
 
-**Status**: OpenPI submodule integrated, VLA scripts in development.
+**Status**: Episode collection, finetuning, and deployment implemented.
 
 ## Quick Start
 
@@ -16,7 +16,7 @@ The VLA (Vision-Language-Action) approach represents the evolution beyond symbol
 # 1. Initialize OpenPI submodule
 git submodule update --init --recursive
 
-# 2. Install OpenPI dependencies to ltx conda environment (CONDA-SAFE METHOD)
+# 2. Install OpenPI dependencies (CONDA-SAFE METHOD)
 conda activate ltx
 pip install -r vla/openpi_requirements.txt
 pip install -e submodules/openpi/packages/openpi-client/
@@ -25,17 +25,159 @@ pip install -e submodules/openpi/
 # 3. Verify installation
 python vla/verify_openpi.py
 
-# 4. Collect training episodes
-python vla/vla_collect_episodes.py --output data/episodes/
+# 4. Collect training episodes (requires tele_op.py running)
+python scripts/collect_vla_episodes.py --output data/episodes/
 
-# 5. Fine-tune π₀ on chess data
-python vla/vla_finetune.py --episodes data/episodes/ --output checkpoints/
+# 5. Validate collected episodes
+python scripts/validate_vla_episodes.py --dataset data/episodes/
 
-# 6. Deploy fine-tuned model
-python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt
+# 6. Fine-tune pi0.5 on collected episodes
+python vla/vla_finetune.py --dataset data/episodes/
+
+# 7. Evaluate fine-tuned model
+python vla/evaluate.py --checkpoint checkpoints/chess_pi0/best.pt
+
+# 8. Deploy fine-tuned model for inference
+python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0/best.pt
 ```
 
-**Important:** Do NOT use `uv sync` as recommended by OpenPI documentation - it creates conflicting virtual environments. Always use the conda-safe pip installation method above. See `vla/INSTALL_OPENPI.md` for detailed installation instructions, troubleshooting, and dependency resolution.
+**Important:** Do NOT use `uv sync` as recommended by OpenPI docs - it creates conflicting virtual environments. Use conda-safe pip installation above.
+
+## Implemented Components
+
+### Episode Collection (`scripts/collect_vla_episodes.py`)
+
+Passive recording of tele-op sessions for VLA training:
+
+```bash
+# Terminal 1: Run tele-op
+python scripts/tele_op.py
+
+# Terminal 2: Collect episodes at 15 FPS
+python scripts/collect_vla_episodes.py --output data/episodes/
+
+# With specific cameras
+python scripts/collect_vla_episodes.py --output data/episodes/ \
+    --global-camera /dev/video4 \
+    --gripper-camera /dev/video0
+```
+
+**Features:**
+- Reads robot joint positions from state_cache.json (passive - no robot control)
+- Records synchronized global + gripper camera frames
+- Generates VLM prompts from board detection + move decomposition
+- Saves to LeRobot dataset format (or raw files if LeRobot unavailable)
+- Retry logic for sensor reading failures
+
+**LeRobot Dataset Schema:**
+```python
+{
+    "observation.global_camera": (720, 1280, 3),   # BGR
+    "observation.gripper_camera": (360, 640, 3),  # BGR
+    "observation.joint_positions": (6,),          # radians
+    "action": (6,),                               # joint targets
+    "language_instruction": str                   # VLM prompt
+}
+```
+
+### Episode Validation (`scripts/validate_vla_episodes.py`)
+
+Interactive tool for reviewing and exporting collected episodes:
+
+```bash
+# Interactive review
+python scripts/validate_vla_episodes.py --dataset data/episodes/
+
+# List episodes
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --list
+
+# Playback episode
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --play 0
+
+# Export good episodes
+python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/filtered/
+```
+
+### Model Loading (`vla/vla_load_model.py`)
+
+Load pi0.5 model and PaliGemma tokenizer:
+
+```python
+from vla.vla_load_model import load_pi05_model
+
+model, tokenizer = load_pi05_model()
+```
+
+### Deployment (`vla/vla_deploy.py`)
+
+Deploy pi0.5 for inference with board detection:
+
+```bash
+# Without robot (visualization only)
+python vla/vla_deploy.py --no-robot
+
+# With SO-100 robot
+python vla/vla_deploy.py --robot-port /dev/ttyACM0
+```
+
+**Pipeline:**
+1. Capture from global + gripper cameras
+2. Detect board state with YOLO
+3. Calculate best move with Stockfish
+4. Decompose into stages with VLM prompts
+5. Generate color-conditioned overlay
+6. Run pi0.5 inference
+7. Execute actions on robot (if connected)
+
+### Finetuning (`vla/vla_finetune.py`)
+
+LoRA-style finetuning of pi0.5 on collected chess episodes:
+
+```bash
+# Basic finetuning with defaults
+python vla/vla_finetune.py --dataset data/episodes/
+
+# With config file
+python vla/vla_finetune.py --config vla/chess_training.yaml
+
+# Resume from checkpoint
+python vla/vla_finetune.py --resume checkpoints/chess_pi0/epoch_50.pt
+
+# Custom hyperparameters
+python vla/vla_finetune.py --dataset data/episodes/ \
+    --epochs 200 \
+    --batch-size 8 \
+    --lr 5e-6
+```
+
+**Training approach:**
+- LoRA-style: Freeze vision encoder, train action head
+- Requires ~22GB VRAM (RTX 3090 / A5000 class)
+- Mixed precision (fp16) for memory efficiency
+- Cosine annealing with warmup
+
+**Configuration (`vla/chess_training.yaml`):**
+```yaml
+batch_size: 4
+gradient_accumulation_steps: 4  # Effective batch = 16
+learning_rate: 1.0e-5
+num_epochs: 100
+freeze_vision_encoder: true
+freeze_language_encoder: true
+```
+
+### Evaluation (`vla/evaluate.py`)
+
+Evaluate fine-tuned checkpoints on held-out episodes:
+
+```bash
+python vla/evaluate.py --checkpoint checkpoints/chess_pi0/best.pt --dataset data/episodes/
+```
+
+**Metrics:**
+- Per-joint MSE and MAE
+- Accuracy at thresholds (0.05, 0.1, 0.2 radians)
+- Comparison to random baseline
 
 ## Planned Architecture
 
@@ -364,31 +506,23 @@ trainer.self_improve(
 | **Reliability** | High (deterministic) | Variable (learned) |
 | **Development Time** | Moderate | High |
 
-## Development Roadmap
+## Development Status
 
-### Stage 1: Data Collection (Current)
-- [x] Episode recorder skeleton
-- [ ] Implement episode storage format
-- [ ] Integrate with guidance system
-- [ ] Collect 100 teleoperation episodes
+**Completed:**
+- Episode collection with LeRobot format
+- Episode validation and export tool
+- pi0.5 model loading
+- Deployment script with board detection integration
+- Color-conditioned VLM prompt generation
+- Fine-tuning pipeline (LoRA-style)
+- Evaluation utilities
 
-### Stage 2: VLA Integration
-- [ ] Pi0 model wrapper
-- [ ] Chess-specific adapter
-- [ ] Inference pipeline
-- [ ] Test with pre-trained Pi0
+**In Progress:**
+- Collect sufficient teleoperation episodes (6 collected, target 100+)
 
-### Stage 3: Training
-- [ ] Dataset builder
-- [ ] Training pipeline
-- [ ] Evaluate on test set
-- [ ] Compare to guidance baseline
-
-### Stage 4: Deployment
-- [ ] Safety validation
-- [ ] Hybrid guidance+VLA mode
-- [ ] Production deployment
-- [ ] Continuous improvement
+**Planned:**
+- Hybrid guidance+VLA mode
+- Self-improvement via play
 
 ## Configuration
 

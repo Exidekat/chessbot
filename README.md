@@ -1,42 +1,46 @@
 # ChessBot - Unified Chess Robot Control System
 
-A modular chess robot system with YOLO-based computer vision, multi-camera management, ROS robot control, and future VLA integration.
+A modular chess robot system with YOLO-based computer vision, multi-camera management, SO-100 robot arm control, and VLA integration for end-to-end learning.
 
 ## Overview
 
 ChessBot provides a complete software stack for autonomous chess-playing robots:
-- **Guidance Module**: YOLO-based board detection and symbolic move calculation
-- **Camera Module**: Multi-camera stream management (2 real-time + 1 static overlay)
-- **Controls Module**: ROS robot arm control with safety systems (skeleton)
-- **VLA Module**: Future Vision-Language-Action model integration (skeleton)
 
-**Status**: Guidance and cameras modules complete and tested. Controls and VLA are skeletal awaiting hardware integration.
+- **Guidance Module**: YOLO-based board detection and symbolic move calculation
+- **Camera Module**: Multi-camera stream management (global + gripper + overlay)
+- **Controls Module**: SO-100 robot arm control with Feetech STS3215 servos
+- **VLA Module**: Vision-Language-Action model integration with episode collection
+
+**Status**: Guidance, cameras, and controls modules functional. VLA has episode collection and deployment scripts.
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-# Clone repository
+# Clone repository with submodules
 git clone --recurse-submodules <repository-url>
 cd chessbot
 
-# Install dependencies
+# Install dependencies (to ltx conda environment)
+conda activate ltx
 pip install -r requirements.txt
 
 # Download YOLO models
-python download.py
+python scripts/download.py
 ```
 
 ### Run Demo
 
 ```bash
-# Detect board state and calculate best move
-python best_move_demo.py --image data/chessboardv2.png --debug
+# Detect board and calculate best move (auto-detects camera)
+python scripts/best_move_demo.py --debug
 
-# Or use the old interface (deprecated)
-python main.py --image data/chessboardv2.png --debug
+# Run with specific camera
+python scripts/best_move_demo.py --debug --global-camera /dev/video0
 ```
+
+See [scripts/USAGE.md](scripts/USAGE.md) for comprehensive command reference.
 
 ## Architecture
 
@@ -45,55 +49,67 @@ python main.py --image data/chessboardv2.png --debug
 ```
 chessbot/
 ├── guidance/              # YOLO-based chess vision
-│   ├── board_detector.py      # Board state detection
-│   ├── move_calculator.py     # Stockfish integration
-│   ├── training/              # YOLO training tools
-│   └── README.md
+│   ├── board_detector.py      # Two-stage YOLO detection pipeline
+│   ├── move_calculator.py     # Stockfish UCI integration
+│   ├── move_interpreter.py    # Move -> robot action decomposition
+│   ├── move_decomposer.py     # VLM prompt generation with color conditioning
+│   ├── coordinate_mapper.py   # Chess square -> pixel mapping
+│   ├── highlight_renderer.py  # Color-coded overlay rendering
+│   ├── guidance_system.py     # High-level orchestrator
+│   └── training/              # YOLO training tools
 │
 ├── cameras/               # Multi-camera management
-│   ├── global_camera.py       # Overhead camera (real-time)
-│   ├── gripper_camera.py      # Arm-mounted camera (real-time)
-│   ├── overlay_generator.py   # Guidance overlay (on-demand)
-│   ├── camera_manager.py      # Unified interface
-│   └── README.md
+│   ├── global_camera.py       # Overhead camera (1280x720)
+│   ├── gripper_camera.py      # Arm-mounted camera (224x224)
+│   ├── overlay_generator.py   # Flag-based overlay loading
+│   ├── virtual_camera.py      # v4l2loopback output for VLA
+│   └── camera_manager.py      # Unified interface
 │
-├── controls/              # ROS robot control (skeleton)
-│   ├── robot_arm.py           # ROS integration (TODO)
-│   ├── movement.py            # Movement primitives (TODO)
-│   ├── calibration.py         # Calibration system (TODO)
-│   ├── safety.py              # Safety monitoring (TODO)
-│   └── README.md
+├── controls/              # SO-100 robot arm control
+│   ├── so100_arm.py           # Low-level Feetech servo protocol
+│   └── robot_controller.py    # High-level control with stability system
 │
-├── vla/                   # Future VLA integration (skeleton)
-│   ├── model/                 # Pi0 wrapper (TODO)
-│   ├── data_collection/       # Episode recording (TODO)
-│   ├── training/              # VLA training (TODO)
-│   └── README.md
+├── vla/                   # Vision-Language-Action integration
+│   ├── vla_deploy.py          # Deploy pi0.5 for inference
+│   ├── vla_load_model.py      # Load pi0.5 and tokenizer
+│   └── verify_openpi.py       # OpenPI installation verification
 │
-├── best_move_demo.py      # Demo using new guidance module
-└── README.md              # This file
+├── utils/                 # Shared utilities
+│   ├── state_cache.py         # Thread-safe JSON state cache
+│   ├── camera_helpers.py      # Camera discovery and selection
+│   └── keyboard_input.py      # Non-blocking terminal input
+│
+├── viz/                   # Web-based visualization
+│   ├── api.py                 # FastAPI + WebSocket server
+│   └── site/                  # React frontend
+│
+├── scripts/               # Execution scripts
+│   ├── USAGE.md               # Command reference
+│   ├── best_move_demo.py      # Main demo script
+│   ├── tele_op.py             # Teleoperation interface
+│   ├── collect_vla_episodes.py # VLA training data collection
+│   └── ...                    # See scripts/USAGE.md
+│
+└── configs/               # Configuration management
+    ├── config_schema.py       # Pydantic schema
+    └── current.yaml           # Active configuration
 ```
-
-**Old Files (Deprecated)**:
-- `board_state.py` - Use `guidance/board_detector.py` instead
-- `robot_interface.py` - Refactored into `guidance/` and `controls/`
-- `tools/` - Moved to `guidance/training/`
 
 ### Module Communication
 
 ```
-Camera Streams → Guidance System → Overlay Generator
-                      ↓
-                Board State + Best Move
-                      ↓
+Camera Streams -> Guidance System -> Overlay Generator
+                       |
+                 Board State + Best Move
+                       |
               Controls (Robot Execution)
-                      ↓
-                  VLA (Future)
+                       |
+                  VLA (End-to-end)
 ```
 
-## Usage
+## Usage Examples
 
-### Guidance System with Overlay Generation
+### Guidance System
 
 ```python
 from guidance import GuidanceSystem
@@ -105,24 +121,35 @@ fen, best_move, actions = guidance.detect_and_calculate(
     "board.png",
     update_cache=True,
     robot_plays_white=True,
-    debug=True  # Saves visualization at each stage
+    debug=True
 )
-
-print(f"Best move: {best_move.uci()}")
-print(f"Action sequence: {len(actions)} actions")
 
 # Generate overlay with action highlights
 guidance.generate_overlay_from_cache()
-# → Saves data/guidance_overlay.png with color-coded highlights
 ```
 
-**Visualizations Generated**:
-- `chessboard_raw_corners.png` - All corner detections with confidence
-- `chessboard_corners.png` - Selected 4 corners labeled TL/TR/BR/BL
-- `chessboard_transformed.png` - Perspective-corrected board
-- `chessboard_detections.png` - Piece detections with confidence colors
-- `chessboard_grid.png` - 8x8 grid overlay
-- `guidance_overlay.png` - Color-coded action highlights (🟢 pickup, 🔵 place, 🔴 capture, 🟠 graveyard)
+### Robot Control (SO-100)
+
+```python
+from controls.robot_controller import RobotController, load_joint_configs_for_port
+
+# Load port-specific configuration
+configs, source = load_joint_configs_for_port("/dev/ttyACM0")
+robot = RobotController("/dev/ttyACM0", configs, source)
+
+# Connect and control
+robot.connect()
+robot.enable_torque()
+robot.set_home_targets()
+robot.start_control_loop()
+
+# Set positions
+robot.set_target_positions(np.array([...]))  # 6 joint radians
+
+# Cleanup
+robot.release_torque()
+robot.disconnect()
+```
 
 ### Camera System
 
@@ -139,273 +166,125 @@ config = {
 cameras = CameraManager(config)
 cameras.start()
 
-# Get real-time streams
 global_frame = cameras.get_global_frame()
 gripper_frame = cameras.get_gripper_frame()
-
-# Get static overlay (only loads when guidance signals via flag)
 overlay = cameras.get_overlay_frame()
 
 cameras.stop()
 ```
 
-### Overlay Generation Workflow
-
-```bash
-# 1. Detect and calculate (updates state cache)
-python -c "from guidance import GuidanceSystem; \
-    GuidanceSystem().detect_and_calculate('board.png')"
-
-# 2. Generate overlay for current action
-python generate_overlay.py
-
-# 3. Check cache status
-python generate_overlay.py --status
-
-# 4. Generate overlay for specific action
-python generate_overlay.py --action 1
-```
-
-### State Cache Management
-
-```python
-from utils import StateCache
-
-cache = StateCache()
-
-# Robot updates after picking up piece
-cache.update({"robot_state": {"holding_piece": True}}, source="robot")
-cache.advance_action()
-
-# Generate new overlay for next action
-import subprocess
-subprocess.run(["python", "generate_overlay.py"])
-```
-
-### Training YOLO Models
-
-```bash
-# Collect data from board photos
-python -m guidance.training.data_collector \
-    --source board_photos/ \
-    --output dataset/
-
-# Train YOLO model
-python -m guidance.training.train_yolo \
-    --data dataset/data.yaml \
-    --epochs 150
-
-# Evaluate model
-python -m guidance.training.evaluate_yolo \
-    --model runs/train/weights/best.pt \
-    --data dataset/
-
-# Analyze specific board
-python -m guidance.training.analyze_board \
-    --image data/test_board.png
-```
-
 ## Configuration
 
-Example `config.yaml`:
+Example `configs/current.yaml`:
 
 ```yaml
-# Control mode
-control_mode: 'guidance'  # or 'vla' (future)
-
-# Guidance (YOLO-based)
 guidance:
   corner_model: "data/best_corners.pt"
   piece_model: "data/best_transformed_detection.pt"
   engine_path: "stockfish"
 
-# Cameras
 cameras:
   global_camera_id: 0
   global_resolution: [1280, 720]
   gripper_camera_id: 1
-  gripper_resolution: [640, 480]
-  overlay_path: "data/guidance_overlay.png"
-  overlay_flag_path: "data/overlay_ready.flag"
+  gripper_resolution: [224, 224]
 
-# Robot (ROS)
-robot:
-  type: "ur5"
-  ros_namespace: "/robot_arm"
-  workspace:
-    x_min: 0.2
-    x_max: 0.8
-    y_min: -0.3
-    y_max: 0.3
-    z_min: 0.0
-    z_max: 0.5
+paths:
+  state_cache: "data/state_cache.json"
+  overlay_image: "data/guidance_overlay.png"
 ```
 
 ## Development Status
 
-### ✅ Completed
+### Completed
 
-**Guidance Module**:
-- [x] `board_detector.py` - Full board detection pipeline with visualizations
-- [x] `move_calculator.py` - Stockfish UCI integration
-- [x] `move_interpreter.py` - Move decomposition into robot actions
-- [x] `coordinate_mapper.py` - Chess square to pixel mapping
-- [x] `highlight_renderer.py` - Color-coded overlay rendering
-- [x] `guidance_system.py` - High-level orchestrator
-- [x] Training tools moved to `guidance/training/`
-- [x] `best_move_demo.py` - Working demo script
+**Guidance Module:**
+- Board detection with two-stage YOLO pipeline
+- Stockfish UCI integration for move calculation
+- Move decomposition into robot actions
+- VLM prompt generation with color conditioning
+- Overlay rendering with action highlights
 
-**Camera Module**:
-- [x] `global_camera.py` - Threaded overhead camera capture
-- [x] `gripper_camera.py` - Threaded gripper camera capture
-- [x] `overlay_generator.py` - Flag-based overlay management
-- [x] `camera_manager.py` - Unified stream interface
+**Camera Module:**
+- Threaded global camera (1280x720)
+- Threaded gripper camera (224x224)
+- Flag-based overlay loading
+- Virtual camera output via v4l2loopback
 
-**Utils Module**:
-- [x] `state_cache.py` - Thread-safe JSON cache for multi-source updates
+**Controls Module:**
+- SO-100 arm with Feetech STS3215 protocol
+- Joint stability system (deadband, smoothing, speed/torque limits)
+- Port-specific configuration loading
+- Teleoperation interface
 
-**Scripts**:
-- [x] `generate_overlay.py` - CLI driver for overlay generation
+**VLA Module:**
+- Episode collection with LeRobot format
+- Episode validation and export
+- pi0.5 model loading and deployment
 
-**Documentation**:
-- [x] Module READMEs for all 4 modules
-- [x] Root README (this file)
+**Utils Module:**
+- Thread-safe JSON state cache
+- Camera discovery helpers
+- Non-blocking keyboard input
 
-### ⏳ To Do
+### In Progress
 
-**Controls Module** (requires hardware):
-- [ ] `robot_arm.py` - ROS integration
-- [ ] `movement.py` - Movement primitives
-- [ ] `calibration.py` - Camera/robot calibration
-- [ ] `safety.py` - Safety monitoring
+- VLA fine-tuning pipeline
+- Full autonomous chess game execution
 
-**VLA Module** (future):
-- [ ] `pi0_wrapper.py` - HuggingFace Pi0 integration
-- [ ] `episode_recorder.py` - Data collection
-- [ ] `train_vla.py` - VLA training pipeline
+## Hardware
+
+### Cameras
+- **Global Camera**: WBC-0E01 USB camera (1280x720)
+- **Gripper Camera**: eMeet C950 USB camera (224x224)
+
+### Robot
+- **Arm**: SO-100 with 6x Feetech STS3215 smart servos
+- **Communication**: Direct serial at 1 Mbps (no ROS required)
+
+### Compute
+- **Vision**: CPU (YOLO on PyTorch CPU backend)
+- **VLA**: GPU with >8GB VRAM for inference
+- **Memory**: 8GB+ RAM
 
 ## Module Documentation
 
-Each module has comprehensive documentation:
+Each module has detailed documentation:
 
-- **[guidance/README.md](guidance/README.md)** - YOLO vision system, training tools, performance notes
-- **[cameras/README.md](cameras/README.md)** - Multi-camera management, stream specifications
-- **[controls/README.md](controls/README.md)** - ROS integration, movement primitives, calibration
-- **[vla/README.md](vla/README.md)** - Future VLA architecture, Pi0 integration, data collection
-
-## Performance
-
-### Current Baseline
-
-Testing with `chessboardv2.png` (starting position):
-- **Detection Rate**: 27/32 pieces (84%)
-- **Classification Accuracy**: 9/32 correct (28%)
-- **Common Issues**: Pawn misclassification, missed pieces
-
-### Improvement Strategy
-
-1. Collect 100+ board photos from your setup
-2. Use `guidance.training.data_collector` to extract labeled pieces
-3. Train new models with `guidance.training.train_yolo` (150+ epochs)
-4. Evaluate and iterate
-
-## Hardware Requirements
-
-### Cameras
-- **Global Camera**: USB camera for overhead view (1280x720+)
-- **Gripper Camera**: USB camera on robot arm (640x480+)
-- **Mounting**: Stable overhead mount, arm-mounted bracket
-
-### Robot
-- **Arm**: ROS-compatible robot arm (UR5, Franka, etc.)
-- **Gripper**: 2-finger gripper or suction gripper
-- **Workspace**: ~60cm x 60cm chessboard area
-
-### Compute
-- **Vision**: CPU (YOLO on CPU with PyTorch 2.7.1+cpu)
-- **VLA**: GPU recommended for Pi0 inference (future)
-- **Memory**: 8GB+ RAM
-- **Storage**: 50GB+ for episode data (VLA)
-
-## Dependencies
-
-### Python Packages
-```
-ultralytics>=8.0.0
-opencv-python
-numpy
-pillow
-shapely
-python-chess
-```
-
-### System
-- Python 3.8+
-- (Optional) Stockfish for move calculation
-- (Future) ROS Noetic for robot control
-- (Future) CUDA for VLA training
-
-## Migration from Old Code
-
-If you were using the old `board_state.py` directly:
-
-```python
-# OLD
-from board_state import BoardState
-detector = BoardState()
-fen = detector.snapshot("board.png", output_format="fen")
-move = detector.bestmove()
-
-# NEW
-from guidance import BoardDetector, MoveCalculator
-import chess
-
-detector = BoardDetector()
-fen, _ = detector.detect_board_state("board.png")
-
-calculator = MoveCalculator()
-board = chess.Board(fen)
-move = calculator.calculate_best_move(board)
-```
-
-For YOLO training:
-```bash
-# OLD
-python tools/train.py --dataset dataset/
-
-# NEW
-python -m guidance.training.train_yolo --dataset dataset/
-```
+- [guidance/README.md](guidance/README.md) - YOLO vision, training tools
+- [cameras/README.md](cameras/README.md) - Multi-camera management
+- [controls/README.md](controls/README.md) - SO-100 arm control, stability system
+- [vla/README.md](vla/README.md) - pi0 integration, episode collection
+- [scripts/USAGE.md](scripts/USAGE.md) - Command reference
 
 ## Troubleshooting
 
 ### Models Not Found
 ```bash
-python download.py
+python scripts/download.py
 ```
 
 ### Camera Not Opening
 ```python
 # List available cameras
-import cv2
-for i in range(10):
-    cap = cv2.VideoCapture(i)
-    if cap.isOpened():
-        print(f"Camera {i} available")
-        cap.release()
+from utils.camera_helpers import get_available_cameras
+print(get_available_cameras())
 ```
 
-### Low Detection Accuracy
-- Collect more training data from your specific setup
-- Ensure good lighting and clear view of board
-- Check that all corners are visible (not obscured)
-- Adjust confidence thresholds in detection
+### Robot Not Found
+```bash
+# List serial ports
+ls /dev/ttyACM* /dev/ttyUSB*
+
+# Add user to dialout group
+sudo usermod -a -G dialout $USER
+```
 
 ### Import Errors
-Make sure to run from project root:
 ```bash
-cd chessbot
-python best_move_demo.py
+# Ensure ltx environment
+conda activate ltx
+pip install -r requirements.txt
 ```
 
 ## Credits

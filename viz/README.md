@@ -93,7 +93,7 @@ npm install
 Runs React dev server (port 3000) with HMR and FastAPI (port 8000) with auto-reload:
 
 ```bash
-python start_viz_tool.py --dev
+python scripts/start_viz_tool.py --dev
 ```
 
 - React dev server: http://localhost:3000
@@ -106,10 +106,10 @@ Builds React app and serves from FastAPI:
 
 ```bash
 # Build React app
-python start_viz_tool.py --build-only
+python scripts/start_viz_tool.py --build-only
 
 # Start production server
-python start_viz_tool.py
+python scripts/start_viz_tool.py
 ```
 
 - Web interface: http://localhost:8000
@@ -118,10 +118,10 @@ python start_viz_tool.py
 
 ```bash
 # Custom host and port
-python start_viz_tool.py --host 192.168.1.100 --port 8080
+python scripts/start_viz_tool.py --host 192.168.1.100 --port 8080
 
 # Dev mode with custom FastAPI port
-python start_viz_tool.py --dev --port 8080
+python scripts/start_viz_tool.py --dev --port 8080
 ```
 
 ## WebSocket Protocol
@@ -264,7 +264,7 @@ Refresh rates are configured in `App.jsx` and can be adjusted based on network c
 3. Check file watcher logs in FastAPI output
 4. Manually regenerate overlay:
    ```bash
-   python generate_overlay.py
+   python scripts/generate_overlay.py
    ```
 
 ### React Build Fails

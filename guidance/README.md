@@ -234,7 +234,7 @@ python -m guidance.training.analyze_board \
 
 Download with:
 ```bash
-python download.py
+python scripts/download.py
 ```
 
 ### Class Mapping
@@ -338,7 +338,7 @@ python -c "from guidance import GuidanceSystem; \
 
 ### 2. Generate Overlay
 ```bash
-python generate_overlay.py
+python scripts/generate_overlay.py
 ```
 - Reads state cache
 - Renders current action highlight
@@ -356,7 +356,7 @@ cache.advance_action()
 
 ### 4. Regenerate Overlay for Next Action
 ```bash
-python generate_overlay.py
+python scripts/generate_overlay.py
 ```
 
 ## Integration

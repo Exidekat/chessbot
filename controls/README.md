@@ -1,257 +1,224 @@
 # Controls Module
 
-Robot arm control and movement primitives using ROS integration. This module handles low-level robot communication, movement execution, safety systems, and calibration.
+SO-100 robotic arm control with Feetech STS3215 smart servos. Provides low-level servo communication and high-level control with joint stability features.
 
 ## Overview
 
-The controls module provides direct robot arm control, replacing the deprecated network-based architecture. All communication with the robot happens through direct function calls and ROS messages - no TCP/UDP networking.
+The controls module provides direct serial control for SO-100 robot arms equipped with 6 Feetech STS3215 servos. Unlike ROS-based systems, this module communicates directly via the Feetech serial protocol at 1 Mbps.
 
-**Status**: Skeleton structure created, implementation pending hardware integration.
+**Hardware**: SO-100 arm with 6x Feetech STS3215 smart servos (motor IDs 1-6)
 
-## Planned Components
+## Components
 
-### `robot_arm.py`
-ROS integration for robot arm control:
+### `so100_arm.py`
+
+Low-level Feetech protocol implementation:
+
 ```python
-from controls import RobotArm
+from controls.so100_arm import SO100Arm
 
-robot = RobotArm(config)
-robot.initialize()
+arm = SO100Arm(port="/dev/ttyACM0", baudrate=1000000)
+arm.connect()
 
-# Direct position control
-robot.move_to_position(x, y, z, orientation)
+# Read current positions (all 6 motors)
+positions = arm.get_joint_positions()  # radians [6]
 
-# Joint control
-robot.move_joints(joint_angles)
+# Get complete state
+state = arm.get_state()  # SO100State: positions, timestamp, is_moving, error_code
 
-# Gripper control
-robot.open_gripper()
-robot.close_gripper()
-
-# Status
-status = robot.get_status()  # position, gripper_state, ready, errors
+arm.disconnect()
 ```
 
-**ROS Topics:**
-- `/robot_arm/command` - Movement commands
-- `/robot_arm/status` - Robot state feedback
-- `/robot_arm/joint_states` - Current joint positions
+**Features:**
+- Feetech serial protocol with checksum validation
+- Threaded state updates at 20 Hz
+- Position reading/writing for all 6 motors
+- Position resolution: 4096 counts/revolution (0-4095 encoder values)
 
-### `movement.py`
-High-level movement primitives for chess:
+### `robot_controller.py`
+
+High-level control with stability system and configuration management:
+
 ```python
-from controls import MovementPrimitives
+from controls.robot_controller import RobotController, load_joint_configs_for_port
 
-primitives = MovementPrimitives(robot_arm, coordinate_mapper)
+# Load port-specific configuration
+configs, source = load_joint_configs_for_port("/dev/ttyACM0")
+robot = RobotController("/dev/ttyACM0", configs, source)
 
-# Chess-specific movements
-primitives.pickup_piece(square="e4", piece_type="P")
-primitives.place_piece(square="e5")
-primitives.move_to_graveyard(captured_piece="p")
+# Connect and start control
+robot.connect()
+robot.enable_torque()
+robot.set_home_targets()
+robot.start_control_loop()  # 20 Hz background thread
 
-# Coordinated sequences
-primitives.execute_capture(from_sq="e4", to_sq="d5")
-primitives.execute_castling(king_move, rook_move)
+# Set target positions (stability system handles smoothing)
+robot.set_target_positions(np.array([...]))  # 6 radians
+
+# Cleanup
+robot.stop_control_loop()
+robot.release_torque()
+robot.disconnect()
 ```
 
-**Movement Types:**
-- **Normal Move**: pickup → place
-- **Capture**: pickup opponent → graveyard → pickup own → place
-- **Castling**: king move → rook move (executed sequentially)
-- **En Passant**: pickup captured pawn → graveyard → pickup own → place
+## Joint Stability System
 
-### `calibration.py`
-Camera-robot calibration system:
-```python
-from controls import CalibrationSystem
+The base joints (J0/J1) have mechanical compliance and inertia that causes oscillation with naive position control. The stability system mitigates this through per-joint parameters:
 
-calibrator = CalibrationSystem(robot, camera_manager)
+### Per-Joint Parameters
 
-# Camera calibration
-calibrator.calibrate_camera_intrinsics()
-calibrator.calibrate_hand_eye()
+Each joint has 5 tunable parameters:
 
-# Workspace calibration
-calibrator.calibrate_board_corners()
-calibrator.calibrate_graveyard_position()
+| Parameter | Description | J0 (Base) | J1 (Shoulder) | J2-J5 |
+|-----------|-------------|-----------|---------------|-------|
+| DEADBAND | Error threshold to disable torque (rad) | 0.025 | 0.0 | 0.0 |
+| SMOOTHING_ALPHA | Low-pass filter (1.0=none, 0.05=heavy) | 1.0 | 1.0 | 1.0 |
+| SPEED_LIMIT | Max speed (steps/sec, 0-1500) | 1000 | 500 | 1000 |
+| ACCEL | Acceleration limit (0=max, 1-254=limited) | 0 | 50 | 0-100 |
+| TORQUE | Torque limit (0-1000 = 0-100%) | 50 | 300 | 100-200 |
 
-# Save/load calibration
-calibrator.save("calibration/current.yaml")
-calibrator.load("calibration/current.yaml")
+**Key behaviors:**
+- **Deadband**: When position error < deadband, torque is disabled to prevent oscillation
+- **J1 has no deadband** because it must fight gravity (would fall if torque disabled)
+- **Smoothing**: Low-pass filter on target positions (currently disabled: alpha=1.0)
+- **Torque limiting**: Prevents excessive force; J0 uses only 5%, J1 uses 30%
+
+### Feetech STS3215 Registers
+
+Key registers used by the control loop:
+
+| Register | Address | Bytes | Description |
+|----------|---------|-------|-------------|
+| Torque Enable | 0x28 | 1 | 0=off, 1=on |
+| Acceleration | 0x29 | 1 | 0=max, 1-254=limited |
+| Goal Position | 0x2A | 2 | Target position (0-4095) |
+| Speed Limit | 0x2E | 2 | Max speed (steps/sec) |
+| Torque Limit | 0x30 | 2 | Runtime torque limit (0-1000) |
+| Current Position | 0x38 | 2 | Read-only encoder value |
+
+## Configuration System
+
+Three-tier configuration fallback:
+
+1. **Port-specific**: `data/so100_config_ttyACM0.csv` (calibrated for specific robot)
+2. **Generic**: `data/so100_config.csv` (shared across robots)
+3. **Defaults**: Full range [0, 2pi] with home at pi (midpoint)
+
+**Safety**: Only robots with port-specific configs should have torque enabled.
+
+### Config File Format
+
+CSV with columns: `joint,min_rad,max_rad,home_rad`
+
+```csv
+joint,min_rad,max_rad,home_rad
+0,0.52,5.76,3.14
+1,1.05,5.23,3.14
+2,0.52,5.76,3.14
+3,0.52,5.76,3.14
+4,0.52,5.76,3.14
+5,1.57,4.71,3.14
 ```
 
-**Calibration Data:**
-- Camera intrinsics (focal length, distortion)
-- Hand-eye transformation (camera to gripper)
-- Board corner positions in robot coordinates
-- Graveyard position
-- Z-heights for pickup/travel/place
+### Creating Calibration
 
-### `safety.py`
-Safety monitoring and collision avoidance:
-```python
-from controls import SafetySystem
-
-safety = SafetySystem(robot, camera_manager)
-
-# Workspace limits
-safety.set_workspace_bounds(x_min, x_max, y_min, y_max, z_min, z_max)
-
-# Collision detection
-safety.enable_collision_detection()
-safety.add_obstacle(position, radius)  # e.g., board edges, pieces
-
-# Emergency stop
-safety.emergency_stop()
-
-# Status
-if safety.is_safe_to_move(target_position):
-    robot.move_to_position(target_position)
-```
-
-**Safety Features:**
-- Workspace boundary enforcement
-- Velocity/acceleration limits
-- Collision detection
-- Emergency stop capability
-- Movement validation before execution
-
-## ROS Setup
-
-### Installation
 ```bash
-# Install ROS (Ubuntu)
-sudo apt-get install ros-noetic-desktop-full
-
-# Initialize rosdep
-sudo rosdep init
-rosdep update
-
-# Source ROS
-echo "source /opt/ros/noetic/setup.bash" >> ~/.bashrc
-source ~/.bashrc
+# Interactive calibration tool (saves to data/so100_config_ttyACM0.csv)
+python scripts/create_so100_config.py --port /dev/ttyACM0
 ```
 
-### ROS Package Structure
-```
-controls/
-├── __init__.py
-├── robot_arm.py         # ROS interface
-├── movement.py          # Movement primitives
-├── calibration.py       # Calibration system
-├── safety.py            # Safety monitoring
-└── README.md
-```
+## Safety Features
 
-## Integration with Other Modules
+### Stuck-Joint Detection
 
-### With Guidance
+Monitors position error over time. If a joint (e.g., gripper holding object) cannot reach target:
+
+1. Error exceeds threshold (0.2 rad / 11 deg) for too long (0.5s)
+2. Safety triggers: torque disabled, target clamped to current position
+3. Auto-recovery when error stays within bounds for 0.5s
+
 ```python
-from guidance import BoardDetector, MoveCalculator
-from controls import RobotArm, MovementPrimitives
+# Configure which joints have safety trigger
+SAFETY_ENABLED_JOINTS = [5]  # Gripper only
 
-# Detect board state
-detector = BoardDetector()
-fen, _ = detector.detect_board_state("board.png")
-
-# Calculate best move
-calculator = MoveCalculator()
-board = chess.Board(fen)
-move = calculator.calculate_best_move(board)
-
-# Execute with robot
-robot = RobotArm(config)
-primitives = MovementPrimitives(robot, coord_mapper)
-primitives.execute_move(move, board)
+# Manual reset after intervention
+robot.reset_safety_trigger(joint_idx=5)
 ```
 
-### With Cameras
+### Torque Release
+
+Critical operation with retry logic and warnings if failed:
+
 ```python
-from cameras import CameraManager
-from controls import RobotArm
-
-cameras = CameraManager(config)
-cameras.start()
-
-robot = RobotArm(config)
-
-# Use real-time feedback
-while moving:
-    gripper_view = cameras.get_gripper_frame()
-    # Adjust based on visual feedback
+robot.release_torque()  # Retries 3 times, warns if unsuccessful
 ```
 
-### With VLA (Future)
+## Usage with Tele-op
+
+The primary interface is via `scripts/tele_op.py`:
+
+```bash
+# Interactive teleoperation with menu
+python scripts/tele_op.py
+
+# Test mode (hold at home for 10 seconds)
+python scripts/tele_op.py --test
+```
+
+**Menu options:**
+1. Exit - Clean disconnect
+2. Tele-op Leader/Follower - Mirror positions between two arms
+3. Adjust Home Positions - Calibrate and save to config
+
+## Utility Functions
+
 ```python
-from vla import VLAModel
-from controls import RobotArm
+from controls.robot_controller import scan_so100_ports, load_joint_configs_for_port
 
-# VLA directly outputs actions
-vla = VLAModel()
-robot = RobotArm(config)
+# Find connected SO-100 robots
+ports = scan_so100_ports()  # Checks /dev/ttyACM0-9
 
-observation = get_observation()  # camera frames + state
-action = vla.predict(observation)
-robot.execute_action(action)
+# Load configs with fallback
+configs, source = load_joint_configs_for_port("/dev/ttyACM0")
+# source: "port-specific", "generic", or "defaults"
 ```
 
-## Configuration
+## Troubleshooting
 
-Example `config.yaml`:
-```yaml
-robot:
-  type: "ur5"  # or "franka", "kuka", etc.
-  ip_address: "192.168.1.100"
-  ros_namespace: "/robot_arm"
+### Robot Not Found
 
-  workspace:
-    x_min: 0.2
-    x_max: 0.8
-    y_min: -0.3
-    y_max: 0.3
-    z_min: 0.0
-    z_max: 0.5
+```bash
+# List available ports
+ls /dev/ttyACM* /dev/ttyUSB*
 
-  speeds:
-    approach: 0.1  # m/s
-    travel: 0.3
-    retreat: 0.1
-
-  gripper:
-    type: "robotiq_2f"
-    open_position: 0.08
-    closed_position: 0.0
-    force_limit: 20  # N
-
-calibration:
-  board_corners:
-    tl: [0.3, 0.2, 0.0]
-    tr: [0.7, 0.2, 0.0]
-    bl: [0.3, -0.2, 0.0]
-    br: [0.7, -0.2, 0.0]
-
-  graveyard: [0.85, 0.0, 0.0]
-
-  z_heights:
-    travel: 0.15
-    approach: 0.05
-    pickup: 0.01
+# Check permissions (add user to dialout group)
+sudo usermod -a -G dialout $USER
+# Log out and back in
 ```
 
-## Development Status
+### Oscillation Issues
 
-- [x] Directory structure created
-- [x] `__init__.py` with planned exports
-- [ ] `robot_arm.py` - ROS interface
-- [ ] `movement.py` - Movement primitives
-- [ ] `calibration.py` - Calibration system
-- [ ] `safety.py` - Safety monitoring
-- [ ] Hardware integration testing
+If joints oscillate around target:
+- Increase DEADBAND for that joint
+- Decrease SMOOTHING_ALPHA (more filtering)
+- Decrease SPEED_LIMIT
+- Decrease TORQUE limit
 
-## Next Steps
+### Torque Not Releasing
 
-1. Implement `robot_arm.py` with specific robot model
-2. Set up ROS environment and test basic movements
-3. Implement calibration workflow
-4. Integrate with cameras for visual servoing
-5. Test complete move execution pipeline
+If `release_torque()` fails:
+- Power cycle the robot
+- Check serial connection
+- Verify correct port
+
+## Hardware Reference
+
+**SO-100 Arm:**
+- 6 DOF: Base, Shoulder, Elbow, Wrist Pitch, Wrist Roll, Gripper
+- Motor IDs: 1-6 (corresponds to joints 0-5 in code)
+- Serial: 1 Mbps baud rate
+
+**Feetech STS3215 Servo:**
+- 14-bit encoder (4096 positions per revolution)
+- Position range: 0-4095 counts = 0 to 2pi radians
+- Serial protocol with [0xFF, 0xFF] header and checksum
