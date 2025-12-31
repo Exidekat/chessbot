@@ -75,8 +75,15 @@ class ChessEpisodeDataset(Dataset):
             raise ImportError("LeRobot is required. Install with: pip install lerobot")
 
         # Load LeRobot dataset
+        # Note: repo_id is a logical identifier, root is the actual local path
+        # When root is provided, LeRobot loads from local disk without HuggingFace Hub access
+        # Use pyav backend for video decoding (torchcodec has FFmpeg compatibility issues)
         print(f"Loading LeRobot dataset from: {dataset_path}")
-        self.lerobot_dataset = LeRobotDataset(str(dataset_path))
+        self.lerobot_dataset = LeRobotDataset(
+            repo_id="local/chess_episodes",  # Logical ID (not used when root is provided)
+            root=self.dataset_path,  # Actual local path
+            video_backend="pyav",  # Use pyav instead of torchcodec for better FFmpeg compatibility
+        )
 
         # Get dataset info
         self.total_frames = len(self.lerobot_dataset)
@@ -151,8 +158,8 @@ class ChessEpisodeDataset(Dataset):
 
         Returns:
             Dictionary with:
-                - observation.image: (C, H, W) tensor (global camera)
-                - observation.gripper_image: (C, H, W) tensor (gripper camera)
+                - observation.images.global_camera: (C, H, W) tensor (global camera)
+                - observation.images.gripper_camera: (C, H, W) tensor (gripper camera)
                 - observation.state: (6,) joint positions tensor
                 - action: (6,) action tensor
                 - language_instruction: str VLM prompt
@@ -163,7 +170,9 @@ class ChessEpisodeDataset(Dataset):
 
         result = {}
 
-        # Process global camera
+        # Process global camera -> maps to base_0_rgb (pretrained model name)
+        # Note: Key format matches PI05 pretrained model expectations
+        # All images must be resized to self.image_size (224x224) for the model
         if self.use_global_camera and "observation.global_camera" in sample:
             global_img = sample["observation.global_camera"]
             if isinstance(global_img, torch.Tensor):
@@ -172,39 +181,73 @@ class ChessEpisodeDataset(Dataset):
                     # (H, W, C) -> (C, H, W)
                     global_img = global_img.permute(2, 0, 1)
                 global_img = global_img.float() / 255.0 if global_img.max() > 1.0 else global_img
+                # Resize to model input size
+                global_img = torch.nn.functional.interpolate(
+                    global_img.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
+                ).squeeze(0)
+                # Normalize
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                global_img = (global_img - mean) / std
             else:
                 # Numpy array
                 global_img = self.transform(global_img)
-            result["observation.image"] = global_img
+            result["observation.images.base_0_rgb"] = global_img
 
-        # Process gripper camera
+        # Process gripper camera -> maps to left_wrist_0_rgb (pretrained model name)
         if self.use_gripper_camera and "observation.gripper_camera" in sample:
             gripper_img = sample["observation.gripper_camera"]
             if isinstance(gripper_img, torch.Tensor):
                 if gripper_img.dim() == 3 and gripper_img.shape[0] != 3:
                     gripper_img = gripper_img.permute(2, 0, 1)
                 gripper_img = gripper_img.float() / 255.0 if gripper_img.max() > 1.0 else gripper_img
+                # Resize to model input size
+                gripper_img = torch.nn.functional.interpolate(
+                    gripper_img.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
+                ).squeeze(0)
+                # Normalize
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                gripper_img = (gripper_img - mean) / std
             else:
                 gripper_img = self.transform(gripper_img)
-            result["observation.gripper_image"] = gripper_img
+            result["observation.images.left_wrist_0_rgb"] = gripper_img
+
+        # Add dummy third camera (right_wrist_0_rgb) - zeros for unused slot
+        # This maintains compatibility with the 3-camera pretrained architecture
+        result["observation.images.right_wrist_0_rgb"] = torch.zeros(3, self.image_size[0], self.image_size[1])
 
         # Process joint positions (observation)
+        # Pretrained PI05 expects 32-dim state, we have 6 joints - pad with zeros
         if "observation.joint_positions" in sample:
             joint_pos = sample["observation.joint_positions"]
             if isinstance(joint_pos, np.ndarray):
                 joint_pos = torch.from_numpy(joint_pos).float()
             elif not isinstance(joint_pos, torch.Tensor):
                 joint_pos = torch.tensor(joint_pos, dtype=torch.float32)
-            result["observation.state"] = joint_pos
+            # Pad to 32 dimensions
+            padded_state = torch.zeros(32)
+            padded_state[:len(joint_pos)] = joint_pos
+            result["observation.state"] = padded_state
 
         # Process action (target)
+        # Pretrained PI05 expects action chunks: (chunk_size, action_dim) = (50, 32)
+        # We have a single 6-joint action, so we:
+        # 1. Pad the action dimension to 32
+        # 2. Repeat the action 50 times (for action chunking during training)
         if "action" in sample:
             action = sample["action"]
             if isinstance(action, np.ndarray):
                 action = torch.from_numpy(action).float()
             elif not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32)
-            result["action"] = action
+            # Pad to 32 dimensions
+            padded_action = torch.zeros(32)
+            padded_action[:len(action)] = action
+            # Repeat for action chunking (50 timesteps)
+            chunk_size = 50
+            action_chunk = padded_action.unsqueeze(0).repeat(chunk_size, 1)  # (50, 32)
+            result["action"] = action_chunk
 
         # Process language instruction
         if "language_instruction" in sample:
@@ -223,18 +266,24 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     Custom collate function for chess episode batches.
 
     Handles variable-length language instructions and stacks tensors.
+    Uses pretrained PI05 camera key names for compatibility.
     """
     result = {}
 
-    # Stack image tensors
-    if "observation.image" in batch[0]:
-        result["observation.image"] = torch.stack(
-            [b["observation.image"] for b in batch]
+    # Stack image tensors (keys match PI05 pretrained model)
+    if "observation.images.base_0_rgb" in batch[0]:
+        result["observation.images.base_0_rgb"] = torch.stack(
+            [b["observation.images.base_0_rgb"] for b in batch]
         )
 
-    if "observation.gripper_image" in batch[0]:
-        result["observation.gripper_image"] = torch.stack(
-            [b["observation.gripper_image"] for b in batch]
+    if "observation.images.left_wrist_0_rgb" in batch[0]:
+        result["observation.images.left_wrist_0_rgb"] = torch.stack(
+            [b["observation.images.left_wrist_0_rgb"] for b in batch]
+        )
+
+    if "observation.images.right_wrist_0_rgb" in batch[0]:
+        result["observation.images.right_wrist_0_rgb"] = torch.stack(
+            [b["observation.images.right_wrist_0_rgb"] for b in batch]
         )
 
     # Stack state tensors

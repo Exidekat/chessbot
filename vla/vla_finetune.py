@@ -160,6 +160,7 @@ def train_epoch(
     config: ChessTrainingConfig,
     epoch: int,
     scaler: Optional[GradScaler] = None,
+    tokenizer = None,
 ) -> Dict[str, float]:
     """
     Train for one epoch.
@@ -178,14 +179,20 @@ def train_epoch(
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(dataloader):
-        # Move batch to device
-        observation_image = batch.get("observation.image")
+        # Move batch to device - using pretrained PI05 camera names
+        base_camera = batch.get("observation.images.base_0_rgb")
+        left_wrist_camera = batch.get("observation.images.left_wrist_0_rgb")
+        right_wrist_camera = batch.get("observation.images.right_wrist_0_rgb")
         observation_state = batch.get("observation.state")
         target_action = batch.get("action")
-        language_instructions = batch.get("language_instruction", [""] * len(target_action))
+        language_instructions = batch.get("language_instruction", ["Move piece"] * (len(target_action) if target_action is not None else 1))
 
-        if observation_image is not None:
-            observation_image = observation_image.to(device)
+        if base_camera is not None:
+            base_camera = base_camera.to(device)
+        if left_wrist_camera is not None:
+            left_wrist_camera = left_wrist_camera.to(device)
+        if right_wrist_camera is not None:
+            right_wrist_camera = right_wrist_camera.to(device)
         if observation_state is not None:
             observation_state = observation_state.to(device)
         if target_action is not None:
@@ -193,18 +200,39 @@ def train_epoch(
 
         # Forward pass with mixed precision
         with autocast(enabled=config.mixed_precision):
-            # Build observation dict for model
-            observation = {}
-            if observation_image is not None:
-                observation["image"] = observation_image
+            # Build batch dict for model - using pretrained PI05 camera names
+            model_batch = {}
+            if base_camera is not None:
+                model_batch["observation.images.base_0_rgb"] = base_camera
+            if left_wrist_camera is not None:
+                model_batch["observation.images.left_wrist_0_rgb"] = left_wrist_camera
+            if right_wrist_camera is not None:
+                model_batch["observation.images.right_wrist_0_rgb"] = right_wrist_camera
             if observation_state is not None:
-                observation["state"] = observation_state
+                model_batch["observation.state"] = observation_state
+            if target_action is not None:
+                model_batch["action"] = target_action
+
+            # Tokenize language instructions for PI05
+            if tokenizer is not None and language_instructions:
+                # Ensure all are strings
+                lang_list = [str(s) if s else "Move chess piece" for s in language_instructions]
+                tokenized = tokenizer(
+                    lang_list,
+                    padding=True,
+                    truncation=True,
+                    max_length=64,
+                    return_tensors="pt"
+                )
+                model_batch["observation.language.tokens"] = tokenized["input_ids"].to(device)
+                # PI05 expects boolean attention mask
+                model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
             # Model forward pass
-            # Note: π₀.₅ expects observation dict and language instruction
+            # Note: π₀.₅ expects batch dict with observation.images.* keys
             try:
                 # Try standard LeRobot policy interface
-                model_output = model(observation)
+                model_output = model.forward(model_batch)
 
                 # Extract predicted actions
                 if hasattr(model_output, "actions"):
@@ -215,10 +243,11 @@ def train_epoch(
                     predicted_actions = model_output
                 else:
                     # Fallback: use model's select_action method
-                    predicted_actions = model.select_action(observation)
+                    predicted_actions = model.select_action(model_batch)
 
             except Exception as e:
                 print(f"[WARN] Model forward failed: {e}")
+                print(f"       Batch keys: {list(model_batch.keys())}")
                 print(f"       Using dummy output for debugging")
                 predicted_actions = target_action.clone()  # For debugging
 
@@ -266,6 +295,7 @@ def validate(
     dataloader,
     loss_fn: VLALoss,
     config: ChessTrainingConfig,
+    tokenizer = None,
 ) -> Dict[str, float]:
     """
     Validate model on held-out data.
@@ -283,28 +313,57 @@ def validate(
 
     with torch.no_grad():
         for batch in dataloader:
-            # Move batch to device
-            observation_image = batch.get("observation.image")
+            # Get language instructions for tokenization
+            language_instructions = batch.get("language_instruction", ["Move piece"])
+
+            # Move batch to device - using pretrained PI05 camera names
+            base_camera = batch.get("observation.images.base_0_rgb")
+            left_wrist_camera = batch.get("observation.images.left_wrist_0_rgb")
+            right_wrist_camera = batch.get("observation.images.right_wrist_0_rgb")
             observation_state = batch.get("observation.state")
             target_action = batch.get("action")
 
-            if observation_image is not None:
-                observation_image = observation_image.to(device)
+            if base_camera is not None:
+                base_camera = base_camera.to(device)
+            if left_wrist_camera is not None:
+                left_wrist_camera = left_wrist_camera.to(device)
+            if right_wrist_camera is not None:
+                right_wrist_camera = right_wrist_camera.to(device)
             if observation_state is not None:
                 observation_state = observation_state.to(device)
             if target_action is not None:
                 target_action = target_action.to(device)
 
-            # Build observation dict
-            observation = {}
-            if observation_image is not None:
-                observation["image"] = observation_image
+            # Build batch dict for model
+            model_batch = {}
+            if base_camera is not None:
+                model_batch["observation.images.base_0_rgb"] = base_camera
+            if left_wrist_camera is not None:
+                model_batch["observation.images.left_wrist_0_rgb"] = left_wrist_camera
+            if right_wrist_camera is not None:
+                model_batch["observation.images.right_wrist_0_rgb"] = right_wrist_camera
             if observation_state is not None:
-                observation["state"] = observation_state
+                model_batch["observation.state"] = observation_state
+            if target_action is not None:
+                model_batch["action"] = target_action
+
+            # Tokenize language instructions for PI05
+            if tokenizer is not None and language_instructions:
+                lang_list = [str(s) if s else "Move chess piece" for s in language_instructions]
+                tokenized = tokenizer(
+                    lang_list,
+                    padding=True,
+                    truncation=True,
+                    max_length=64,
+                    return_tensors="pt"
+                )
+                model_batch["observation.language.tokens"] = tokenized["input_ids"].to(device)
+                # PI05 expects boolean attention mask
+                model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
             # Forward pass
             try:
-                model_output = model(observation)
+                model_output = model.forward(model_batch)
 
                 if hasattr(model_output, "actions"):
                     predicted_actions = model_output.actions
@@ -313,7 +372,7 @@ def validate(
                 elif isinstance(model_output, torch.Tensor):
                     predicted_actions = model_output
                 else:
-                    predicted_actions = model.select_action(observation)
+                    predicted_actions = model.select_action(model_batch)
 
             except Exception:
                 predicted_actions = target_action.clone()
@@ -409,7 +468,8 @@ def main():
     print("Loading Model")
     print("=" * 60)
 
-    model, tokenizer = load_pi0_model(device=config.device)
+    # Load model configured for chess robot training (custom camera layout)
+    model, tokenizer = load_pi0_model(device=config.device, for_training=True)
 
     # Freeze backbones for LoRA-style training
     if config.freeze_vision_encoder:
@@ -502,11 +562,11 @@ def main():
 
         # Train
         train_metrics = train_epoch(
-            model, train_loader, optimizer, loss_fn, config, epoch + 1, scaler
+            model, train_loader, optimizer, loss_fn, config, epoch + 1, scaler, tokenizer
         )
 
         # Validate
-        val_metrics = validate(model, val_loader, loss_fn, config)
+        val_metrics = validate(model, val_loader, loss_fn, config, tokenizer)
 
         # Update scheduler
         scheduler.step()

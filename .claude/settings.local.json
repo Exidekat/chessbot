@@ -44,7 +44,12 @@
       "Bash(for:*)",
       "Bash(do echo \"=== $dev ===\")",
       "Bash(find:*)",
-      "Bash(git -C /home/exidekat/chessbot log --oneline --all -30)"
+      "Bash(git -C /home/exidekat/chessbot log --oneline --all -30)",
+      "Bash(LD_LIBRARY_PATH=/home/exidekat/miniconda3/envs/ltx/lib:$LD_LIBRARY_PATH PYTHONPATH=/home/exidekat/chessbot timeout 30 python:*)",
+      "Bash(PYTHONPATH=/home/exidekat/chessbot timeout 300 python:*)",
+      "Bash(PYTHONPATH=/home/exidekat/chessbot timeout 120 python:*)",
+      "Bash(PYTHONPATH=/home/exidekat/chessbot timeout 180 python:*)",
+      "Bash(lspci:*)"
     ],
     "deny": [],
     "ask": []

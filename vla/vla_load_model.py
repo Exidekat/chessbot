@@ -13,11 +13,13 @@ The π₀.₅ model is from Physical Intelligence's LeRobot implementation.
 
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 try:
     import torch
     from lerobot.policies.pi05 import PI05Policy as PI0Policy
+    from lerobot.policies.pi05.modeling_pi05 import PI05Config
+    from lerobot.configs.types import PolicyFeature, FeatureType
     from transformers import AutoTokenizer
 except ImportError as e:
     print(f"[X] Failed to import required packages: {e}")
@@ -25,9 +27,43 @@ except ImportError as e:
     sys.exit(1)
 
 
+# Chess robot camera configuration
+# The pretrained pi0.5 model expects 3 specific camera names:
+#   - observation.images.base_0_rgb (overhead/global camera)
+#   - observation.images.left_wrist_0_rgb (gripper camera)
+#   - observation.images.right_wrist_0_rgb (not used, will be zeros)
+# We map our 2 cameras to the first two slots.
+CHESS_INPUT_FEATURES = {
+    'observation.images.base_0_rgb': PolicyFeature(
+        type=FeatureType.VISUAL, shape=(3, 224, 224)
+    ),
+    'observation.images.left_wrist_0_rgb': PolicyFeature(
+        type=FeatureType.VISUAL, shape=(3, 224, 224)
+    ),
+    'observation.images.right_wrist_0_rgb': PolicyFeature(
+        type=FeatureType.VISUAL, shape=(3, 224, 224)
+    ),
+}
+
+# Mapping from our camera names to pretrained model names
+CHESS_CAMERA_MAPPING = {
+    'global_camera': 'base_0_rgb',
+    'gripper_camera': 'left_wrist_0_rgb',
+}
+
+CHESS_OUTPUT_FEATURES = {
+    'action': PolicyFeature(
+        type=FeatureType.ACTION, shape=(6,)  # SO-100 has 6 joints
+    ),
+}
+
+
 def load_pi0_model(
     checkpoint_path: Optional[str] = None,
-    device: str = "cuda"
+    device: str = "cuda",
+    for_training: bool = False,
+    input_features: Optional[Dict[str, PolicyFeature]] = None,
+    output_features: Optional[Dict[str, PolicyFeature]] = None,
 ) -> Tuple[PI0Policy, AutoTokenizer]:
     """
     Load π₀.₅ VLA model and PaliGemma tokenizer.
@@ -37,15 +73,22 @@ def load_pi0_model(
     - Loading fine-tuned checkpoints from local paths
     - Device placement (CUDA/CPU)
     - Tokenizer initialization for language conditioning
+    - Custom input/output features for chess robot
 
     Args:
         checkpoint_path: Path to fine-tuned checkpoint. If None or doesn't exist,
                         loads base π₀.₅ weights from HuggingFace.
         device: Device to run model on ("cuda" or "cpu"). Defaults to "cuda".
+        for_training: If True, configure model for chess robot (custom cameras/actions).
+                     If False, load model as-is for inference.
+        input_features: Custom input features dict. Uses CHESS_INPUT_FEATURES if None
+                       and for_training=True.
+        output_features: Custom output features dict. Uses CHESS_OUTPUT_FEATURES if None
+                        and for_training=True.
 
     Returns:
         Tuple of (policy, tokenizer):
-            - policy: PI05Policy instance ready for inference
+            - policy: PI05Policy instance ready for inference/training
             - tokenizer: PaliGemma tokenizer for language prompts
 
     Note on State Dict Warnings:
@@ -59,12 +102,15 @@ def load_pi0_model(
         errors (KeyError, RuntimeError) during inference if issues arise.
 
     Example:
+        >>> # For inference
         >>> policy, tokenizer = load_pi0_model(device="cuda")
-        >>> # Use for inference
         >>> observation = {...}
         >>> action = policy.select_action(observation)
 
-        >>> # Or load fine-tuned checkpoint
+        >>> # For training with chess robot cameras
+        >>> policy, tokenizer = load_pi0_model(device="cuda", for_training=True)
+
+        >>> # With fine-tuned checkpoint
         >>> policy, tokenizer = load_pi0_model("checkpoints/chess_pi0.pt")
     """
     # Determine checkpoint to load
@@ -81,13 +127,33 @@ def load_pi0_model(
     print(f"Loading model from: {pretrained_path}")
     print(f"Target device: {device}")
 
-    policy = PI0Policy.from_pretrained(pretrained_path)
+    if for_training and not is_finetuned:
+        # For training: use the pretrained model's exact architecture
+        # We map our cameras to the pretrained model's expected camera names:
+        #   global_camera -> base_0_rgb
+        #   gripper_camera -> left_wrist_0_rgb
+        #   (dummy zeros) -> right_wrist_0_rgb
+        print("Loading pretrained model for finetuning...")
+        print("  Camera mapping: global_camera -> base_0_rgb, gripper_camera -> left_wrist_0_rgb")
 
-    # Move to device and set to evaluation mode
+        # Load pretrained model directly
+        policy = PI0Policy.from_pretrained(pretrained_path)
+
+        print(f"  Input features: {list(policy.config.input_features.keys())}")
+        print(f"  Output features: {list(policy.config.output_features.keys())}")
+    else:
+        # For inference or fine-tuned: load as-is
+        policy = PI0Policy.from_pretrained(pretrained_path)
+
+    # Move to device
     policy = policy.to(device)
-    policy.eval()
 
-    print(f"[OK] Model loaded and moved to {device}")
+    if for_training:
+        policy.train()
+        print(f"[OK] Model loaded in training mode on {device}")
+    else:
+        policy.eval()
+        print(f"[OK] Model loaded in eval mode on {device}")
 
     # Load tokenizer for language prompts
     # PaliGemma (π₀.₅'s vision-language backbone) uses Gemma tokenizer
