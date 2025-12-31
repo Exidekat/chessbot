@@ -43,7 +43,7 @@ except ImportError as e:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from vla.training_config import ChessTrainingConfig, load_config
 from vla.chess_dataloader import create_dataloaders, ChessEpisodeDataset
-from vla.losses import VLALoss, compute_action_accuracy
+# Note: VLALoss not needed - PI05 computes loss internally
 from vla.vla_load_model import load_pi0_model, get_model_info
 
 
@@ -156,7 +156,6 @@ def train_epoch(
     model: nn.Module,
     dataloader,
     optimizer: torch.optim.Optimizer,
-    loss_fn: VLALoss,
     config: ChessTrainingConfig,
     epoch: int,
     scaler: Optional[GradScaler] = None,
@@ -229,31 +228,15 @@ def train_epoch(
                 model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
             # Model forward pass
-            # Note: π₀.₅ expects batch dict with observation.images.* keys
+            # PI05Policy.forward() returns (loss, loss_dict) tuple
             try:
-                # Try standard LeRobot policy interface
-                model_output = model.forward(model_batch)
-
-                # Extract predicted actions
-                if hasattr(model_output, "actions"):
-                    predicted_actions = model_output.actions
-                elif isinstance(model_output, dict) and "actions" in model_output:
-                    predicted_actions = model_output["actions"]
-                elif isinstance(model_output, torch.Tensor):
-                    predicted_actions = model_output
-                else:
-                    # Fallback: use model's select_action method
-                    predicted_actions = model.select_action(model_batch)
+                loss, loss_dict = model.forward(model_batch)
+                loss = loss / accumulation_steps
 
             except Exception as e:
                 print(f"[WARN] Model forward failed: {e}")
                 print(f"       Batch keys: {list(model_batch.keys())}")
-                print(f"       Using dummy output for debugging")
-                predicted_actions = target_action.clone()  # For debugging
-
-            # Compute loss
-            losses = loss_fn(predicted_actions, target_action)
-            loss = losses["loss"] / accumulation_steps
+                raise  # Re-raise to debug
 
         # Backward pass
         if scaler is not None:
@@ -275,8 +258,8 @@ def train_epoch(
             optimizer.zero_grad()
 
         # Accumulate metrics
-        total_loss += losses["loss"].item()
-        total_action_loss += losses["action_loss"].item()
+        total_loss += loss.item() * accumulation_steps  # Undo scaling for logging
+        total_action_loss += loss_dict.get("loss", loss.item())
         num_batches += 1
 
         # Log progress
@@ -293,7 +276,6 @@ def train_epoch(
 def validate(
     model: nn.Module,
     dataloader,
-    loss_fn: VLALoss,
     config: ChessTrainingConfig,
     tokenizer = None,
 ) -> Dict[str, float]:
@@ -361,42 +343,23 @@ def validate(
                 # PI05 expects boolean attention mask
                 model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
-            # Forward pass
+            # Forward pass - PI05Policy.forward() returns (loss, loss_dict)
             try:
-                model_output = model.forward(model_batch)
+                loss, loss_dict = model.forward(model_batch)
 
-                if hasattr(model_output, "actions"):
-                    predicted_actions = model_output.actions
-                elif isinstance(model_output, dict) and "actions" in model_output:
-                    predicted_actions = model_output["actions"]
-                elif isinstance(model_output, torch.Tensor):
-                    predicted_actions = model_output
-                else:
-                    predicted_actions = model.select_action(model_batch)
+                total_loss += loss.item()
+                total_action_loss += loss_dict.get("loss", loss.item())
+                num_batches += 1
 
-            except Exception:
-                predicted_actions = target_action.clone()
-
-            # Compute loss
-            losses = loss_fn(predicted_actions, target_action)
-
-            # Compute accuracy metrics
-            metrics = compute_action_accuracy(predicted_actions, target_action)
-            all_metrics.append(metrics)
-
-            total_loss += losses["loss"].item()
-            total_action_loss += losses["action_loss"].item()
-            num_batches += 1
+            except Exception as e:
+                print(f"[WARN] Validation forward failed: {e}")
+                continue
 
     # Average metrics
     avg_metrics = {
         "val_loss": total_loss / max(num_batches, 1),
         "val_action_loss": total_action_loss / max(num_batches, 1),
     }
-
-    if all_metrics:
-        for key in all_metrics[0].keys():
-            avg_metrics[f"val_{key}"] = np.mean([m[key] for m in all_metrics])
 
     return avg_metrics
 
@@ -527,13 +490,8 @@ def main():
         milestones=[config.warmup_steps],
     )
 
-    # Create loss function
-    loss_fn = VLALoss(
-        action_weight=config.action_loss_weight,
-        auxiliary_weight=config.auxiliary_loss_weight,
-    )
-
     # Mixed precision scaler
+    # Note: PI05 computes its own loss internally, so we don't need a separate loss_fn
     scaler = GradScaler() if config.mixed_precision else None
 
     # Resume from checkpoint
@@ -562,11 +520,11 @@ def main():
 
         # Train
         train_metrics = train_epoch(
-            model, train_loader, optimizer, loss_fn, config, epoch + 1, scaler, tokenizer
+            model, train_loader, optimizer, config, epoch + 1, scaler, tokenizer
         )
 
         # Validate
-        val_metrics = validate(model, val_loader, loss_fn, config, tokenizer)
+        val_metrics = validate(model, val_loader, config, tokenizer)
 
         # Update scheduler
         scheduler.step()
@@ -577,7 +535,6 @@ def main():
 
         print(f"\n  Train Loss: {train_metrics['train_loss']:.6f}")
         print(f"  Val Loss: {val_metrics['val_loss']:.6f}")
-        print(f"  Val Accuracy: {val_metrics.get('val_overall_accuracy', 0):.4f}")
         print(f"  LR: {current_lr:.2e}")
         print(f"  Time: {epoch_time:.1f}s")
 
