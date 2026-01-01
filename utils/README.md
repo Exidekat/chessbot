@@ -75,7 +75,7 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     get_camera_index_from_device,
-    capture_4k_downscale
+    capture_1080p_downscale
 )
 
 # Find all cameras
@@ -88,8 +88,8 @@ device = select_camera(cameras)
 # Parse device path
 index = get_camera_index_from_device("/dev/video0")  # Returns 0
 
-# Capture 4K and downscale to 720p
-success = capture_4k_downscale("/dev/video0", Path("board.png"))
+# Capture 1080p and downscale to 720p
+success = capture_1080p_downscale("/dev/video0", Path("board.png"))
 ```
 
 **Functions:**
@@ -99,7 +99,7 @@ success = capture_4k_downscale("/dev/video0", Path("board.png"))
 | `get_available_cameras()` | Detect USB cameras via v4l2-ctl |
 | `select_camera(cameras)` | Interactive camera selection prompt |
 | `get_camera_index_from_device(path)` | Parse /dev/videoN to OpenCV index |
-| `capture_4k_downscale(device, output)` | Capture 4K MJPEG, downscale to 720p |
+| `capture_1080p_downscale(device, output)` | Capture 1080p MJPEG, downscale to 720p |
 
 ### `keyboard_input.py`
 

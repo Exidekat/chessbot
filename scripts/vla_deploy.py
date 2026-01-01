@@ -56,7 +56,7 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     get_camera_index_from_device,
-    capture_4k_downscale
+    capture_1080p_downscale
 )
 from utils.keyboard_input import KeyboardInput
 from controls.robot_controller import (

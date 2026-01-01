@@ -5,6 +5,9 @@ torch>=2.0.0  # PyTorch for YOLO models
 ultralytics>=8.0.0  # YOLOv8 implementation
 opencv-python>=4.8.0  # OpenCV for image processing
 pillow>=10.0.0  # Image loading and manipulation
+lerobot
+transformers
+pyserial
 
 # Computational Geometry
 shapely>=2.0.0  # For IoU calculations and polygon operations
