@@ -11,7 +11,7 @@ num_workers: 4
 
 # Training
 batch_size: 1  # Reduced for 24GB VRAM - PI05 is ~3B params
-gradient_accumulation_steps: 16  # Effective batch size = 16
+gradient_accumulation_steps: 1  # Disabled to debug memory leak
 learning_rate: 1.0e-5
 weight_decay: 0.01
 num_epochs: 100
@@ -31,7 +31,7 @@ save_best: true
 # Logging
 wandb_project: "chessbot-vla"
 use_wandb: false  # Set to true to enable W&B logging
-log_every_n_steps: 10
+log_every_n_steps: 100
 
 # Hardware
 device: "cuda"

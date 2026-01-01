@@ -49,7 +49,9 @@
       "Bash(PYTHONPATH=/home/exidekat/chessbot timeout 300 python:*)",
       "Bash(PYTHONPATH=/home/exidekat/chessbot timeout 120 python:*)",
       "Bash(PYTHONPATH=/home/exidekat/chessbot timeout 180 python:*)",
-      "Bash(lspci:*)"
+      "Bash(lspci:*)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)"
     ],
     "deny": [],
     "ask": []

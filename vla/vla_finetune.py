@@ -257,10 +257,17 @@ def train_epoch(
 
             optimizer.zero_grad()
 
-        # Accumulate metrics
-        total_loss += loss.item() * accumulation_steps  # Undo scaling for logging
-        total_action_loss += loss_dict.get("loss", loss.item())
+        # Accumulate metrics (save values before cleanup)
+        batch_loss = loss.item() * accumulation_steps
+        batch_action_loss = loss_dict.get("loss", loss.item())
+        total_loss += batch_loss
+        total_action_loss += batch_action_loss
         num_batches += 1
+
+        # Aggressive memory cleanup to prevent OOM on 24GB GPU
+        del loss, loss_dict, model_batch
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         # Log progress
         if (batch_idx + 1) % config.log_every_n_steps == 0:
@@ -466,11 +473,22 @@ def main():
     print(f"Val batches: {len(val_loader)}")
 
     # Create optimizer and scheduler
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    # Use 8-bit AdamW to save ~6GB VRAM on optimizer states
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        print("[OK] Using 8-bit AdamW (saves ~6GB VRAM)")
+    except ImportError:
+        print("[WARN] bitsandbytes not installed, using standard AdamW")
+        optimizer = AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
 
     # Warmup + cosine annealing scheduler
     warmup_scheduler = LinearLR(
