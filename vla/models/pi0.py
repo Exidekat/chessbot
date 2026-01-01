@@ -1,0 +1,307 @@
+"""
+PI0 (Pi Zero Point Five) VLA Model Implementation
+
+This module provides the PI0 model wrapper implementing the VLAModelBase interface.
+PI0 is Physical Intelligence's vision-language-action model from LeRobot.
+"""
+
+from typing import Dict, Any, Tuple, Optional
+from pathlib import Path
+import sys
+
+import numpy as np
+
+try:
+    import torch
+    import cv2
+    from lerobot.policies.pi05 import PI05Policy
+    from lerobot.configs.types import PolicyFeature, FeatureType
+    from transformers import AutoTokenizer
+except ImportError as e:
+    print(f"[X] Failed to import PI0 dependencies: {e}")
+    print("    Run: conda activate ltx && pip install lerobot transformers")
+    sys.exit(1)
+
+from .registry import register_model
+from .base import VLAModelMixin
+
+
+# Chess robot camera configuration for PI0
+# Maps our 2 cameras to PI0's expected 3 camera slots
+CHESS_INPUT_FEATURES = {
+    'observation.images.base_0_rgb': PolicyFeature(
+        type=FeatureType.VISUAL, shape=(3, 224, 224)
+    ),
+    'observation.images.left_wrist_0_rgb': PolicyFeature(
+        type=FeatureType.VISUAL, shape=(3, 224, 224)
+    ),
+    'observation.images.right_wrist_0_rgb': PolicyFeature(
+        type=FeatureType.VISUAL, shape=(3, 224, 224)
+    ),
+}
+
+CHESS_OUTPUT_FEATURES = {
+    'action': PolicyFeature(
+        type=FeatureType.ACTION, shape=(6,)  # SO-100 has 6 joints
+    ),
+}
+
+
+@register_model("pi0")
+class PI0Model(VLAModelMixin):
+    """
+    PI0 (Pi Zero Point Five) VLA model implementation.
+
+    This model uses PaliGemma as the vision-language backbone with a
+    flow-matching action expert for predicting robot actions.
+
+    Attributes:
+        MODEL_NAME: "pi0"
+        DEFAULT_IMAGE_SIZE: (224, 224) - Fixed resolution for PaliGemma
+        DEFAULT_PRETRAINED_PATH: "lerobot/pi05_base"
+        TOKENIZER_PATH: "google/paligemma-3b-pt-224"
+    """
+
+    MODEL_NAME = "pi0"
+    DEFAULT_IMAGE_SIZE = (224, 224)
+    DEFAULT_PRETRAINED_PATH = "lerobot/pi05_base"
+    TOKENIZER_PATH = "google/paligemma-3b-pt-224"
+
+    # Camera key names expected by PI0
+    CAMERA_KEYS = {
+        'global': 'observation.images.base_0_rgb',
+        'gripper': 'observation.images.left_wrist_0_rgb',
+        'unused': 'observation.images.right_wrist_0_rgb',
+    }
+
+    # ImageNet normalization (matches training in chess_dataloader.py)
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+
+    def __init__(self):
+        """Initialize empty model (populated by from_pretrained)."""
+        self.policy: Optional[PI05Policy] = None
+        self.tokenizer: Optional[AutoTokenizer] = None
+        self.device: str = "cpu"
+        self._mean_tensor: Optional[torch.Tensor] = None
+        self._std_tensor: Optional[torch.Tensor] = None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        checkpoint_path: Optional[str] = None,
+        device: str = "cuda",
+        for_training: bool = False,
+    ) -> "PI0Model":
+        """
+        Load PI0 model from pretrained weights or checkpoint.
+
+        Args:
+            checkpoint_path: Path to fine-tuned checkpoint. If None or doesn't exist,
+                           loads base weights from HuggingFace.
+            device: Device to run model on ("cuda" or "cpu").
+            for_training: If True, set model to training mode.
+
+        Returns:
+            PI0Model instance ready for inference or training.
+        """
+        instance = cls()
+        instance.device = device
+
+        # Determine which weights to load
+        if checkpoint_path and Path(checkpoint_path).exists():
+            print(f"[PI0] Loading fine-tuned checkpoint: {checkpoint_path}")
+            pretrained_path = checkpoint_path
+        else:
+            print(f"[PI0] Loading base weights from HuggingFace ({cls.DEFAULT_PRETRAINED_PATH})")
+            pretrained_path = cls.DEFAULT_PRETRAINED_PATH
+
+        # Load PI0 policy
+        print(f"[PI0] Loading model from: {pretrained_path}")
+        instance.policy = PI05Policy.from_pretrained(pretrained_path)
+        instance.policy = instance.policy.to(device)
+
+        # Set training/eval mode
+        if for_training:
+            instance.policy.train()
+            print(f"[PI0] Model loaded in training mode on {device}")
+        else:
+            instance.policy.eval()
+            print(f"[PI0] Model loaded in eval mode on {device}")
+
+        # Load tokenizer
+        print(f"[PI0] Loading PaliGemma tokenizer...")
+        instance.tokenizer = AutoTokenizer.from_pretrained(cls.TOKENIZER_PATH)
+        print(f"[PI0] Tokenizer loaded")
+
+        # Pre-compute normalization tensors
+        instance._mean_tensor = torch.tensor(cls.IMAGENET_MEAN).view(3, 1, 1).to(device)
+        instance._std_tensor = torch.tensor(cls.IMAGENET_STD).view(3, 1, 1).to(device)
+
+        return instance
+
+    def preprocess_observation(
+        self,
+        global_frame: np.ndarray,
+        gripper_frame: np.ndarray,
+        robot_state: Optional[np.ndarray] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Preprocess raw observations for PI0 model input.
+
+        Args:
+            global_frame: Global camera frame (BGR, any resolution)
+            gripper_frame: Gripper camera frame (BGR, any resolution)
+            robot_state: Robot joint positions (6D for SO-100), or None
+
+        Returns:
+            Dictionary with preprocessed tensors:
+                - observation.images.base_0_rgb: Global camera (1, 3, 224, 224)
+                - observation.images.left_wrist_0_rgb: Gripper camera (1, 3, 224, 224)
+                - observation.images.right_wrist_0_rgb: Zeros (1, 3, 224, 224)
+                - observation.state: Padded state (1, 32)
+        """
+        # Ensure frames are in (H, W, C) format
+        if len(global_frame.shape) == 3 and global_frame.shape[0] == 3:
+            global_frame = np.transpose(global_frame, (1, 2, 0))
+        if len(gripper_frame.shape) == 3 and gripper_frame.shape[0] == 3:
+            gripper_frame = np.transpose(gripper_frame, (1, 2, 0))
+
+        # Resize to 224x224
+        global_resized = cv2.resize(global_frame, (224, 224))
+        gripper_resized = cv2.resize(gripper_frame, (224, 224))
+
+        # Convert BGR to RGB
+        global_rgb = cv2.cvtColor(global_resized, cv2.COLOR_BGR2RGB)
+        gripper_rgb = cv2.cvtColor(gripper_resized, cv2.COLOR_BGR2RGB)
+
+        # Prepare state vector (pad to 32D)
+        if robot_state is not None:
+            state_6d = robot_state.astype(np.float32)
+        else:
+            state_6d = np.zeros(6, dtype=np.float32)
+            state_6d[5] = 0.5  # Gripper at 50% open
+
+        state_32d = np.zeros(32, dtype=np.float32)
+        state_32d[:6] = state_6d
+
+        # Convert to tensors with ImageNet normalization
+        global_tensor = self._preprocess_image(global_rgb)
+        gripper_tensor = self._preprocess_image(gripper_rgb)
+
+        # Right wrist is unused (zeros)
+        right_wrist_tensor = torch.zeros(1, 3, 224, 224, device=self.device)
+
+        # State tensor
+        state_tensor = torch.from_numpy(state_32d).float().unsqueeze(0).to(self.device)
+
+        return {
+            "observation.images.base_0_rgb": global_tensor,
+            "observation.images.left_wrist_0_rgb": gripper_tensor,
+            "observation.images.right_wrist_0_rgb": right_wrist_tensor,
+            "observation.state": state_tensor,
+        }
+
+    def _preprocess_image(self, rgb_image: np.ndarray) -> torch.Tensor:
+        """Apply PI0 image preprocessing (ImageNet normalization)."""
+        tensor = torch.from_numpy(rgb_image).float().permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
+        tensor = tensor / 255.0  # Normalize to [0, 1]
+        tensor = tensor.to(self.device)
+        tensor = (tensor - self._mean_tensor) / self._std_tensor  # ImageNet normalization
+        tensor = tensor.unsqueeze(0)  # Add batch dim: (1, C, H, W)
+        return tensor
+
+    def tokenize_prompt(
+        self,
+        prompt: str,
+        max_length: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Tokenize a language prompt for PI0.
+
+        Args:
+            prompt: Natural language instruction
+            max_length: Maximum token length (uses model config if None)
+
+        Returns:
+            Dictionary with tokenized prompt tensors
+        """
+        if max_length is None:
+            max_length = self.policy.config.tokenizer_max_length
+
+        tokens = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )
+
+        return {
+            "tokens": tokens["input_ids"].to(self.device),
+            "attention_mask": tokens["attention_mask"].to(self.device).bool(),
+        }
+
+    def predict_action(
+        self,
+        observation: Dict[str, torch.Tensor],
+        language_prompt: str,
+        current_state: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """
+        Predict action from observation and language prompt.
+
+        Args:
+            observation: Preprocessed observation dict from preprocess_observation()
+            language_prompt: Natural language instruction
+            current_state: Current robot state for delta action computation
+
+        Returns:
+            Dictionary with:
+                - joint_positions: Predicted joint positions (6D)
+                - confidence: Confidence score (always 1.0 for PI0)
+                - raw_action: Raw model output for debugging
+        """
+        # Tokenize prompt and add to observation
+        token_dict = self.tokenize_prompt(language_prompt)
+        observation["observation.language.tokens"] = token_dict["tokens"]
+        observation["observation.language.attention_mask"] = token_dict["attention_mask"]
+
+        # Run inference
+        with torch.inference_mode():
+            action_tensor = self.policy.select_action(observation)
+
+        # Extract action as numpy
+        if isinstance(action_tensor, torch.Tensor):
+            action = action_tensor.cpu().numpy()
+        else:
+            action = np.array(action_tensor)
+
+        # Handle batch dimension
+        if len(action.shape) > 1:
+            action = action[0]
+
+        # Get current state for delta computation
+        if current_state is not None:
+            state_6d = current_state.astype(np.float32)
+        else:
+            # Extract from observation if available
+            state_tensor = observation.get("observation.state")
+            if state_tensor is not None:
+                state_6d = state_tensor.cpu().numpy()[0, :6]
+            else:
+                state_6d = np.zeros(6, dtype=np.float32)
+
+        # PI0 outputs deltas, apply to current state
+        if len(action) >= 6:
+            action_deltas = action[:6].astype(np.float32)
+            predicted_joints = state_6d + action_deltas
+            predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)
+        else:
+            predicted_joints = state_6d
+
+        return {
+            "joint_positions": predicted_joints,
+            "confidence": 1.0,
+            "raw_action": action[:6] if len(action) >= 6 else action,
+        }

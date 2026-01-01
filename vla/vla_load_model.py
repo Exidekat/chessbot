@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-VLA Model Loading Utilities
+VLA Model Loading Utilities (DEPRECATED)
 
-Shared utilities for loading π₀.₅ (Pi Zero Point Five) models across different VLA scripts.
-This module provides a standardized way to load the model for:
-- Deployment/inference (vla_deploy.py)
-- Fine-tuning (vla_finetune.py)
-- Episode collection (vla_collect_episodes.py)
+DEPRECATED: Use vla.models.load_vla_model() instead.
+
+This module is maintained for backward compatibility with existing code.
+New code should use:
+    from vla.models import load_vla_model
+    model, tokenizer = load_vla_model("pi0")  # or "smolvla"
 
 The π₀.₅ model is from Physical Intelligence's LeRobot implementation.
 """

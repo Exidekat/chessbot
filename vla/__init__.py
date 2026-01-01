@@ -1,32 +1,57 @@
 """
 VLA (Vision-Language-Action) Module
 
-End-to-end robot control using Physical Intelligence's pi0.5 model.
+End-to-end robot control using VLA models (PI0, SmolVLA).
 Includes episode collection, finetuning, and deployment.
 
 Components:
-- vla_load_model: Load pi0.5 base or fine-tuned checkpoints
-- vla_deploy: Deploy model for real-time inference
-- vla_finetune: Fine-tune on collected chess episodes
+- models/: Model abstractions and factory pattern for PI0/SmolVLA
+- configs/: Per-model training configuration classes
 - chess_dataloader: Load LeRobot datasets for training
-- training_config: Training configuration management
 - losses: VLA loss functions
 - evaluate: Model evaluation utilities
 
-Episode collection is in scripts/collect_vla_episodes.py
-Episode validation is in scripts/validate_vla_episodes.py
+Scripts (in scripts/):
+- scripts/vla_finetune.py: Fine-tune VLA on collected chess episodes
+- scripts/vla_deploy.py: Deploy model for real-time inference
+- scripts/collect_vla_episodes.py: Episode collection
+- scripts/validate_vla_episodes.py: Episode validation
+
+Usage:
+    # New API (preferred)
+    from vla.models import load_vla_model, list_models
+    from vla.configs import get_training_config
+
+    model, tokenizer = load_vla_model("pi0")  # or "smolvla"
+    config = get_training_config("pi0")       # or "smolvla"
+
+    # Backward compatible (deprecated)
+    from vla import load_pi0_model, ChessTrainingConfig
 """
 
+# New API (preferred) - multi-model support
+from .models import load_vla_model, list_models, get_model_class
+from .configs import get_training_config, get_config_class, list_config_models
+
+# Backward compatible (deprecated) - PI0 only
 from .vla_load_model import load_pi0_model, get_model_info
 from .training_config import ChessTrainingConfig, load_config, get_default_config
+
+# Common utilities (unchanged)
 from .chess_dataloader import ChessEpisodeDataset, create_dataloaders, collate_fn
 from .losses import VLALoss, compute_action_accuracy, create_loss_fn
 
 __all__ = [
-    # Model loading
+    # New API (multi-model)
+    "load_vla_model",
+    "list_models",
+    "get_model_class",
+    "get_training_config",
+    "get_config_class",
+    "list_config_models",
+    # Backward compatible (deprecated)
     "load_pi0_model",
     "get_model_info",
-    # Training config
     "ChessTrainingConfig",
     "load_config",
     "get_default_config",

@@ -457,36 +457,44 @@ The script:
 4. User presses ENTER to save final frame for that stage
 5. Outputs stage frames with VLM prompts for training
 
-## π₀ VLA Integration
+## VLA Integration (Multi-Model: PI0, SmolVLA)
 
-The ChessBot system integrates with Physical Intelligence's π₀ (pi-zero) vision-language-action model for end-to-end robot learning.
+The ChessBot system integrates with VLA (vision-language-action) models for end-to-end robot learning. Supports:
+- **PI0 (π₀.₅)**: Physical Intelligence's flow-matching VLA (224x224 images)
+- **SmolVLA**: Efficient VLA with SmolVLM2 backbone (512x512 images)
 
 ### VLA Workflow
 
 **Phase 1: Episode Collection**
 ```bash
 # Collect training episodes with color-conditioned prompts
-python vla/vla_collect_episodes.py --output data/episodes/
+python scripts/collect_vla_episodes.py --output data/episodes/
 ```
 - Uses `virtual_overlay_demo.py` to stream overlays to /dev/video7
 - Records each move stage with synchronized video + VLM prompt
-- Saves episodes in OpenPI-compatible format
+- Saves episodes in LeRobot-compatible format
 
 **Phase 2: Fine-tuning**
 ```bash
-# Fine-tune π₀ on collected chess episodes
-python vla/vla_finetune.py --episodes data/episodes/ --output checkpoints/
+# Fine-tune PI0 on collected chess episodes (default)
+python scripts/vla_finetune.py --dataset data/episodes/
+
+# Fine-tune SmolVLA on collected chess episodes
+python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
 ```
-- Fine-tunes base π₀ model on chess-specific data
+- Fine-tunes base model on chess-specific data
 - Uses color-conditioned prompts for multimodal alignment
-- Outputs fine-tuned checkpoint for deployment
+- Checkpoints saved to `checkpoints/chess_pi0/` or `checkpoints/chess_smolvla/`
 
 **Phase 3: Deployment**
 ```bash
-# Deploy fine-tuned model for inference
-python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt
+# Deploy fine-tuned PI0 model
+python scripts/vla_deploy.py --model pi0 --checkpoint checkpoints/chess_pi0/best.pt
+
+# Deploy fine-tuned SmolVLA model
+python scripts/vla_deploy.py --model smolvla --checkpoint checkpoints/chess_smolvla/best.pt
 ```
-- Loads fine-tuned model
+- Loads fine-tuned model using factory pattern
 - Processes live camera feed + board state
 - Generates action sequences for robot execution
 
@@ -523,26 +531,26 @@ python vla/verify_openpi.py
 
 See `submodules/openpi/README.md` for detailed OpenPI documentation.
 
-### VLA Scripts (Planned)
+### VLA Scripts
 
-Three scripts will handle the complete VLA pipeline:
+Scripts handling the complete VLA pipeline:
 
-1. **`vla/vla_collect_episodes.py`**: Episode data collection
+1. **`scripts/collect_vla_episodes.py`**: Episode data collection
    - Interfaces with virtual_overlay_demo.py
    - Records synchronized video + prompts + robot actions
-   - Saves in OpenPI training format
+   - Saves in LeRobot training format
 
-2. **`vla/vla_finetune.py`**: Model fine-tuning
-   - Loads base π₀ checkpoint
-   - Fine-tunes on chess episodes (LoRA or full)
+2. **`scripts/vla_finetune.py`**: Model fine-tuning (multi-model)
+   - Supports `--model pi0` or `--model smolvla`
+   - LoRA-style training (freeze vision/language, train action head)
    - Validates on held-out episodes
-   - Saves fine-tuned checkpoint
+   - Saves to `checkpoints/chess_{model}/`
 
-3. **`vla/vla_deploy.py`**: Inference deployment
-   - Loads fine-tuned model
-   - Processes camera feed + board state
-   - Generates color-conditioned actions
-   - Interfaces with robot control system
+3. **`scripts/vla_deploy.py`**: Inference deployment (multi-model)
+   - Supports `--model pi0` or `--model smolvla`
+   - Factory pattern loads appropriate model
+   - Processes camera feed + board state with color-conditioned overlays
+   - Interfaces with SO-100 robot control
 
 ## Development Workflow
 

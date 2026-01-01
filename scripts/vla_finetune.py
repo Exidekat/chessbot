@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 """
-VLA Finetuning Script
+VLA Finetuning Script - Multi-Model Support
 
-Fine-tune π₀.₅ on collected chess robot episodes using LoRA-style training
+Fine-tune PI0 or SmolVLA on collected chess robot episodes using LoRA-style training
 (freeze vision encoder, train action head).
 
 Usage:
-    # Fresh start (default - ignores existing checkpoints)
-    python vla/vla_finetune.py --dataset data/episodes/
+    # Fine-tune PI0 (default)
+    python scripts/vla_finetune.py --dataset data/episodes/
+
+    # Fine-tune SmolVLA
+    python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
 
     # With config file
-    python vla/vla_finetune.py --config vla/chess_training.yaml
+    python scripts/vla_finetune.py --model pi0 --config vla/chess_training.yaml
 
-    # Continue from latest checkpoint in output directory
-    python vla/vla_finetune.py --continue
+    # Continue from latest checkpoint
+    python scripts/vla_finetune.py --model pi0 --continue
 
     # Resume from specific checkpoint
-    python vla/vla_finetune.py --resume checkpoints/chess_pi0/epoch_0050.pt
+    python scripts/vla_finetune.py --model smolvla --resume checkpoints/chess_smolvla/epoch_0050.pt
 
 Requirements:
     - GPU with >22GB VRAM for LoRA finetuning
     - Collected episodes in LeRobot format (via collect_vla_episodes.py)
-    - OpenPI/LeRobot dependencies installed
+    - LeRobot dependencies installed
 """
 
 # Disable tokenizer parallelism before any imports to avoid fork warnings
@@ -48,10 +51,9 @@ except ImportError as e:
 
 # Local imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from vla.training_config import ChessTrainingConfig, load_config
-from vla.chess_dataloader import create_dataloaders, ChessEpisodeDataset
-# Note: VLALoss not needed - PI05 computes loss internally
-from vla.vla_load_model import load_pi0_model, get_model_info
+from vla.models import load_vla_model, list_models
+from vla.configs import get_training_config, BaseTrainingConfig
+from vla.chess_dataloader import create_dataloaders
 
 
 def freeze_vision_backbone(model: nn.Module) -> int:
@@ -59,7 +61,7 @@ def freeze_vision_backbone(model: nn.Module) -> int:
     Freeze vision encoder parameters for LoRA-style training.
 
     Args:
-        model: π₀.₅ model
+        model: VLA model
 
     Returns:
         Number of frozen parameters
@@ -80,7 +82,7 @@ def freeze_language_backbone(model: nn.Module) -> int:
     Freeze language encoder parameters.
 
     Args:
-        model: π₀.₅ model
+        model: VLA model
 
     Returns:
         Number of frozen parameters
@@ -113,7 +115,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     loss: float,
-    config: ChessTrainingConfig,
+    config: BaseTrainingConfig,
     path: Path,
 ):
     """Save training checkpoint."""
@@ -125,6 +127,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "loss": loss,
         "config": config.to_dict(),
+        "model_name": config.model_name,
     }
 
     torch.save(checkpoint, path)
@@ -202,10 +205,10 @@ def train_epoch(
     model: nn.Module,
     dataloader,
     optimizer: torch.optim.Optimizer,
-    config: ChessTrainingConfig,
+    config: BaseTrainingConfig,
     epoch: int,
     scaler: Optional[torch.amp.GradScaler] = None,
-    tokenizer = None,
+    tokenizer=None,
 ) -> Dict[str, float]:
     """
     Train for one epoch.
@@ -223,21 +226,15 @@ def train_epoch(
 
     optimizer.zero_grad()
 
+    # Get camera keys from config
+    camera_keys = config.camera_keys
+
     for batch_idx, batch in enumerate(dataloader):
-        # Move batch to device - using pretrained PI05 camera names
-        base_camera = batch.get("observation.images.base_0_rgb")
-        left_wrist_camera = batch.get("observation.images.left_wrist_0_rgb")
-        right_wrist_camera = batch.get("observation.images.right_wrist_0_rgb")
+        # Move batch to device - using model-specific camera keys
         observation_state = batch.get("observation.state")
         target_action = batch.get("action")
         language_instructions = batch.get("language_instruction", ["Move piece"] * (len(target_action) if target_action is not None else 1))
 
-        if base_camera is not None:
-            base_camera = base_camera.to(device)
-        if left_wrist_camera is not None:
-            left_wrist_camera = left_wrist_camera.to(device)
-        if right_wrist_camera is not None:
-            right_wrist_camera = right_wrist_camera.to(device)
         if observation_state is not None:
             observation_state = observation_state.to(device)
         if target_action is not None:
@@ -245,22 +242,22 @@ def train_epoch(
 
         # Forward pass with mixed precision
         with autocast("cuda", enabled=config.mixed_precision):
-            # Build batch dict for model - using pretrained PI05 camera names
+            # Build batch dict for model with dynamic camera keys
             model_batch = {}
-            if base_camera is not None:
-                model_batch["observation.images.base_0_rgb"] = base_camera
-            if left_wrist_camera is not None:
-                model_batch["observation.images.left_wrist_0_rgb"] = left_wrist_camera
-            if right_wrist_camera is not None:
-                model_batch["observation.images.right_wrist_0_rgb"] = right_wrist_camera
+
+            # Move all camera images to device (handles PI0 and SmolVLA keys)
+            for cam_type in ['global', 'gripper', 'unused']:
+                cam_key = camera_keys[cam_type]
+                if cam_key in batch:
+                    model_batch[cam_key] = batch[cam_key].to(device)
+
             if observation_state is not None:
                 model_batch["observation.state"] = observation_state
             if target_action is not None:
                 model_batch["action"] = target_action
 
-            # Tokenize language instructions for PI05
+            # Tokenize language instructions
             if tokenizer is not None and language_instructions:
-                # Ensure all are strings
                 lang_list = [str(s) if s else "Move chess piece" for s in language_instructions]
                 tokenized = tokenizer(
                     lang_list,
@@ -270,11 +267,9 @@ def train_epoch(
                     return_tensors="pt"
                 )
                 model_batch["observation.language.tokens"] = tokenized["input_ids"].to(device)
-                # PI05 expects boolean attention mask
                 model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
-            # Model forward pass
-            # PI05Policy.forward() returns (loss, loss_dict) tuple
+            # Model forward pass - both PI0 and SmolVLA return (loss, loss_dict)
             try:
                 loss, loss_dict = model.forward(model_batch)
                 loss = loss / accumulation_steps
@@ -282,7 +277,7 @@ def train_epoch(
             except Exception as e:
                 print(f"[WARN] Model forward failed: {e}")
                 print(f"       Batch keys: {list(model_batch.keys())}")
-                raise  # Re-raise to debug
+                raise
 
         # Backward pass
         if scaler is not None:
@@ -303,14 +298,14 @@ def train_epoch(
 
             optimizer.zero_grad()
 
-        # Accumulate metrics (save values before cleanup)
+        # Accumulate metrics
         batch_loss = loss.item() * accumulation_steps
         batch_action_loss = loss_dict.get("loss", loss.item())
         total_loss += batch_loss
         total_action_loss += batch_action_loss
         num_batches += 1
 
-        # Aggressive memory cleanup to prevent OOM on 24GB GPU
+        # Aggressive memory cleanup
         del loss, loss_dict, model_batch
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -329,8 +324,8 @@ def train_epoch(
 def validate(
     model: nn.Module,
     dataloader,
-    config: ChessTrainingConfig,
-    tokenizer = None,
+    config: BaseTrainingConfig,
+    tokenizer=None,
 ) -> Dict[str, float]:
     """
     Validate model on held-out data.
@@ -343,46 +338,39 @@ def validate(
 
     total_loss = 0.0
     total_action_loss = 0.0
-    all_metrics = []
     num_batches = 0
+
+    # Get camera keys from config
+    camera_keys = config.camera_keys
 
     with torch.no_grad():
         for batch in dataloader:
-            # Get language instructions for tokenization
             language_instructions = batch.get("language_instruction", ["Move piece"])
 
-            # Move batch to device - using pretrained PI05 camera names
-            base_camera = batch.get("observation.images.base_0_rgb")
-            left_wrist_camera = batch.get("observation.images.left_wrist_0_rgb")
-            right_wrist_camera = batch.get("observation.images.right_wrist_0_rgb")
+            # Move batch to device - using model-specific camera keys
             observation_state = batch.get("observation.state")
             target_action = batch.get("action")
 
-            if base_camera is not None:
-                base_camera = base_camera.to(device)
-            if left_wrist_camera is not None:
-                left_wrist_camera = left_wrist_camera.to(device)
-            if right_wrist_camera is not None:
-                right_wrist_camera = right_wrist_camera.to(device)
             if observation_state is not None:
                 observation_state = observation_state.to(device)
             if target_action is not None:
                 target_action = target_action.to(device)
 
-            # Build batch dict for model
+            # Build batch dict with dynamic camera keys
             model_batch = {}
-            if base_camera is not None:
-                model_batch["observation.images.base_0_rgb"] = base_camera
-            if left_wrist_camera is not None:
-                model_batch["observation.images.left_wrist_0_rgb"] = left_wrist_camera
-            if right_wrist_camera is not None:
-                model_batch["observation.images.right_wrist_0_rgb"] = right_wrist_camera
+
+            # Move all camera images to device (handles PI0 and SmolVLA keys)
+            for cam_type in ['global', 'gripper', 'unused']:
+                cam_key = camera_keys[cam_type]
+                if cam_key in batch:
+                    model_batch[cam_key] = batch[cam_key].to(device)
+
             if observation_state is not None:
                 model_batch["observation.state"] = observation_state
             if target_action is not None:
                 model_batch["action"] = target_action
 
-            # Tokenize language instructions for PI05
+            # Tokenize language instructions
             if tokenizer is not None and language_instructions:
                 lang_list = [str(s) if s else "Move chess piece" for s in language_instructions]
                 tokenized = tokenizer(
@@ -393,13 +381,10 @@ def validate(
                     return_tensors="pt"
                 )
                 model_batch["observation.language.tokens"] = tokenized["input_ids"].to(device)
-                # PI05 expects boolean attention mask
                 model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
-            # Forward pass - PI05Policy.forward() returns (loss, loss_dict)
             try:
                 loss, loss_dict = model.forward(model_batch)
-
                 total_loss += loss.item()
                 total_action_loss += loss_dict.get("loss", loss.item())
                 num_batches += 1
@@ -408,21 +393,38 @@ def validate(
                 print(f"[WARN] Validation forward failed: {e}")
                 continue
 
-    # Average metrics
-    avg_metrics = {
+    return {
         "val_loss": total_loss / max(num_batches, 1),
         "val_action_loss": total_action_loss / max(num_batches, 1),
     }
 
-    return avg_metrics
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune pi0.5 on chess robot episodes")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune VLA on chess robot episodes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Fine-tune PI0 (default)
+    python scripts/vla_finetune.py --dataset data/episodes/
+
+    # Fine-tune SmolVLA
+    python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
+
+    # Continue from latest checkpoint
+    python scripts/vla_finetune.py --model pi0 --continue
+        """
+    )
+
+    parser.add_argument(
+        "--model", type=str, default="pi0",
+        choices=list_models(),
+        help="Model type to fine-tune (default: pi0)"
+    )
     parser.add_argument("--dataset", type=str, default="data/episodes",
                         help="Path to LeRobot dataset")
-    parser.add_argument("--output", type=str, default="checkpoints/chess_pi0",
-                        help="Output directory for checkpoints")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output directory for checkpoints (default: checkpoints/chess_{model})")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file")
     parser.add_argument("--resume", type=str, default=None,
@@ -440,20 +442,25 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration
-    config = load_config(args.config)
+    # Load model-specific configuration
+    config = get_training_config(args.model)
+
+    # Load from YAML if specified
+    if args.config:
+        config = type(config).from_yaml(args.config)
 
     # Override with command line args
     if args.dataset:
         config.dataset_path = args.dataset
     if args.output:
-        config.checkpoint_dir = args.output
+        # User specified custom output directory
+        config._checkpoint_dir = args.output
     if args.epochs:
         config.num_epochs = args.epochs
     if args.batch_size:
         config.batch_size = args.batch_size
     if args.lr:
-        config.learning_rate = args.lr
+        config._learning_rate = args.lr
     if args.no_wandb:
         config.use_wandb = False
 
@@ -483,11 +490,18 @@ def main():
 
     # Load model
     print("\n" + "=" * 60)
-    print("Loading Model")
+    print(f"Loading Model ({args.model.upper()})")
     print("=" * 60)
 
-    # Load model configured for chess robot training (custom camera layout)
-    model, tokenizer = load_pi0_model(device=config.device, for_training=True)
+    # Load model using factory
+    model_wrapper, tokenizer = load_vla_model(
+        model_name=args.model,
+        device=config.device,
+        for_training=True,
+    )
+
+    # Get the underlying policy for training
+    model = model_wrapper.policy
 
     # Freeze backbones for LoRA-style training
     if config.freeze_vision_encoder:
@@ -505,7 +519,7 @@ def main():
     print(f"  Trainable: {param_counts['trainable']:,} ({param_counts['trainable_pct']:.1f}%)")
     print(f"  Frozen: {param_counts['frozen']:,}")
 
-    # Create dataloaders
+    # Create dataloaders with model-specific image size
     print("\n" + "=" * 60)
     print("Loading Data")
     print("=" * 60)
@@ -515,28 +529,41 @@ def main():
         batch_size=config.batch_size,
         num_workers=config.num_workers,
         val_split=config.val_split,
+        image_size=config.image_size,  # Model-specific: 224 for PI0, 256 for SmolVLA
+        camera_keys=config.camera_keys,  # Model-specific camera key mapping
+        state_dim=config.state_dim,  # Model-specific: 32 for PI0, 6 for SmolVLA
     )
 
-    print(f"\nTrain batches: {len(train_loader)}")
+    print(f"\nImage size: {config.image_size}")
+    print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 
-    # Create optimizer and scheduler
-    # Use 8-bit AdamW to save ~6GB VRAM on optimizer states
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
-        print("[OK] Using 8-bit AdamW (saves ~6GB VRAM)")
-    except ImportError:
-        print("[WARN] bitsandbytes not installed, using standard AdamW")
+    # Create optimizer - 8-bit AdamW for PI0 (saves VRAM), standard for SmolVLA
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if args.model == "pi0":
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                trainable_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+            print(f"[OK] Using 8-bit AdamW optimizer for PI0 (lr={config.learning_rate})")
+        except ImportError:
+            print("[WARN] bitsandbytes not installed, using standard AdamW")
+            optimizer = AdamW(
+                trainable_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+    else:
+        # SmolVLA uses standard AdamW
         optimizer = AdamW(
-            [p for p in model.parameters() if p.requires_grad],
+            trainable_params,
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
+        print(f"[OK] Using AdamW optimizer for {args.model.upper()} (lr={config.learning_rate})")
 
     # Warmup + cosine annealing scheduler
     warmup_scheduler = LinearLR(
@@ -547,7 +574,7 @@ def main():
     )
     cosine_scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=len(train_loader) * 10,  # Restart every 10 epochs
+        T_0=len(train_loader) * 10,
         T_mult=2,
     )
     scheduler = SequentialLR(
@@ -556,9 +583,15 @@ def main():
         milestones=[config.warmup_steps],
     )
 
-    # Mixed precision scaler
-    # Note: PI05 computes its own loss internally, so we don't need a separate loss_fn
-    scaler = torch.amp.GradScaler("cuda") if config.mixed_precision else None
+    # Mixed precision scaler - only for PI0 (SmolVLA uses BFloat16 which is incompatible with GradScaler)
+    # GradScaler is only needed for float16, not bfloat16
+    if config.mixed_precision and args.model == "pi0":
+        scaler = torch.amp.GradScaler("cuda")
+        print("[OK] Using GradScaler for mixed precision (PI0)")
+    else:
+        scaler = None
+        if config.mixed_precision:
+            print("[OK] Using native BFloat16 mixed precision (SmolVLA)")
 
     # Setup checkpoint directory
     checkpoint_dir = Path(config.checkpoint_dir)
@@ -569,14 +602,12 @@ def main():
     resume_path = None
 
     if args.continue_training:
-        # Find latest checkpoint in output directory
         resume_path = find_latest_checkpoint(checkpoint_dir)
         if resume_path:
             print(f"\n[CONTINUE] Found latest checkpoint: {resume_path}")
         else:
             print(f"\n[CONTINUE] No checkpoints found in {checkpoint_dir}, starting fresh")
     elif args.resume:
-        # Use specific checkpoint path
         resume_path = Path(args.resume)
 
     if resume_path:
@@ -653,7 +684,8 @@ def main():
     print("\n" + "=" * 60)
     print("Training Complete!")
     print("=" * 60)
-    print(f"\nBest validation loss: {best_val_loss:.6f}")
+    print(f"\nModel: {args.model.upper()}")
+    print(f"Best validation loss: {best_val_loss:.6f}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
     if config.use_wandb:

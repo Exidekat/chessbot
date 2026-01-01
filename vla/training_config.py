@@ -1,8 +1,14 @@
 """
-VLA Training Configuration
+VLA Training Configuration (DEPRECATED)
 
-Chess-specific training configuration for π₀.₅ LoRA finetuning.
-Supports YAML loading and dataclass-based defaults.
+DEPRECATED: Use vla.configs.get_training_config() instead.
+
+This module is maintained for backward compatibility with existing code.
+New code should use:
+    from vla.configs import get_training_config
+    config = get_training_config("pi0")  # or "smolvla"
+
+ChessTrainingConfig is now an alias for PI0TrainingConfig.
 """
 
 import yaml

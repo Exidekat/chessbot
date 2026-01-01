@@ -17,3 +17,6 @@ numpy>=1.24.0  # Numerical operations
 
 # Optional: For visualization and debugging
 matplotlib>=3.7.0  # For plotting grid and visualization (optional)
+
+# For SmolVLA
+num2words

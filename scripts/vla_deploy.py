@@ -1,7 +1,7 @@
 """
-VLA Deploy - π₀.₅ Inference for Chess Robot Control
+VLA Deploy - Multi-Model Inference for Chess Robot Control
 
-This script deploys the Physical Intelligence π₀.₅ model for real-time chess robot control:
+This script deploys VLA models (PI0 or SmolVLA) for real-time chess robot control:
 1. Loads base π₀.₅ weights (or fine-tuned checkpoint if provided)
 2. Performs board detection and move calculation (same as virtual_overlay_demo.py)
 3. Generates color-conditioned VLM prompts for each move stage
@@ -10,7 +10,17 @@ This script deploys the Physical Intelligence π₀.₅ model for real-time ches
 6. Repeats for all stages of the best move
 
 Usage:
-    python vla/vla_deploy.py [--checkpoint CHECKPOINT_PATH] [--device CAMERA_DEVICE]
+    # Deploy PI0 base model
+    python scripts/vla_deploy.py --model pi0
+
+    # Deploy SmolVLA base model
+    python scripts/vla_deploy.py --model smolvla
+
+    # Deploy fine-tuned PI0 checkpoint
+    python scripts/vla_deploy.py --model pi0 --checkpoint checkpoints/chess_pi0/best.pt
+
+    # Deploy with specific cameras
+    python scripts/vla_deploy.py --model pi0 --global-camera /dev/video2 --robot-port /dev/ttyACM0
 """
 
 import argparse
@@ -54,8 +64,8 @@ from controls.robot_controller import (
     load_joint_configs_for_port,
 )
 
-# Import VLA model loading
-from vla.vla_load_model import load_pi0_model
+# Import VLA model loading (multi-model support)
+from vla.models import load_vla_model, list_models
 
 # Import SO-100 arm control
 try:
@@ -193,39 +203,44 @@ def capture_gripper_frame(device_path):
     return frame_224
 
 
-class Pi0VLA:
-    """Wrapper for Physical Intelligence π₀.₅ model with SO-100 integration."""
+class VLAWrapper:
+    """Unified wrapper for VLA models (PI0, SmolVLA) with SO-100 integration."""
 
     def __init__(
         self,
+        model_name: str = "pi0",
         checkpoint_path: Optional[str] = None,
         device: str = "cuda",
         robot_arm: Optional[SO100Arm] = None,
         robot_controller: Optional[RobotController] = None
     ):
         """
-        Initialize π₀.₅ model.
+        Initialize VLA model.
 
         Args:
+            model_name: Model type ("pi0" or "smolvla")
             checkpoint_path: Path to fine-tuned checkpoint (None = base weights)
             device: Device to run model on ("cuda" or "cpu")
             robot_arm: SO100Arm instance for robot control (deprecated, use robot_controller)
             robot_controller: RobotController instance for position-controlled robot
         """
+        self.model_name = model_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.robot_arm = robot_arm
         self.robot_controller = robot_controller
 
         print("\n" + "=" * 60)
-        print("Loading VLA Model")
+        print(f"Loading VLA Model ({model_name.upper()})")
         print("=" * 60)
 
-        # Load π₀.₅ model and tokenizer using shared loader
-        self.policy, self.tokenizer = load_pi0_model(
+        # Load model and tokenizer using factory
+        self.model_wrapper, self.tokenizer = load_vla_model(
+            model_name=model_name,
             checkpoint_path=checkpoint_path,
             device=device
         )
+        self.policy = self.model_wrapper.policy
 
         if robot_controller:
             print(f"Robot: SO-100 via RobotController (position-controlled)")
@@ -248,6 +263,10 @@ class Pi0VLA:
         """
         Predict robot action from observation.
 
+        Uses model-specific preprocessing via the model wrapper, which handles:
+        - PI0: 224x224 images, base_0_rgb/left_wrist_0_rgb/right_wrist_0_rgb keys, 32D state
+        - SmolVLA: 256x256 images, camera1/camera2/camera3 keys, 6D state
+
         Args:
             global_frame: Global camera frame (720p, with overlay applied)
             gripper_frame: Gripper camera frame (224x224)
@@ -259,124 +278,35 @@ class Pi0VLA:
                 - joint_positions: [6] target joint positions in radians
                 - confidence: float model confidence
 
-        Note:
-            Image preprocessing matches chess_dataloader.py for training consistency:
-            - Resize to 224x224
-            - Normalize to [0, 1]
-            - Apply ImageNet normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            - right_wrist_0_rgb is zeros (unused camera slot)
         """
-        # ImageNet normalization constants (must match training in chess_dataloader.py)
-        IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(self.device)
-        IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(self.device)
-
-        # Step 1: Ensure frames are in (H, W, 3) uint8 format
-        if len(global_frame.shape) == 3 and global_frame.shape[0] == 3:
-            global_frame = np.transpose(global_frame, (1, 2, 0))
-        if len(gripper_frame.shape) == 3 and gripper_frame.shape[0] == 3:
-            gripper_frame = np.transpose(gripper_frame, (1, 2, 0))
-
-        # Resize to 224x224 (model input size)
-        global_frame_resized = cv2.resize(global_frame, (224, 224))
-        gripper_frame_resized = cv2.resize(gripper_frame, (224, 224))
-
-        # Convert BGR (OpenCV) to RGB for model
-        global_frame_rgb = cv2.cvtColor(global_frame_resized, cv2.COLOR_BGR2RGB)
-        gripper_frame_rgb = cv2.cvtColor(gripper_frame_resized, cv2.COLOR_BGR2RGB)
-
-        # Get current robot state
-        # SO-100 has 6 motors total: motors 1-5 are arm joints, motor 6 is gripper
+        # Get current robot state as numpy array
         if robot_state:
-            state_6d = robot_state.joint_positions.astype(np.float32)
+            current_state = robot_state.joint_positions.astype(np.float32)
         else:
             # Placeholder state when no robot connected
-            state_6d = np.zeros(6, dtype=np.float32)
-            state_6d[5] = 0.5  # Gripper at 50% open
+            current_state = np.zeros(6, dtype=np.float32)
+            current_state[5] = 0.5  # Gripper at 50% open
 
-        # Pad to 32D as expected by PI05 model config
-        state_32d = np.zeros(32, dtype=np.float32)
-        state_32d[:6] = state_6d
-
-        # Step 2: Convert to tensors and apply preprocessing matching training
-        # Global camera -> base_0_rgb
-        global_tensor = torch.from_numpy(global_frame_rgb).float().permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
-        global_tensor = global_tensor / 255.0  # Normalize to [0, 1]
-        global_tensor = global_tensor.to(self.device)
-        global_tensor = (global_tensor - IMAGENET_MEAN) / IMAGENET_STD  # ImageNet normalization
-        global_tensor = global_tensor.unsqueeze(0)  # Add batch dim: (1, C, H, W)
-
-        # Gripper camera -> left_wrist_0_rgb
-        gripper_tensor = torch.from_numpy(gripper_frame_rgb).float().permute(2, 0, 1)
-        gripper_tensor = gripper_tensor / 255.0
-        gripper_tensor = gripper_tensor.to(self.device)
-        gripper_tensor = (gripper_tensor - IMAGENET_MEAN) / IMAGENET_STD
-        gripper_tensor = gripper_tensor.unsqueeze(0)
-
-        # Right wrist -> zeros (unused camera slot, matches training)
-        right_wrist_tensor = torch.zeros(1, 3, 224, 224, device=self.device)
-
-        # State tensor
-        state_tensor = torch.from_numpy(state_32d).float().unsqueeze(0).to(self.device)
-
-        # Step 3: Build observation dict
-        observation = {
-            "observation.images.base_0_rgb": global_tensor,
-            "observation.images.left_wrist_0_rgb": gripper_tensor,
-            "observation.images.right_wrist_0_rgb": right_wrist_tensor,
-            "observation.state": state_tensor,
-        }
-
-        # Step 5: Tokenize language prompt and add to observation
-        tokens = self.tokenizer(
-            language_prompt,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.policy.config.tokenizer_max_length
+        # Use model wrapper's predict_action which handles:
+        # - Model-specific image size (224x224 for PI0, 256x256 for SmolVLA)
+        # - Model-specific camera keys (base_0_rgb vs camera1)
+        # - Model-specific state dimension (32D for PI0, 6D for SmolVLA)
+        # - Preprocessing, tokenization, and inference
+        result = self.model_wrapper.predict_action(
+            observation=self.model_wrapper.preprocess_observation(
+                global_frame=global_frame,
+                gripper_frame=gripper_frame,
+                robot_state=current_state
+            ),
+            language_prompt=language_prompt,
+            current_state=current_state
         )
-        observation["observation.language.tokens"] = tokens["input_ids"].to(self.device)
-        # Convert attention mask to boolean (model expects bool, not Long)
-        observation["observation.language.attention_mask"] = tokens["attention_mask"].to(self.device).bool()
 
-        # Step 6: Run inference using select_action API
-        with torch.inference_mode():
-            action_tensor = self.policy.select_action(observation)
+        # DEBUG: Print raw model output
+        print(f"[DEBUG] Raw model output: {result['raw_action']}")
+        print(f"[DEBUG] Current robot state: {current_state}")
 
-        # Extract action as numpy array
-        if isinstance(action_tensor, torch.Tensor):
-            action = action_tensor.cpu().numpy()
-        else:
-            action = np.array(action_tensor)
-
-        # Handle batch dimension if present
-        if len(action.shape) > 1:
-            action = action[0]
-
-        # Map action to SO-100 control
-        # π₀ outputs normalized action deltas (typically -1 to 1 range)
-        # We need to:
-        # 1. Extract first 6 dimensions (SO-100 joints)
-        # 2. Scale from normalized space to radians
-        # 3. Apply as delta to current position
-
-        if len(action) >= 6:
-            # Extract 6D action deltas (normalized, likely -1 to 1)
-            action_deltas_normalized = action[:6]
-
-            # Scale to radians: assuming actions are in [-1, 1], map to small delta range
-            # Use conservative scaling: ±0.1 radians (~5.7 degrees) per step
-            max_delta_rad = 0.1
-            action_deltas_rad = action_deltas_normalized * max_delta_rad
-
-            # Apply delta to current state
-            predicted_joints = state_6d + action_deltas_rad
-
-            # Wraparound to [0, 2π) using modulo (continuous rotation joints)
-            predicted_joints = predicted_joints % (2 * np.pi)
-        else:
-            # Fallback: keep current positions
-            print(f"[VLA WARN] Action dimension mismatch: got {len(action)}, expected 6")
-            predicted_joints = state_6d
+        predicted_joints = result["joint_positions"]
 
         predicted_action = {
             "joint_positions": predicted_joints,
@@ -429,7 +359,7 @@ class Pi0VLA:
 
 
 def vla_control_loop(
-    vla: Pi0VLA,
+    vla: VLAWrapper,
     global_camera: str,
     gripper_camera: str,
     language_prompt: str,
@@ -604,7 +534,7 @@ class MoveResult(NamedTuple):
 
 
 def execute_move(
-    vla: Pi0VLA,
+    vla: VLAWrapper,
     detector: BoardDetector,
     calculator: MoveCalculator,
     global_camera: str,
@@ -620,7 +550,7 @@ def execute_move(
     Execute a single chess move: detect board, calculate best move, execute all stages.
 
     Args:
-        vla: Pi0VLA model instance
+        vla: VLAWrapper model instance
         detector: BoardDetector instance
         calculator: MoveCalculator instance
         global_camera: Global camera device path
@@ -771,13 +701,20 @@ def execute_move(
 def main():
     """Main VLA deployment driver."""
     parser = argparse.ArgumentParser(
-        description="VLA Deploy - π₀.₅ inference for chess robot control"
+        description="VLA Deploy - Multi-model inference for chess robot control"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="pi0",
+        choices=list_models(),
+        help="Model type to deploy (default: pi0)"
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to fine-tuned checkpoint (default: base π₀.₅ weights)"
+        help="Path to fine-tuned checkpoint (default: base model weights)"
     )
     parser.add_argument(
         "--global-camera",
@@ -865,7 +802,8 @@ def main():
     else:
         print("[WARN] CUDA not available, will use CPU (slow)")
     print()
-    print(f"Checkpoint: {args.checkpoint or 'Base π₀.₅ weights'}")
+    print(f"Model: {args.model.upper()}")
+    print(f"Checkpoint: {args.checkpoint or f'Base {args.model.upper()} weights'}")
     print(f"Board rotation: {args.rotation}")
     print(f"Turn: {args.turn.capitalize()}")
     print()
@@ -995,7 +933,8 @@ def main():
     print("STAGE 4: Initialize VLA Model")
     print("=" * 60)
 
-    vla = Pi0VLA(
+    vla = VLAWrapper(
+        model_name=args.model,
         checkpoint_path=args.checkpoint,
         device="cuda" if torch.cuda.is_available() else "cpu",
         robot_controller=robot_controller

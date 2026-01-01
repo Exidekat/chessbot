@@ -162,25 +162,54 @@ python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/e
 # Force raw file mode (disable LeRobot)
 python scripts/validate_vla_episodes.py --dataset data/episodes/ --no-lerobot
 
-## VLA Deployment (Physical Intelligence π₀.₅ Model)
+## VLA Finetuning (Multi-Model: PI0, SmolVLA)
 
-# Deploy π₀.₅ base model for chess robot control (auto-detects cameras)
-python vla/vla_deploy.py --no-robot
+# Fine-tune PI0 model on collected episodes (default)
+python scripts/vla_finetune.py --dataset data/episodes/
+
+# Fine-tune SmolVLA model on collected episodes
+python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
+
+# Fine-tune with custom output directory
+python scripts/vla_finetune.py --model pi0 --output checkpoints/my_chess_pi0/
+
+# Continue training from latest checkpoint
+python scripts/vla_finetune.py --model pi0 --continue
+
+# Resume from specific checkpoint
+python scripts/vla_finetune.py --model smolvla --resume checkpoints/chess_smolvla/epoch_0050.pt
+
+# Fine-tune with custom hyperparameters
+python scripts/vla_finetune.py --model pi0 --epochs 50 --batch-size 2 --lr 1e-5
+
+# Fine-tune with Weights & Biases logging
+python scripts/vla_finetune.py --model pi0
+
+## VLA Deployment (Multi-Model: PI0, SmolVLA)
+
+# Deploy PI0 base model for chess robot control (auto-detects cameras)
+python scripts/vla_deploy.py --model pi0 --no-robot
+
+# Deploy SmolVLA base model
+python scripts/vla_deploy.py --model smolvla --no-robot
 
 # Deploy with specific cameras (global overhead + gripper)
-python vla/vla_deploy.py --no-robot --global-camera /dev/video4 --gripper-camera /dev/video0
+python scripts/vla_deploy.py --model pi0 --no-robot --global-camera /dev/video4 --gripper-camera /dev/video0
 
-# Deploy with fine-tuned checkpoint instead of base weights
-python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt --no-robot
+# Deploy with fine-tuned PI0 checkpoint
+python scripts/vla_deploy.py --model pi0 --checkpoint checkpoints/chess_pi0/best.pt --no-robot
+
+# Deploy with fine-tuned SmolVLA checkpoint
+python scripts/vla_deploy.py --model smolvla --checkpoint checkpoints/chess_smolvla/best.pt --no-robot
 
 # Deploy for black's turn with board rotation
-python vla/vla_deploy.py --no-robot --turn black --rotation right
+python scripts/vla_deploy.py --model pi0 --no-robot --turn black --rotation right
 
 # Deploy with SO-100 robot arm connected (requires hardware)
-python vla/vla_deploy.py --global-camera /dev/video4 --gripper-camera /dev/video0 --robot-port /dev/ttyUSB0
+python scripts/vla_deploy.py --model pi0 --global-camera /dev/video4 --gripper-camera /dev/video0 --robot-port /dev/ttyUSB0
 
 # Deploy with all custom parameters
-python vla/vla_deploy.py --checkpoint checkpoints/chess_pi0.pt --global-camera /dev/video4 --gripper-camera /dev/video0 --turn white --rotation right --corner-conf 0.005 --min-corner-dist 30
+python scripts/vla_deploy.py --model pi0 --checkpoint checkpoints/chess_pi0/best.pt --global-camera /dev/video4 --gripper-camera /dev/video0 --turn white --rotation right --corner-conf 0.005 --min-corner-dist 30
 
 ## Overlay Generation
 
