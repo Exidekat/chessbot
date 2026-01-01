@@ -6,20 +6,27 @@ Fine-tune π₀.₅ on collected chess robot episodes using LoRA-style training
 (freeze vision encoder, train action head).
 
 Usage:
-    # Basic finetuning
+    # Fresh start (default - ignores existing checkpoints)
     python vla/vla_finetune.py --dataset data/episodes/
 
     # With config file
     python vla/vla_finetune.py --config vla/chess_training.yaml
 
-    # Resume from checkpoint
-    python vla/vla_finetune.py --resume checkpoints/chess_pi0/epoch_50.pt
+    # Continue from latest checkpoint in output directory
+    python vla/vla_finetune.py --continue
+
+    # Resume from specific checkpoint
+    python vla/vla_finetune.py --resume checkpoints/chess_pi0/epoch_0050.pt
 
 Requirements:
     - GPU with >22GB VRAM for LoRA finetuning
     - Collected episodes in LeRobot format (via collect_vla_episodes.py)
     - OpenPI/LeRobot dependencies installed
 """
+
+# Disable tokenizer parallelism before any imports to avoid fork warnings
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import sys
@@ -34,7 +41,7 @@ try:
     import torch.nn as nn
     from torch.optim import AdamW
     from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.amp import autocast
 except ImportError as e:
     print(f"[X] Failed to import PyTorch: {e}")
     sys.exit(1)
@@ -140,7 +147,8 @@ def load_checkpoint(
         print(f"[WARN] Checkpoint not found: {path}")
         return 0
 
-    checkpoint = torch.load(path, map_location=device)
+    # Load to CPU first to avoid OOM (model already on GPU)
+    checkpoint = torch.load(path, map_location="cpu")
 
     model.load_state_dict(checkpoint["model_state_dict"])
     print(f"[OK] Loaded model weights from: {path}")
@@ -149,7 +157,45 @@ def load_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(f"[OK] Loaded optimizer state")
 
-    return checkpoint.get("epoch", 0) + 1
+    # Clean up CPU checkpoint
+    epoch = checkpoint.get("epoch", 0) + 1
+    del checkpoint
+
+    return epoch
+
+
+def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    """
+    Find the latest checkpoint in a directory.
+
+    Looks for epoch_XXXX.pt files and returns the one with highest epoch number.
+    Falls back to best.pt or final.pt if no epoch checkpoints found.
+
+    Returns:
+        Path to latest checkpoint, or None if no checkpoints found
+    """
+    if not checkpoint_dir.exists():
+        return None
+
+    # Look for epoch_XXXX.pt files
+    epoch_checkpoints = list(checkpoint_dir.glob("epoch_*.pt"))
+    if epoch_checkpoints:
+        # Sort by epoch number (extract from filename)
+        def get_epoch_num(p: Path) -> int:
+            try:
+                return int(p.stem.split("_")[1])
+            except (IndexError, ValueError):
+                return 0
+        epoch_checkpoints.sort(key=get_epoch_num, reverse=True)
+        return epoch_checkpoints[0]
+
+    # Fallback to best.pt or final.pt
+    for name in ["best.pt", "final.pt"]:
+        candidate = checkpoint_dir / name
+        if candidate.exists():
+            return candidate
+
+    return None
 
 
 def train_epoch(
@@ -158,7 +204,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     config: ChessTrainingConfig,
     epoch: int,
-    scaler: Optional[GradScaler] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
     tokenizer = None,
 ) -> Dict[str, float]:
     """
@@ -198,7 +244,7 @@ def train_epoch(
             target_action = target_action.to(device)
 
         # Forward pass with mixed precision
-        with autocast(enabled=config.mixed_precision):
+        with autocast("cuda", enabled=config.mixed_precision):
             # Build batch dict for model - using pretrained PI05 camera names
             model_batch = {}
             if base_camera is not None:
@@ -380,7 +426,9 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from")
+                        help="Path to specific checkpoint to resume from")
+    parser.add_argument("--continue", dest="continue_training", action="store_true",
+                        help="Continue from latest checkpoint in output directory")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
     parser.add_argument("--batch-size", type=int, default=None,
@@ -510,12 +558,29 @@ def main():
 
     # Mixed precision scaler
     # Note: PI05 computes its own loss internally, so we don't need a separate loss_fn
-    scaler = GradScaler() if config.mixed_precision else None
+    scaler = torch.amp.GradScaler("cuda") if config.mixed_precision else None
+
+    # Setup checkpoint directory
+    checkpoint_dir = Path(config.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Resume from checkpoint
     start_epoch = 0
-    if args.resume:
-        start_epoch = load_checkpoint(model, optimizer, Path(args.resume), config.device)
+    resume_path = None
+
+    if args.continue_training:
+        # Find latest checkpoint in output directory
+        resume_path = find_latest_checkpoint(checkpoint_dir)
+        if resume_path:
+            print(f"\n[CONTINUE] Found latest checkpoint: {resume_path}")
+        else:
+            print(f"\n[CONTINUE] No checkpoints found in {checkpoint_dir}, starting fresh")
+    elif args.resume:
+        # Use specific checkpoint path
+        resume_path = Path(args.resume)
+
+    if resume_path:
+        start_epoch = load_checkpoint(model, optimizer, resume_path, config.device)
 
     # Compile model (PyTorch 2.0+)
     if config.compile_model and hasattr(torch, "compile"):
@@ -528,8 +593,6 @@ def main():
     print("=" * 60)
 
     best_val_loss = float("inf")
-    checkpoint_dir = Path(config.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start = time.time()
