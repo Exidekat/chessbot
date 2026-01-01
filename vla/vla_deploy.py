@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import sys
+import termios
 from pathlib import Path
 import chess
 import cv2
@@ -23,7 +24,7 @@ from datetime import datetime
 import time
 import gc
 import threading
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple, NamedTuple
 import numpy as np
 
 # Add parent directory to path for module imports
@@ -34,7 +35,11 @@ from guidance.board_detector import BoardDetector
 from guidance.move_calculator import MoveCalculator
 from guidance.coordinate_mapper import CoordinateMapper
 from guidance.move_decomposer import decompose_move
+from guidance import apply_stage_overlay_to_frame
 from PIL import Image
+
+# Import virtual camera for overlay streaming
+from cameras import VirtualCamera
 
 # Import shared utilities
 from utils.camera_helpers import (
@@ -42,6 +47,11 @@ from utils.camera_helpers import (
     select_camera,
     get_camera_index_from_device,
     capture_4k_downscale
+)
+from utils.keyboard_input import KeyboardInput
+from controls.robot_controller import (
+    RobotController,
+    load_joint_configs_for_port,
 )
 
 # Import VLA model loading
@@ -190,7 +200,8 @@ class Pi0VLA:
         self,
         checkpoint_path: Optional[str] = None,
         device: str = "cuda",
-        robot_arm: Optional[SO100Arm] = None
+        robot_arm: Optional[SO100Arm] = None,
+        robot_controller: Optional[RobotController] = None
     ):
         """
         Initialize π₀.₅ model.
@@ -198,14 +209,16 @@ class Pi0VLA:
         Args:
             checkpoint_path: Path to fine-tuned checkpoint (None = base weights)
             device: Device to run model on ("cuda" or "cpu")
-            robot_arm: SO100Arm instance for robot control
+            robot_arm: SO100Arm instance for robot control (deprecated, use robot_controller)
+            robot_controller: RobotController instance for position-controlled robot
         """
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.robot_arm = robot_arm
+        self.robot_controller = robot_controller
 
         print("\n" + "=" * 60)
-        print("Loading π₀.₅ Model")
+        print("Loading VLA Model")
         print("=" * 60)
 
         # Load π₀.₅ model and tokenizer using shared loader
@@ -214,13 +227,15 @@ class Pi0VLA:
             device=device
         )
 
-        if robot_arm:
-            print(f"Robot: SO-100 connected")
+        if robot_controller:
+            print(f"Robot: SO-100 via RobotController (position-controlled)")
+        elif robot_arm:
+            print(f"Robot: SO-100 direct control")
         else:
             print(f"Robot: None (actions will not be executed)")
 
         print("=" * 60)
-        print("[OK] π₀.₅ model loaded successfully")
+        print("[OK] VLA model loaded successfully")
         print("=" * 60)
 
     def predict_action(
@@ -234,75 +249,82 @@ class Pi0VLA:
         Predict robot action from observation.
 
         Args:
-            global_frame: Global camera frame (720p)
+            global_frame: Global camera frame (720p, with overlay applied)
             gripper_frame: Gripper camera frame (224x224)
-            language_prompt: Natural language instruction
+            language_prompt: Natural language instruction (VLM prompt)
             robot_state: Current SO-100 state
 
         Returns:
             dict: Predicted action
                 - joint_positions: [6] target joint positions in radians
-                - gripper: 0.0-1.0 gripper position
                 - confidence: float model confidence
+
+        Note:
+            Image preprocessing matches chess_dataloader.py for training consistency:
+            - Resize to 224x224
+            - Normalize to [0, 1]
+            - Apply ImageNet normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            - right_wrist_0_rgb is zeros (unused camera slot)
         """
-        # Prepare raw observation using LeRobot canonical pattern
+        # ImageNet normalization constants (must match training in chess_dataloader.py)
+        IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(self.device)
+        IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(self.device)
+
         # Step 1: Ensure frames are in (H, W, 3) uint8 format
         if len(global_frame.shape) == 3 and global_frame.shape[0] == 3:
             global_frame = np.transpose(global_frame, (1, 2, 0))
         if len(gripper_frame.shape) == 3 and gripper_frame.shape[0] == 3:
             gripper_frame = np.transpose(gripper_frame, (1, 2, 0))
 
-        # Resize to expected resolution (will be resized again by processor if needed)
+        # Resize to 224x224 (model input size)
         global_frame_resized = cv2.resize(global_frame, (224, 224))
         gripper_frame_resized = cv2.resize(gripper_frame, (224, 224))
 
-        # Ensure uint8 dtype
-        if global_frame_resized.dtype != np.uint8:
-            global_frame_resized = (global_frame_resized * 255).astype(np.uint8)
-        if gripper_frame_resized.dtype != np.uint8:
-            gripper_frame_resized = (gripper_frame_resized * 255).astype(np.uint8)
+        # Convert BGR (OpenCV) to RGB for model
+        global_frame_rgb = cv2.cvtColor(global_frame_resized, cv2.COLOR_BGR2RGB)
+        gripper_frame_rgb = cv2.cvtColor(gripper_frame_resized, cv2.COLOR_BGR2RGB)
 
         # Get current robot state
         # SO-100 has 6 motors total: motors 1-5 are arm joints, motor 6 is gripper
-        # joint_positions is [6] array containing all motors
         if robot_state:
-            state_6d = robot_state.joint_positions.astype(np.float32)  # [6] all motors
+            state_6d = robot_state.joint_positions.astype(np.float32)
         else:
             # Placeholder state when no robot connected
             state_6d = np.zeros(6, dtype=np.float32)
-            state_6d[5] = 0.5  # Gripper (motor 6) at 50% open
+            state_6d[5] = 0.5  # Gripper at 50% open
 
-        # Pad to 32D as expected by π₀ model config
+        # Pad to 32D as expected by PI05 model config
         state_32d = np.zeros(32, dtype=np.float32)
-        state_32d[:6] = state_6d  # First 6 dims = SO-100 state (5 arm + 1 gripper)
+        state_32d[:6] = state_6d
 
-        # Step 2: Create raw observation dict using model's expected key names
-        # Model expects: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb
-        # We have: top camera (global) and wrist camera (gripper)
-        # Map our cameras to model's expected names
-        raw_observation = {
-            "observation.images.base_0_rgb": global_frame_resized,       # Top/global camera
-            "observation.images.left_wrist_0_rgb": gripper_frame_resized, # Wrist camera
-            "observation.images.right_wrist_0_rgb": gripper_frame_resized, # Duplicate for now
-            "observation.state": state_32d,                               # 32D state
+        # Step 2: Convert to tensors and apply preprocessing matching training
+        # Global camera -> base_0_rgb
+        global_tensor = torch.from_numpy(global_frame_rgb).float().permute(2, 0, 1)  # (H,W,C) -> (C,H,W)
+        global_tensor = global_tensor / 255.0  # Normalize to [0, 1]
+        global_tensor = global_tensor.to(self.device)
+        global_tensor = (global_tensor - IMAGENET_MEAN) / IMAGENET_STD  # ImageNet normalization
+        global_tensor = global_tensor.unsqueeze(0)  # Add batch dim: (1, C, H, W)
+
+        # Gripper camera -> left_wrist_0_rgb
+        gripper_tensor = torch.from_numpy(gripper_frame_rgb).float().permute(2, 0, 1)
+        gripper_tensor = gripper_tensor / 255.0
+        gripper_tensor = gripper_tensor.to(self.device)
+        gripper_tensor = (gripper_tensor - IMAGENET_MEAN) / IMAGENET_STD
+        gripper_tensor = gripper_tensor.unsqueeze(0)
+
+        # Right wrist -> zeros (unused camera slot, matches training)
+        right_wrist_tensor = torch.zeros(1, 3, 224, 224, device=self.device)
+
+        # State tensor
+        state_tensor = torch.from_numpy(state_32d).float().unsqueeze(0).to(self.device)
+
+        # Step 3: Build observation dict
+        observation = {
+            "observation.images.base_0_rgb": global_tensor,
+            "observation.images.left_wrist_0_rgb": gripper_tensor,
+            "observation.images.right_wrist_0_rgb": right_wrist_tensor,
+            "observation.state": state_tensor,
         }
-
-        # Step 3: Convert to PyTorch tensors
-        observation = preprocess_observation(raw_observation)
-
-        # Step 4: Add batch dimension and move to device
-        for key in observation.keys():
-            if isinstance(observation[key], torch.Tensor):
-                # Add batch dimension if not present
-                if observation[key].ndim == 3:  # Images (H, W, C) -> (1, C, H, W)
-                    observation[key] = observation[key].permute(2, 0, 1).unsqueeze(0)
-                elif observation[key].ndim == 1:  # State (D,) -> (1, D)
-                    observation[key] = observation[key].unsqueeze(0)
-                # Move to device and convert to float
-                observation[key] = observation[key].to(self.device).float()
-                # Normalize images to [0, 1]
-                if "images" in key:
-                    observation[key] = observation[key] / 255.0
 
         # Step 5: Tokenize language prompt and add to observation
         tokens = self.tokenizer(
@@ -374,18 +396,36 @@ class Pi0VLA:
         Returns:
             bool: True if execution successful
         """
-        if not self.robot_arm:
-            print("[VLA] No robot arm connected, skipping execution")
-            return False
+        # Prefer RobotController (position-controlled with continuous holding)
+        if self.robot_controller:
+            self.robot_controller.set_target_positions(action["joint_positions"])
+            return True
 
-        # Send joint position command (all 6 motors)
-        success = self.robot_arm.move_joints(
-            action["joint_positions"],
-            speed=speed,
-            blocking=False  # Non-blocking for continuous control
-        )
+        # Fallback to direct SO100Arm control
+        if self.robot_arm:
+            success = self.robot_arm.move_joints(
+                action["joint_positions"],
+                speed=speed,
+                blocking=False  # Non-blocking for continuous control
+            )
+            return success
 
-        return success
+        print("[VLA] No robot connected, skipping execution")
+        return False
+
+    def get_robot_state(self) -> Optional[SO100State]:
+        """Get current robot state from controller or arm."""
+        if self.robot_controller:
+            return self.robot_controller.arm.get_state()
+        elif self.robot_arm:
+            return self.robot_arm.get_state()
+        return None
+
+    def reset_to_home(self):
+        """Reset robot to home position (only works with RobotController)."""
+        if self.robot_controller:
+            self.robot_controller.set_home_targets()
+            print("[VLA] Robot reset to home position")
 
 
 def vla_control_loop(
@@ -393,7 +433,12 @@ def vla_control_loop(
     global_camera: str,
     gripper_camera: str,
     language_prompt: str,
-    duration: float = 30.0
+    stage: Dict[str, Any],
+    detector: BoardDetector,
+    perspective_matrix: Optional[np.ndarray],
+    camera_rotation: str,
+    virtual_cam: Optional[VirtualCamera],
+    duration: float = 50.0
 ):
     """
     Run VLA control loop for a single stage.
@@ -403,6 +448,11 @@ def vla_control_loop(
         global_camera: Global camera device path
         gripper_camera: Gripper camera device path
         language_prompt: VLM prompt for this stage
+        stage: Full stage dict for overlay rendering
+        detector: BoardDetector instance for coordinate mapping
+        perspective_matrix: Perspective transform matrix from detection
+        camera_rotation: Camera rotation setting
+        virtual_cam: VirtualCamera instance for overlay streaming
         duration: Maximum duration for control (seconds)
     """
     print("\n" + "=" * 60)
@@ -438,6 +488,9 @@ def vla_control_loop(
     frame_count = 0
     action_count = 0
 
+    # Path to transformed board image (generated during detection)
+    transformed_image_path = "data/chessboard_transformed.png"
+
     try:
         while not stop_event.is_set():
             loop_start = time.time()
@@ -454,17 +507,35 @@ def vla_control_loop(
             if not ret1 or not ret2:
                 continue
 
+            # Apply stage overlay to global frame (matches training data format)
+            # Training uses overlayed frames, so inference must too for consistency
+            overlayed_frame = None
+            if perspective_matrix is not None:
+                overlayed_frame = apply_stage_overlay_to_frame(
+                    frame=global_frame,
+                    stage=stage,
+                    transformed_image_path=transformed_image_path,
+                    detector=detector,
+                    perspective_matrix=perspective_matrix,
+                    camera_position=camera_rotation
+                )
+
+            # Use overlayed frame for VLA input (matches training), fallback to raw if overlay fails
+            vla_input_frame = overlayed_frame if overlayed_frame is not None else global_frame
+
+            # Stream to virtual camera for visualization
+            if virtual_cam:
+                virtual_cam.write_frame(vla_input_frame)
+
             # Resize gripper to 224x224
             gripper_frame = cv2.resize(gripper_frame, (224, 224))
 
             # Get current robot state
-            robot_state = None
-            if vla.robot_arm:
-                robot_state = vla.robot_arm.get_state()
+            robot_state = vla.get_robot_state()
 
-            # Get VLA action prediction
+            # Get VLA action prediction using overlayed frame (matches training data)
             action = vla.predict_action(
-                global_frame,
+                vla_input_frame,  # Use overlayed frame, not raw
                 gripper_frame,
                 language_prompt,
                 robot_state=robot_state
@@ -504,8 +575,181 @@ def vla_control_loop(
     print(f"Duration: {elapsed:.2f}s")
     print(f"Frames processed: {frame_count}")
     print(f"Actions executed: {action_count}")
-    print(f"Control rate: {frame_count/elapsed:.1f} Hz")
+    if elapsed > 0:
+        print(f"Control rate: {frame_count/elapsed:.1f} Hz")
     print("=" * 60)
+
+    # Flush stdin to clear any pending input from the daemon thread
+    # This prevents the double-ENTER issue when control exits due to timeout
+    try:
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass  # Ignore if not a TTY
+
+
+class MoveResult(NamedTuple):
+    """Result of execute_move()."""
+    success: bool           # True if move executed successfully
+    restart_requested: bool  # True if user pressed R to recapture
+
+
+def execute_move(
+    vla: Pi0VLA,
+    detector: BoardDetector,
+    calculator: MoveCalculator,
+    global_camera: str,
+    gripper_camera: str,
+    virtual_cam: Optional[VirtualCamera],
+    turn_letter: str,
+    camera_rotation: str,
+    corner_conf: float,
+    min_corner_dist: float,
+    time_limit: float
+) -> MoveResult:
+    """
+    Execute a single chess move: detect board, calculate best move, execute all stages.
+
+    Args:
+        vla: Pi0VLA model instance
+        detector: BoardDetector instance
+        calculator: MoveCalculator instance
+        global_camera: Global camera device path
+        gripper_camera: Gripper camera device path
+        virtual_cam: VirtualCamera for overlay streaming (or None)
+        turn_letter: 'w' or 'b' for whose turn
+        camera_rotation: Camera rotation setting
+        corner_conf: Corner detection confidence threshold
+        min_corner_dist: Minimum corner distance in pixels
+        time_limit: Engine time limit in seconds
+
+    Returns:
+        MoveResult with success and restart_requested flags
+    """
+    print("\n" + "=" * 60)
+    print("BOARD DETECTION & MOVE CALCULATION")
+    print("=" * 60)
+
+    # Capture photo for board detection
+    print("Capturing board image...")
+    board_frame = capture_720p_frame(global_camera)
+    if board_frame is None:
+        print("[X] Failed to capture board image")
+        return MoveResult(success=False, restart_requested=False)
+
+    # Save for debugging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    image_path = Path("data") / f"vla_board_{timestamp}.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(image_path), board_frame)
+    print(f"[OK] Board image saved: {image_path}")
+
+    # Detect board state
+    print("Detecting board state...")
+    try:
+        fen, transformed_image = detector.detect_board_state(
+            str(image_path),
+            corner_conf=corner_conf,
+            min_corner_distance=min_corner_dist,
+            debug=True,
+            turn=turn_letter
+        )
+    except Exception as e:
+        print(f"[X] Board detection failed: {e}")
+        return MoveResult(success=False, restart_requested=False)
+
+    print("[OK] Board state detected")
+
+    # Get perspective matrix from detector (stored during detection)
+    perspective_matrix = detector.perspective_matrix
+
+    # Create chess board from FEN
+    try:
+        board = chess.Board(fen)
+    except ValueError:
+        print(f"[X] Invalid FEN: {fen}")
+        return MoveResult(success=False, restart_requested=False)
+
+    print()
+    print("FEN Notation:")
+    print("-" * 60)
+    print(fen)
+    print("-" * 60)
+    print()
+    print_board(board)
+
+    # Calculate best move
+    print("\n" + "=" * 60)
+    print("BEST MOVE CALCULATION")
+    print("=" * 60)
+
+    try:
+        best_move = calculator.calculate_best_move(board, time_limit=time_limit)
+
+        if not best_move:
+            print("[X] No legal moves available")
+            return MoveResult(success=False, restart_requested=False)
+
+        print(f"[OK] Best move: {best_move}")
+        print(f"  UCI notation: {best_move.uci()}")
+        san_move = board.san(best_move)
+        print(f"  SAN notation: {san_move}")
+        print()
+
+        # Decompose move into stages
+        stages = decompose_move(board, best_move)
+        print(f"Move decomposed into {len(stages)} stage(s):")
+        for i, stage in enumerate(stages, 1):
+            print(f"  {i}. {stage['description']}")
+        print()
+
+        # Execute each stage with VLA control
+        print("\n" + "=" * 60)
+        print("VLA-CONTROLLED EXECUTION")
+        print("=" * 60)
+        print()
+
+        for i, stage in enumerate(stages, 1):
+            print("\n" + "-" * 60)
+            print(f"Stage {i}/{len(stages)}: {stage['description']}")
+            print("-" * 60)
+            print(f"  VLM Prompt: {stage['vlm_prompt']}")
+            print()
+
+            # Wait for user to press ENTER to start VLA control, or R to recapture
+            user_input = input("Press ENTER to hand control to VLA (or R to recapture board)...")
+            if user_input.strip().lower() == 'r':
+                print("\n[INFO] Recapturing board...")
+                return MoveResult(success=False, restart_requested=True)
+
+            # Run VLA control loop
+            vla_control_loop(
+                vla=vla,
+                global_camera=global_camera,
+                gripper_camera=gripper_camera,
+                language_prompt=stage['vlm_prompt'],
+                stage=stage,
+                detector=detector,
+                perspective_matrix=perspective_matrix,
+                camera_rotation=camera_rotation,
+                virtual_cam=virtual_cam,
+                duration=50.0  # 50 second timeout per stage
+            )
+
+            print()
+
+        print("\n" + "=" * 60)
+        print("[OK] All stages completed!")
+        print("=" * 60)
+        return MoveResult(success=True, restart_requested=False)
+
+    except FileNotFoundError:
+        print(f"[X] Chess engine not found")
+        return MoveResult(success=False, restart_requested=False)
+    except Exception as e:
+        print(f"[X] Error during move execution: {e}")
+        import traceback
+        traceback.print_exc()
+        return MoveResult(success=False, restart_requested=False)
 
 
 def main():
@@ -587,58 +831,89 @@ def main():
     turn_letter = "w" if args.turn == "white" else "b"
 
     print("=" * 60)
-    print("VLA Deploy - π₀.₅ Chess Robot Control")
+    print("VLA Deploy - Chess Robot Control")
     print("=" * 60)
+
+    # Clear GPU memory and check availability before loading model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        free_mem = torch.cuda.mem_get_info()[0] / (1024**3)  # GB
+        total_mem = torch.cuda.mem_get_info()[1] / (1024**3)  # GB
+        print(f"[INFO] GPU Memory: {free_mem:.1f} GB free / {total_mem:.1f} GB total")
+
+        if free_mem < 15.0:
+            print("[WARN] Low GPU memory! Other processes may be using the GPU.")
+            print("       Run 'nvidia-smi' to check for lingering processes.")
+    else:
+        print("[WARN] CUDA not available, will use CPU (slow)")
+    print()
     print(f"Checkpoint: {args.checkpoint or 'Base π₀.₅ weights'}")
     print(f"Board rotation: {args.rotation}")
     print(f"Turn: {args.turn.capitalize()}")
     print()
 
-    # Step 1: Initialize SO-100 robot arm
+    # Step 1: Initialize SO-100 robot arm with RobotController
     print("=" * 60)
     print("STAGE 1: Initialize SO-100 Robot Arm")
     print("=" * 60)
 
-    robot_arm = None
+    robot_controller = None
     if not args.no_robot and SO100_AVAILABLE:
         try:
-            robot_arm = SO100Arm(port=args.robot_port, baudrate=1000000)  # Feetech protocol: 1 Mbps
-            if robot_arm.connect():
+            # Load port-specific joint configs for calibrated home positions
+            config_dir = Path("data")
+            joint_configs, config_source = load_joint_configs_for_port(args.robot_port, config_dir)
+
+            print(f"[INFO] Config source: {config_source}")
+            home_degs = [f"{np.degrees(c.home_rad):.1f}" for c in joint_configs]
+            print(f"[INFO] Home positions: [{', '.join(home_degs)}] deg")
+
+            # Create RobotController for position-controlled operation
+            robot_controller = RobotController(
+                port=args.robot_port,
+                joint_configs=joint_configs,
+                config_source=config_source,
+                enable_stability_system=True  # Enable joint 0/1 stability
+            )
+
+            if robot_controller.connect():
                 print(f"[OK] SO-100 connected on {args.robot_port}")
-                state = robot_arm.get_state()
-                print(f"[OK] Current joint positions: {state.joint_positions}")
+
+                # Enable torque and start control loop targeting home
+                robot_controller.enable_torque()
+                robot_controller.set_home_targets()
+                robot_controller.start_control_loop()
+                print(f"[OK] Control loop started, robot holding at home position")
+
+                state = robot_controller.arm.get_state()
+                print(f"[OK] Current joint positions: {np.degrees(state.joint_positions)}")
             else:
                 print(f"[X] Failed to connect to SO-100")
-                robot_arm = None
+                robot_controller = None
         except Exception as e:
             print(f"[X] SO-100 connection error: {e}")
-            robot_arm = None
+            import traceback
+            traceback.print_exc()
+            robot_controller = None
     else:
         if args.no_robot:
             print("[WARN] Running without robot (--no-robot flag)")
         else:
             print("[WARN] SO-100 control not available")
 
-    # Step 2: Initialize π₀.₅ model
+    # Step 2: Camera selection and validation (BEFORE model loading)
     print("\n" + "=" * 60)
-    print("STAGE 2: Initialize π₀.₅ Model")
-    print("=" * 60)
-
-    vla = Pi0VLA(
-        checkpoint_path=args.checkpoint,
-        device="cuda",
-        robot_arm=robot_arm
-    )
-
-    # Step 3: Camera selection
-    print("\n" + "=" * 60)
-    print("STAGE 3: Camera Selection")
+    print("STAGE 2: Camera Selection")
     print("=" * 60)
 
     # Detect cameras
     cameras = get_available_cameras()
     if not cameras:
         print("[X] No cameras found!")
+        if robot_arm:
+            robot_arm.disconnect()
         return 1
 
     # Global camera selection
@@ -655,122 +930,145 @@ def main():
     gripper_camera = args.gripper_camera
     print(f"[OK] Gripper camera: {gripper_camera}")
 
-    # Step 4: Capture initial board state
-    print("\n" + "=" * 60)
-    print("STAGE 4: Board Detection & Move Calculation")
-    print("=" * 60)
-
-    # Capture photo for board detection
-    print("Capturing board image...")
-    board_frame = capture_720p_frame(global_camera)
-    if board_frame is None:
-        print("[X] Failed to capture board image")
+    # Validate cameras work before loading model (fail fast)
+    print("\n[INFO] Validating cameras...")
+    test_frame = capture_720p_frame(global_camera)
+    if test_frame is None:
+        print(f"[X] Global camera {global_camera} not working!")
+        if robot_controller:
+            robot_controller.disconnect()
         return 1
+    print(f"[OK] Global camera validated: {test_frame.shape}")
 
-    # Save for debugging
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    image_path = Path("data") / f"vla_board_{timestamp}.png"
-    image_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(image_path), board_frame)
-    print(f"[OK] Board image saved: {image_path}")
-
-    # Detect board state
-    print("Detecting board state...")
-    detector = BoardDetector(camera_position=args.rotation)
-    fen, transformed_image = detector.detect_board_state(
-        str(image_path),
-        corner_conf=args.corner_conf,
-        min_corner_distance=args.min_corner_dist,
-        debug=True,
-        turn=turn_letter
-    )
-    print("[OK] Board state detected")
-    print()
-
-    # Create chess board from FEN
-    try:
-        board = chess.Board(fen)
-    except ValueError:
-        print(f"[X] Invalid FEN: {fen}")
-        board = chess.Board(None)
-
-    print("FEN Notation:")
-    print("-" * 60)
-    print(fen)
-    print("-" * 60)
-    print()
-
-    print_board(board)
-
-    # Calculate best move
+    # Step 3: Initialize virtual camera for overlay streaming
     print("\n" + "=" * 60)
-    print("STAGE 5: Best Move Calculation")
+    print("STAGE 3: Virtual Camera Output")
     print("=" * 60)
+
+    virtual_cam = None
+    try:
+        virtual_cam = VirtualCamera(
+            device_path="/dev/video7",
+            width=1280,
+            height=720
+        )
+        if virtual_cam.start():
+            print("[OK] Virtual camera started: /dev/video7")
+        else:
+            print("[WARN] Virtual camera failed to start, overlays disabled")
+            virtual_cam = None
+    except Exception as e:
+        print(f"[WARN] Virtual camera not available: {e}")
+        virtual_cam = None
+
+    # Step 4: Initialize VLA model (GPU-intensive)
+    print("\n" + "=" * 60)
+    print("STAGE 4: Initialize VLA Model")
+    print("=" * 60)
+
+    vla = Pi0VLA(
+        checkpoint_path=args.checkpoint,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        robot_controller=robot_controller
+    )
+
+    # Step 5: Initialize guidance components
+    print("\n" + "=" * 60)
+    print("STAGE 5: Initialize Guidance System")
+    print("=" * 60)
+
+    detector = BoardDetector(camera_position=args.rotation)
+    print(f"[OK] BoardDetector initialized (rotation: {args.rotation})")
 
     try:
         calculator = MoveCalculator(engine_path=args.engine)
-        best_move = calculator.calculate_best_move(board, time_limit=args.time)
+        print(f"[OK] MoveCalculator initialized (engine: {args.engine})")
+    except FileNotFoundError:
+        print(f"[X] Chess engine not found at '{args.engine}'")
+        print("  Install stockfish or specify engine path with --engine")
+        if virtual_cam:
+            virtual_cam.stop()
+        if robot_controller:
+            robot_controller.disconnect()
+        return 1
 
-        if best_move:
-            print(f"[OK] Best move: {best_move}")
-            print(f"  UCI notation: {best_move.uci()}")
-            san_move = board.san(best_move)
-            print(f"  SAN notation: {san_move}")
-            print()
+    # Ready for game loop
+    print("\n" + "=" * 60)
+    print("[READY] VLA Chess Robot Ready for Play")
+    print("=" * 60)
+    print(f"  Robot plays: {args.turn.capitalize()}")
+    print(f"  Engine: {args.engine}")
+    print(f"  Global camera: {global_camera}")
+    print(f"  Gripper camera: {gripper_camera}")
+    print(f"  Virtual camera: {'enabled' if virtual_cam else 'disabled'}")
+    if robot_controller:
+        print(f"  Robot: {args.robot_port} (holding at home position)")
+    else:
+        print(f"  Robot: None (--no-robot mode)")
+    print()
+    print("  Press ENTER to capture board and calculate move")
+    print("  Press Ctrl+C to exit")
+    print("=" * 60)
 
-            # Decompose move into stages
-            stages = decompose_move(board, best_move)
-            print(f"Move decomposed into {len(stages)} stage(s):")
-            for i, stage in enumerate(stages, 1):
-                print(f"  {i}. {stage['description']}")
-            print()
+    # Main game loop
+    move_count = 0
+    try:
+        while True:
+            # Robot holds at home position while waiting (control loop running)
+            input("\nPress ENTER to start next move...")
 
-            # Step 5: VLA control for each stage
-            print("\n" + "=" * 60)
-            print("STAGE 6: VLA-Controlled Execution")
-            print("=" * 60)
-            print()
+            # Loop for board capture with restart support
+            while True:
+                move_count += 1
+                print(f"\n[MOVE {move_count}]")
 
-            for i, stage in enumerate(stages, 1):
-                print("\n" + "-" * 60)
-                print(f"Stage {i}/{len(stages)}: {stage['description']}")
-                print("-" * 60)
-                print(f"  VLM Prompt: {stage['vlm_prompt']}")
-                print()
-
-                # Wait for user to press ENTER to start VLA control
-                input("Press ENTER to hand control to VLA...")
-
-                # Run VLA control loop
-                vla_control_loop(
-                    vla,
-                    global_camera,
-                    gripper_camera,
-                    stage['vlm_prompt'],
-                    duration=30.0  # 30 second timeout
+                result = execute_move(
+                    vla=vla,
+                    detector=detector,
+                    calculator=calculator,
+                    global_camera=global_camera,
+                    gripper_camera=gripper_camera,
+                    virtual_cam=virtual_cam,
+                    turn_letter=turn_letter,
+                    camera_rotation=args.rotation,
+                    corner_conf=args.corner_conf,
+                    min_corner_dist=args.min_corner_dist,
+                    time_limit=args.time
                 )
 
-                print()
+                if result.restart_requested:
+                    # Decrement move count since we're retrying
+                    move_count -= 1
+                    print("\n[INFO] Recapturing board for new detection...")
+                    continue
+                else:
+                    # Move completed (success or failure), exit inner loop
+                    break
 
-            print("\n" + "=" * 60)
-            print("[OK] All stages completed!")
-            print("=" * 60)
+            # Reset robot to home position after move completes
+            vla.reset_to_home()
 
-        else:
-            print("[X] No legal moves available")
+            if result.success:
+                print("\n[OK] Move completed successfully!")
+            else:
+                print("\n[WARN] Move failed or was aborted")
 
-    except FileNotFoundError:
-        print(f"[X] Engine not found at '{args.engine}'")
-        print("  Install stockfish or specify engine path with --engine")
-    except Exception as e:
-        print(f"[X] Error: {e}")
-        import traceback
-        traceback.print_exc()
+            print("\n" + "-" * 60)
+            print(f"Moves executed: {move_count}")
+            print("-" * 60)
 
-    # Cleanup
-    if robot_arm:
-        print("\nDisconnecting from SO-100...")
-        robot_arm.disconnect()
+    except KeyboardInterrupt:
+        print("\n\n[INFO] Exiting...")
+
+    finally:
+        # Cleanup
+        if virtual_cam:
+            print("Stopping virtual camera...")
+            virtual_cam.stop()
+        if robot_controller:
+            print("Disconnecting from SO-100...")
+            robot_controller.disconnect()
+        print("[OK] Goodbye!")
 
     return 0
 
