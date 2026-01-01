@@ -27,12 +27,15 @@ Usage:
 """
 
 import argparse
+import json
+import queue
+import threading
 import time
 import cv2
 import chess
 import numpy as np
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import sys
 
 # Add parent directory to path for imports
@@ -164,6 +167,12 @@ class EpisodeRecorder:
         self.perspective_matrix: Optional[np.ndarray] = None
         self.transformed_image_path = "data/chessboard_transformed.png"
 
+        # Background saving thread
+        self.save_queue: queue.Queue = queue.Queue()
+        self.save_thread: Optional[threading.Thread] = None
+        self.save_thread_running = False
+        self.save_lock = threading.Lock()  # Protects episode_count and dataset access
+
         print(f"[OK] EpisodeRecorder initialized")
         print(f"     Output: {self.output_dir}")
         print(f"     FPS: {self.fps}")
@@ -286,6 +295,80 @@ class EpisodeRecorder:
             self.virtual_cam.stop()
 
         print("[OK] Cameras stopped")
+
+    def start_save_thread(self):
+        """Start background save worker thread."""
+        if self.save_thread is not None and self.save_thread.is_alive():
+            return
+
+        self.save_thread_running = True
+        self.save_thread = threading.Thread(target=self._save_worker, daemon=True)
+        self.save_thread.start()
+        print("[OK] Background save thread started")
+
+    def stop_save_thread(self):
+        """Stop background save worker thread, waiting for queue to drain."""
+        if self.save_thread is None:
+            return
+
+        # Signal thread to stop
+        self.save_thread_running = False
+
+        # Wait for queue to drain
+        remaining = self.save_queue.qsize()
+        if remaining > 0:
+            print(f"[INFO] Waiting for {remaining} episode(s) to save...")
+
+        # Block until queue is empty
+        self.save_queue.join()
+
+        # Wait for thread to finish
+        self.save_thread.join(timeout=5.0)
+        self.save_thread = None
+        print("[OK] Background save thread stopped")
+
+    def _save_worker(self):
+        """Background worker that saves episodes from queue."""
+        while self.save_thread_running or not self.save_queue.empty():
+            try:
+                # Get next episode to save (with timeout to check running flag)
+                item = self.save_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                frames, stage_info, episode_index = item
+
+                if self.use_lerobot:
+                    self._save_episode_lerobot_impl(frames, stage_info, episode_index)
+                else:
+                    self._save_episode_raw_impl(frames, stage_info, episode_index)
+
+            except Exception as e:
+                print(f"[ERROR] Background save failed: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self.save_queue.task_done()
+
+    def queue_episode(self, frames: List[Dict], stage_info: Dict) -> int:
+        """
+        Queue episode for background saving.
+
+        Args:
+            frames: List of frame dictionaries for this stage
+            stage_info: Stage dictionary with 'description', 'vlm_prompt', etc.
+
+        Returns:
+            Episode index assigned to this episode
+        """
+        with self.save_lock:
+            episode_index = self.episode_count
+            self.episode_count += 1
+
+        self.save_queue.put((frames, stage_info, episode_index))
+        print(f"[INFO] Queued episode {episode_index} ({len(frames)} frames, queue size: {self.save_queue.qsize()})")
+        return episode_index
 
     def _detect_and_decompose_move(self, board_image_path: str) -> Optional[Dict]:
         """
@@ -419,6 +502,11 @@ class EpisodeRecorder:
             # Continue streaming overlay while waiting
             self._generate_and_stream_overlay(stage)
 
+        # Flush gripper camera buffer to avoid stale/corrupted frames at start
+        # Read and discard several frames to clear the buffer
+        for _ in range(5):
+            self.gripper_cam.read()
+
         print(f"[INFO] Recording stage {stage_index + 1} at {self.fps} FPS...")
         print("[PROMPT] Press ENTER to STOP recording")
 
@@ -528,57 +616,62 @@ class EpisodeRecorder:
             traceback.print_exc()
             return None
 
-    def _save_episode_lerobot(self, all_frames: List[Dict], move_info: Dict):
+    def _save_episode_lerobot_impl(self, frames: List[Dict], stage_info: Dict, episode_index: int):
         """
-        Save episode to LeRobot dataset.
+        Save single-stage episode to LeRobot dataset (called from background thread).
 
         Args:
-            all_frames: List of all frame dictionaries from all stages
-            move_info: Dictionary with 'board', 'move', 'stages'
+            frames: List of frame dictionaries for this stage
+            stage_info: Stage dictionary with 'description', 'vlm_prompt', etc.
+            episode_index: Pre-assigned episode index
         """
         try:
-            episode_index = self.episode_count
+            vlm_prompt = stage_info.get("vlm_prompt", "")
 
-            print(f"\n[INFO] Writing episode {episode_index} to LeRobot dataset...")
+            print(f"[SAVE] Writing episode {episode_index} to LeRobot dataset...")
 
-            for frame_idx, frame_data in enumerate(all_frames):
-                self.dataset.add_frame({
-                    "observation.global_camera": frame_data["global_frame"],
-                    "observation.gripper_camera": frame_data["gripper_frame"],
-                    "observation.joint_positions": frame_data["joint_positions"],
-                    "action": frame_data["joint_positions"],  # Copy for action cloning
-                    "language_instruction": frame_data["vlm_prompt"],
-                    "task": frame_data["vlm_prompt"]  # Required by LeRobot v0.4
-                })
+            with self.save_lock:
+                for frame_data in frames:
+                    # Convert BGR (OpenCV) to RGB for LeRobot video encoding
+                    global_rgb = cv2.cvtColor(frame_data["global_frame"], cv2.COLOR_BGR2RGB)
+                    gripper_rgb = cv2.cvtColor(frame_data["gripper_frame"], cv2.COLOR_BGR2RGB)
 
-            # Finalize episode (encode videos, write Parquet)
-            self.dataset.save_episode()
+                    self.dataset.add_frame({
+                        "observation.global_camera": global_rgb,
+                        "observation.gripper_camera": gripper_rgb,
+                        "observation.joint_positions": frame_data["joint_positions"],
+                        "action": frame_data["joint_positions"],  # Copy for action cloning
+                        "language_instruction": vlm_prompt,
+                        "task": vlm_prompt  # Required by LeRobot v0.4
+                    })
 
-            print(f"[OK] Episode {episode_index} saved: {len(all_frames)} frames")
-            self.episode_count += 1
+                # Finalize episode (encode videos, write Parquet)
+                self.dataset.save_episode()
+
+            print(f"[SAVE] Episode {episode_index} saved: {len(frames)} frames")
 
         except Exception as e:
-            print(f"[ERROR] Failed to save episode to LeRobot: {e}")
+            print(f"[ERROR] Failed to save episode {episode_index} to LeRobot: {e}")
             import traceback
             traceback.print_exc()
 
-    def _save_episode_raw(self, all_frames: List[Dict], move_info: Dict):
+    def _save_episode_raw_impl(self, frames: List[Dict], stage_info: Dict, episode_index: int):
         """
-        Save episode as raw files (fallback if LeRobot not available).
+        Save single-stage episode as raw files (called from background thread).
 
         Args:
-            all_frames: List of all frame dictionaries from all stages
-            move_info: Dictionary with 'board', 'move', 'stages'
+            frames: List of frame dictionaries for this stage
+            stage_info: Stage dictionary with 'description', 'vlm_prompt', etc.
+            episode_index: Pre-assigned episode index
         """
         try:
-            episode_index = self.episode_count
             episode_dir = self.output_dir / f"episode_{episode_index:06d}"
             episode_dir.mkdir(parents=True, exist_ok=True)
 
-            print(f"\n[INFO] Saving episode {episode_index} to {episode_dir}...")
+            print(f"[SAVE] Saving episode {episode_index} to {episode_dir}...")
 
             # Save frames as images
-            for frame_idx, frame_data in enumerate(all_frames):
+            for frame_idx, frame_data in enumerate(frames):
                 cv2.imwrite(
                     str(episode_dir / f"global_{frame_idx:06d}.png"),
                     frame_data["global_frame"]
@@ -588,27 +681,26 @@ class EpisodeRecorder:
                     frame_data["gripper_frame"]
                 )
 
-            # Save metadata
-            import json
+            # Save metadata (single-stage, single task)
             metadata = {
                 "episode_index": episode_index,
-                "frame_count": len(all_frames),
+                "frame_count": len(frames),
                 "fps": self.fps,
-                "move": move_info["move"].uci(),
-                "fen": move_info["board"].fen(),
-                "stages": move_info["stages"],
-                "joint_positions": [frame["joint_positions"].tolist() for frame in all_frames],
-                "timestamps": [frame["timestamp"] for frame in all_frames]
+                "vlm_prompt": stage_info.get("vlm_prompt", ""),
+                "description": stage_info.get("description", ""),
+                "pickup_square": stage_info.get("pickup_square"),
+                "place_square": stage_info.get("place_square"),
+                "joint_positions": [frame["joint_positions"].tolist() for frame in frames],
+                "timestamps": [frame["timestamp"] for frame in frames]
             }
 
             with open(episode_dir / "metadata.json", "w") as f:
                 json.dump(metadata, f, indent=2)
 
-            print(f"[OK] Episode {episode_index} saved: {len(all_frames)} frames")
-            self.episode_count += 1
+            print(f"[SAVE] Episode {episode_index} saved: {len(frames)} frames")
 
         except Exception as e:
-            print(f"[ERROR] Failed to save raw episode: {e}")
+            print(f"[ERROR] Failed to save raw episode {episode_index}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -626,11 +718,15 @@ class EpisodeRecorder:
             print("[ERROR] Camera initialization failed, exiting")
             return
 
+        # Start background save thread
+        self.start_save_thread()
+
         # Use keyboard context manager to enable raw terminal input
         with self.keyboard:
             try:
                 print("\n[INFO] Episode collection ready")
-                print("[PROMPT] Press ENTER to capture board and start new episode (Ctrl+C to quit)...")
+                print("[INFO] Each stage is saved as a separate episode")
+                print("[PROMPT] Press ENTER to capture board and start new move (Ctrl+C to quit)...")
 
                 while True:
                     # Wait for user to press ENTER
@@ -656,9 +752,9 @@ class EpisodeRecorder:
                         print("[ERROR] Failed to process board, try again")
                         continue
 
-                    # Record each stage
-                    all_frames = []
-                    episode_aborted = False
+                    # Record each stage as its own episode
+                    stages_saved = 0
+                    move_aborted = False
 
                     for stage_idx, stage in enumerate(move_info["stages"]):
                         # Retry loop for each stage
@@ -666,64 +762,57 @@ class EpisodeRecorder:
                             frames = self._record_stage(stage, stage_idx, len(move_info["stages"]))
 
                             if frames is None:
-                                print("[WARNING] Stage recording failed, skipping episode")
-                                episode_aborted = True
+                                print("[WARNING] Stage recording failed")
+                                move_aborted = True
                                 break
 
                             # Ask if user wants to keep or retry
-                            print("\n[PROMPT] Keep this recording? (ENTER=Keep, R=Retry, Q=Abort episode)")
+                            print("\n[PROMPT] Keep this recording? (ENTER=Keep, R=Retry, Q=Abort move)")
                             while True:
                                 key = self.keyboard.get_key(timeout=0.1)
                                 if key == 'ENTER':
-                                    # Keep recording, move to next stage
-                                    all_frames.extend(frames)
+                                    # Keep recording - queue for background save
+                                    self.queue_episode(frames, stage)
+                                    stages_saved += 1
                                     break
                                 elif key in ('r', 'R'):
                                     # Retry this stage
                                     print("[INFO] Retrying stage...")
                                     break
                                 elif key in ('q', 'Q'):
-                                    # Abort entire episode
-                                    print("[INFO] Aborting episode...")
-                                    episode_aborted = True
+                                    # Abort remaining stages
+                                    print("[INFO] Aborting remaining stages...")
+                                    move_aborted = True
                                     break
 
                             # Check if we should keep this recording or retry
                             if key == 'ENTER':
                                 break  # Exit retry loop, move to next stage
-                            elif episode_aborted:
-                                break  # Exit retry loop, abort episode
+                            elif move_aborted:
+                                break  # Exit retry loop, abort move
                             # Otherwise key was 'r'/'R', continue retry loop
 
-                        if episode_aborted:
+                        if move_aborted:
                             break  # Exit stage loop
 
-                    if episode_aborted or all_frames is None or len(all_frames) == 0:
-                        print("[WARNING] Episode aborted or no frames recorded, skipping")
-                        print("[PROMPT] Press ENTER to start next episode (Ctrl+C to quit)...")
-                        continue
-
-                    # Save episode
-                    if self.use_lerobot:
-                        self._save_episode_lerobot(all_frames, move_info)
-                    else:
-                        self._save_episode_raw(all_frames, move_info)
-
-                    # Summary
+                    # Summary for this move
                     print(f"\n{'='*60}")
-                    print(f"Episode Collection Summary")
+                    print(f"Move Collection Summary")
                     print(f"{'='*60}")
+                    print(f"Stages saved: {stages_saved}/{len(move_info['stages'])}")
                     print(f"Total episodes: {self.episode_count}")
-                    print(f"Last episode frames: {len(all_frames)}")
+                    print(f"Save queue: {self.save_queue.qsize()} pending")
                     print(f"Output directory: {self.output_dir}")
                     print(f"{'='*60}\n")
 
-                    print("[PROMPT] Press ENTER to start next episode (Ctrl+C to quit)...")
+                    print("[PROMPT] Press ENTER to start next move (Ctrl+C to quit)...")
 
             except KeyboardInterrupt:
                 print("\n\n[INFO] Collection stopped by user")
 
             finally:
+                # Stop save thread (waits for queue to drain)
+                self.stop_save_thread()
                 self.stop_cameras()
                 print("\n[OK] Episode collection complete")
                 print(f"     Total episodes: {self.episode_count}")

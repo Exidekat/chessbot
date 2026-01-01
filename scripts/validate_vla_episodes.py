@@ -108,7 +108,8 @@ class EpisodeValidator:
             self.dataset = LeRobotDataset(
                 repo_id=repo_id,
                 root=str(self.dataset_path),
-                download_videos=False
+                download_videos=False,
+                video_backend="pyav"  # Use pyav instead of torchcodec (FFmpeg issues)
             )
 
             # LeRobot v0.4: episode info is in meta.episodes
@@ -162,6 +163,8 @@ class EpisodeValidator:
                     "stages": metadata.get("stages", []),
                     "joint_positions": metadata.get("joint_positions", []),
                     "timestamps": metadata.get("timestamps", []),
+                    "task": metadata.get("vlm_prompt", metadata.get("task", "")),  # Support both new and old format
+                    "description": metadata.get("description", ""),
                     "format": "raw"
                 })
 
@@ -286,6 +289,9 @@ class EpisodeValidator:
 
         frames = []
 
+        # Get task from episode metadata
+        episode_task = episode.get("task", "")
+
         if episode["format"] == "raw":
             ep_dir = episode["path"]
 
@@ -306,31 +312,60 @@ class EpisodeValidator:
                     "global_frame": global_frame,
                     "gripper_frame": gripper_frame,
                     "joint_positions": jp,
-                    "timestamp": ts
+                    "timestamp": ts,
+                    "task": episode_task
                 })
 
         elif self.use_lerobot and self.dataset is not None:
-            # Load from LeRobot dataset
+            # Load from LeRobot dataset (v0.4 API)
             try:
-                ep_data = self.dataset.episode_data_index[
-                    self.dataset.episode_data_index["episode_index"] == episode_index
-                ]
+                # Calculate start index by summing lengths of previous episodes
+                start_idx = 0
+                for ep in self.episodes:
+                    if ep["index"] < episode_index:
+                        start_idx += ep["frame_count"]
+                    elif ep["index"] == episode_index:
+                        break
 
-                for _, row in ep_data.iterrows():
-                    frame_idx = row["frame_index"]
+                # Load frames for this episode
+                for i in range(episode["frame_count"]):
+                    global_idx = start_idx + i
 
                     # Get frame data from dataset
-                    sample = self.dataset[frame_idx]
+                    sample = self.dataset[global_idx]
+
+                    # Get task from sample or episode metadata
+                    task_val = sample.get("language_instruction", sample.get("task", episode_task))
+
+                    # Handle tensor conversion for images
+                    global_cam = sample.get("observation.global_camera")
+                    gripper_cam = sample.get("observation.gripper_camera")
+                    joint_pos = sample.get("observation.joint_positions", [0.0] * 6)
+
+                    # Convert tensors to numpy if needed
+                    if hasattr(global_cam, 'numpy'):
+                        global_cam = global_cam.permute(1, 2, 0).numpy()  # CHW -> HWC
+                        global_cam = (global_cam * 255).astype(np.uint8)
+                        global_cam = cv2.cvtColor(global_cam, cv2.COLOR_RGB2BGR)
+                    if hasattr(gripper_cam, 'numpy'):
+                        gripper_cam = gripper_cam.permute(1, 2, 0).numpy()
+                        gripper_cam = (gripper_cam * 255).astype(np.uint8)
+                        gripper_cam = cv2.cvtColor(gripper_cam, cv2.COLOR_RGB2BGR)
+                    if hasattr(joint_pos, 'numpy'):
+                        joint_pos = joint_pos.numpy()
 
                     frames.append({
-                        "global_frame": sample.get("observation.global_camera"),
-                        "gripper_frame": sample.get("observation.gripper_camera"),
-                        "joint_positions": sample.get("observation.joint_positions", [0.0] * 6),
-                        "timestamp": sample.get("timestamp", frame_idx / episode["fps"])
+                        "global_frame": global_cam,
+                        "gripper_frame": gripper_cam,
+                        "joint_positions": joint_pos,
+                        "timestamp": i / episode["fps"],
+                        "task": task_val
                     })
 
             except Exception as e:
                 print(f"[ERROR] Failed to load LeRobot frames: {e}")
+                import traceback
+                traceback.print_exc()
                 return None
 
         return frames
@@ -367,7 +402,7 @@ class EpisodeValidator:
 
         # Create display window
         cv2.namedWindow("Episode Playback", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Episode Playback", 1280, 400)
+        cv2.resizeWindow("Episode Playback", 1320, 400)
 
         frame_idx = 0
         last_frame_time = time.time()
@@ -474,6 +509,7 @@ class EpisodeValidator:
         gripper_frame = frame_data.get("gripper_frame")
         joint_positions = frame_data.get("joint_positions", [0.0] * 6)
         timestamp = frame_data.get("timestamp", 0.0)
+        task = frame_data.get("task", "")
 
         # Create placeholder if frames are missing
         if global_frame is None:
@@ -490,55 +526,71 @@ class EpisodeValidator:
         global_resized = cv2.resize(global_frame, (640, 360))
         gripper_resized = cv2.resize(gripper_frame, (360, 360))
 
-        # Create info panel
-        info_panel = np.zeros((360, 280, 3), dtype=np.uint8)
+        # Create info panel (wider to fit task text)
+        info_panel = np.zeros((360, 320, 3), dtype=np.uint8)
 
         # Add episode info
-        y_offset = 30
+        y_offset = 25
         cv2.putText(info_panel, f"Episode: {episode_index}", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        y_offset += 25
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset += 20
 
         cv2.putText(info_panel, f"Frame: {frame_idx}/{total_frames-1}", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        y_offset += 25
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset += 20
 
         cv2.putText(info_panel, f"Time: {timestamp:.2f}s", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        y_offset += 25
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset += 20
 
         status = f"[PAUSED] " if paused else ""
         cv2.putText(info_panel, f"{status}Speed: {speed}x", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if paused else (255, 255, 255), 1)
-        y_offset += 35
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255) if paused else (255, 255, 255), 1)
+        y_offset += 25
 
-        # Add joint positions
-        cv2.putText(info_panel, "Joint Positions:", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        y_offset += 20
+        # Add task/VLM prompt (with word wrapping)
+        if task:
+            cv2.putText(info_panel, "Task:", (10, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 100), 1)
+            y_offset += 15
+
+            # Wrap task text (approx 35 chars per line at 0.35 font scale)
+            max_chars = 38
+            words = task.split()
+            lines = []
+            current_line = ""
+            for word in words:
+                if len(current_line) + len(word) + 1 <= max_chars:
+                    current_line += (" " if current_line else "") + word
+                else:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+            if current_line:
+                lines.append(current_line)
+
+            # Display up to 3 lines
+            for line in lines[:3]:
+                cv2.putText(info_panel, line, (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 150), 1)
+                y_offset += 12
+            y_offset += 5
+
+        # Add joint positions (compact)
+        cv2.putText(info_panel, "Joints:", (10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        y_offset += 15
 
         for i, jp in enumerate(joint_positions[:6]):
             jp_val = jp if isinstance(jp, (int, float)) else 0.0
-            cv2.putText(info_panel, f"  J{i}: {jp_val:7.3f} rad", (10, y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 255, 150), 1)
-            y_offset += 18
+            cv2.putText(info_panel, f"J{i}: {jp_val:6.2f}", (10, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 255, 150), 1)
+            y_offset += 12
 
-        # Add controls
-        y_offset += 20
-        cv2.putText(info_panel, "Controls:", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        y_offset += 18
-        cv2.putText(info_panel, "SPACE: Pause", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
-        y_offset += 15
-        cv2.putText(info_panel, "A/D: Seek -/+1s", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
-        y_offset += 15
-        cv2.putText(info_panel, "W/S: Speed +/-", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
-        y_offset += 15
-        cv2.putText(info_panel, "Q: Quit", (10, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        # Add controls (compact)
+        y_offset += 8
+        cv2.putText(info_panel, "SPACE:pause A/D:seek W/S:spd Q:quit", (10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
 
         # Combine frames horizontally
         display = np.hstack([global_resized, gripper_resized, info_panel])
