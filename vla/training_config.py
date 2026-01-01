@@ -51,7 +51,7 @@ class ChessTrainingConfig:
     use_wandb: bool = False  # Disabled by default
 
     # Hardware
-    device: str = "cuda"
+    device: str = "mps"
     mixed_precision: bool = True  # Use fp16/bf16 for memory efficiency
     compile_model: bool = False  # torch.compile for speed (requires PyTorch 2.0+)
 
@@ -119,8 +119,8 @@ class ChessTrainingConfig:
             errors.append(f"num_epochs must be >= 1, got {self.num_epochs}")
 
         # Check device
-        if self.device not in ["cuda", "cpu"]:
-            errors.append(f"device must be 'cuda' or 'cpu', got {self.device}")
+        if self.device not in ["cuda", "cpu", "mps"]:
+            errors.append(f"device must be 'cuda', 'cpu', or 'mps', got {self.device}")
 
         return errors
 

@@ -1,10 +1,12 @@
 # ide
+.claude
 .idea
 
 # downloaded & cached data
 data/
 results/
 viz/site/package-lock.json
+checkpoints/
 
 # Python
 __pycache__/

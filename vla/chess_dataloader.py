@@ -313,6 +313,7 @@ def create_dataloaders(
     num_workers: int = 4,
     val_split: float = 0.1,
     image_size: Tuple[int, int] = (224, 224),
+    device: str = "cuda",
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation dataloaders.
@@ -323,6 +324,7 @@ def create_dataloaders(
         num_workers: Number of data loading workers
         val_split: Fraction of data for validation
         image_size: Target image size
+        device: Target device ("cuda", "mps", or "cpu")
 
     Returns:
         Tuple of (train_loader, val_loader)
@@ -339,13 +341,16 @@ def create_dataloaders(
         image_size=image_size,
     )
 
+    # Pin memory only beneficial for CUDA (not supported on MPS)
+    use_pin_memory = (device == "cuda")
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         drop_last=True,
     )
 
@@ -355,7 +360,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         drop_last=False,
     )
 

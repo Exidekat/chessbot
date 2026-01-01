@@ -34,13 +34,18 @@ try:
     import torch.nn as nn
     from torch.optim import AdamW
     from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.cuda.amp import GradScaler
 except ImportError as e:
     print(f"[X] Failed to import PyTorch: {e}")
     sys.exit(1)
 
 # Local imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# IMPORTANT: Apply MPS patches BEFORE importing PI05Policy
+from vla.mps_patches import apply_mps_patches
+apply_mps_patches()
+
 from vla.training_config import ChessTrainingConfig, load_config
 from vla.chess_dataloader import create_dataloaders, ChessEpisodeDataset
 # Note: VLALoss not needed - PI05 computes loss internally
@@ -198,7 +203,9 @@ def train_epoch(
             target_action = target_action.to(device)
 
         # Forward pass with mixed precision
-        with autocast(enabled=config.mixed_precision):
+        # Use device-specific autocast (CUDA only - MPS/CPU don't need it)
+        device_type = 'cuda' if config.device == 'cuda' else 'cpu'
+        with torch.amp.autocast(device_type, enabled=config.mixed_precision and config.device == 'cuda'):
             # Build batch dict for model - using pretrained PI05 camera names
             model_batch = {}
             if base_camera is not None:
@@ -460,6 +467,7 @@ def main():
         batch_size=config.batch_size,
         num_workers=config.num_workers,
         val_split=config.val_split,
+        device=config.device,
     )
 
     print(f"\nTrain batches: {len(train_loader)}")
@@ -490,9 +498,9 @@ def main():
         milestones=[config.warmup_steps],
     )
 
-    # Mixed precision scaler
+    # Mixed precision scaler (only for CUDA)
     # Note: PI05 computes its own loss internally, so we don't need a separate loss_fn
-    scaler = GradScaler() if config.mixed_precision else None
+    scaler = GradScaler() if (config.mixed_precision and config.device == 'cuda') else None
 
     # Resume from checkpoint
     start_epoch = 0

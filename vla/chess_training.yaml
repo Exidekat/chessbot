@@ -34,7 +34,7 @@ use_wandb: false  # Set to true to enable W&B logging
 log_every_n_steps: 10
 
 # Hardware
-device: "cuda"
+device: "mps"
 mixed_precision: true
 compile_model: false
 
