@@ -507,21 +507,31 @@ def vla_control_loop(
             if not ret1 or not ret2:
                 continue
 
-            # Apply stage overlay to global frame (matches training data format)
-            # Training uses overlayed frames, so inference must too for consistency
-            overlayed_frame = None
-            if perspective_matrix is not None:
-                overlayed_frame = apply_stage_overlay_to_frame(
-                    frame=global_frame,
-                    stage=stage,
-                    transformed_image_path=transformed_image_path,
-                    detector=detector,
-                    perspective_matrix=perspective_matrix,
-                    camera_position=camera_rotation
-                )
+            # Apply stage overlay to global frame (REQUIRED - matches training data format)
+            # Training uses overlayed frames with color conditioning, so inference MUST too
+            # DO NOT fall back to raw frame - model was trained with overlays
+            if perspective_matrix is None:
+                print("[X] FATAL: perspective_matrix is None - cannot apply overlay")
+                print("    VLA was trained with color-conditioned overlays. Cannot deploy without them.")
+                break
 
-            # Use overlayed frame for VLA input (matches training), fallback to raw if overlay fails
-            vla_input_frame = overlayed_frame if overlayed_frame is not None else global_frame
+            overlayed_frame = apply_stage_overlay_to_frame(
+                frame=global_frame,
+                stage=stage,
+                transformed_image_path=transformed_image_path,
+                detector=detector,
+                perspective_matrix=perspective_matrix,
+                camera_position=camera_rotation
+            )
+
+            if overlayed_frame is None:
+                # Overlay failed - skip this frame, don't use raw frame
+                print("[WARN] Overlay failed for frame, skipping...")
+                frame_count += 1
+                continue
+
+            # Use overlayed frame for VLA input (REQUIRED - matches training)
+            vla_input_frame = overlayed_frame
 
             # Stream to virtual camera for visualization
             if virtual_cam:
@@ -660,7 +670,13 @@ def execute_move(
     print("[OK] Board state detected")
 
     # Get perspective matrix from detector (stored during detection)
+    # This is REQUIRED for color-conditioned overlays during VLA control
     perspective_matrix = detector.perspective_matrix
+    if perspective_matrix is None:
+        print("[X] FATAL: No perspective matrix from board detection!")
+        print("    VLA requires color-conditioned overlays which need the perspective transform.")
+        print("    This usually means corner detection failed. Check debug images.")
+        return MoveResult(success=False, restart_requested=False)
 
     # Create chess board from FEN
     try:
@@ -930,8 +946,10 @@ def main():
     gripper_camera = args.gripper_camera
     print(f"[OK] Gripper camera: {gripper_camera}")
 
-    # Validate cameras work before loading model (fail fast)
+    # Validate BOTH cameras work before loading model (fail fast)
+    # Both are required: global for overlay detection, gripper for VLA input
     print("\n[INFO] Validating cameras...")
+
     test_frame = capture_720p_frame(global_camera)
     if test_frame is None:
         print(f"[X] Global camera {global_camera} not working!")
@@ -939,6 +957,15 @@ def main():
             robot_controller.disconnect()
         return 1
     print(f"[OK] Global camera validated: {test_frame.shape}")
+
+    gripper_test = capture_gripper_frame(gripper_camera)
+    if gripper_test is None:
+        print(f"[X] Gripper camera {gripper_camera} not working!")
+        print("    Both cameras are REQUIRED for VLA deployment.")
+        if robot_controller:
+            robot_controller.disconnect()
+        return 1
+    print(f"[OK] Gripper camera validated: {gripper_test.shape}")
 
     # Step 3: Initialize virtual camera for overlay streaming
     print("\n" + "=" * 60)
@@ -955,10 +982,12 @@ def main():
         if virtual_cam.start():
             print("[OK] Virtual camera started: /dev/video7")
         else:
-            print("[WARN] Virtual camera failed to start, overlays disabled")
+            print("[INFO] Virtual camera not available (visualization only)")
+            print("       Overlays are still applied to VLA input - this is OK")
             virtual_cam = None
     except Exception as e:
-        print(f"[WARN] Virtual camera not available: {e}")
+        print(f"[INFO] Virtual camera not available: {e}")
+        print("       Overlays are still applied to VLA input - this is OK")
         virtual_cam = None
 
     # Step 4: Initialize VLA model (GPU-intensive)
