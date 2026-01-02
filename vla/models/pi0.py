@@ -106,8 +106,8 @@ class PI0Model(VLAModelMixin):
         Load PI0 model from pretrained weights or checkpoint.
 
         Args:
-            checkpoint_path: Path to fine-tuned checkpoint. If None or doesn't exist,
-                           loads base weights from HuggingFace.
+            checkpoint_path: Path to fine-tuned checkpoint (.pt file with model_state_dict).
+                           If None or doesn't exist, loads base weights from HuggingFace.
             device: Device to run model on ("cuda" or "cpu").
             for_training: If True, set model to training mode.
             normalizer: ActionNormalizer for denormalizing outputs.
@@ -119,18 +119,32 @@ class PI0Model(VLAModelMixin):
         instance = cls()
         instance.device = device
 
-        # Determine which weights to load
+        # Check if we have a custom checkpoint (.pt file with model_state_dict)
+        has_custom_checkpoint = False
         if checkpoint_path and Path(checkpoint_path).exists():
-            print(f"[PI0] Loading fine-tuned checkpoint: {checkpoint_path}")
-            pretrained_path = checkpoint_path
-        else:
-            print(f"[PI0] Loading base weights from HuggingFace ({cls.DEFAULT_PRETRAINED_PATH})")
-            pretrained_path = cls.DEFAULT_PRETRAINED_PATH
+            # Check if it's our custom format (has model_state_dict key)
+            try:
+                ckpt = torch.load(checkpoint_path, map_location="cpu")
+                if "model_state_dict" in ckpt:
+                    has_custom_checkpoint = True
+                    print(f"[PI0] Found fine-tuned checkpoint: {checkpoint_path}")
+                del ckpt
+            except Exception:
+                pass
 
-        # Load PI0 policy
-        print(f"[PI0] Loading model from: {pretrained_path}")
-        instance.policy = PI05Policy.from_pretrained(pretrained_path)
+        # Always load base model architecture from HuggingFace first
+        print(f"[PI0] Loading base model from: {cls.DEFAULT_PRETRAINED_PATH}")
+        instance.policy = PI05Policy.from_pretrained(cls.DEFAULT_PRETRAINED_PATH)
         instance.policy = instance.policy.to(device)
+
+        # Load custom checkpoint weights on top of base model
+        if has_custom_checkpoint:
+            print(f"[PI0] Loading fine-tuned weights from: {checkpoint_path}")
+            ckpt = torch.load(checkpoint_path, map_location=device)
+            instance.policy.load_state_dict(ckpt["model_state_dict"])
+            epoch = ckpt.get("epoch", "?")
+            print(f"[PI0] Loaded checkpoint from epoch {epoch}")
+            del ckpt
 
         # Set training/eval mode
         if for_training:

@@ -11,6 +11,7 @@ Key features:
 - Multi-model support (PI0, SmolVLA)
 """
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -163,7 +164,12 @@ class ChessEpisodeDataset(Dataset):
             self.transform = self._default_transform()
 
     def _build_split_indices(self, split: str, val_ratio: float = 0.1):
-        """Build indices for train/val split based on episodes."""
+        """
+        Build indices for train/val split based on episodes.
+
+        Uses ceiling for validation count to ensure at least 1 episode is
+        used for validation (Leave-One-Episode-Out minimum).
+        """
         # Get episode boundaries
         episode_indices = []
         current_episode = -1
@@ -178,8 +184,16 @@ class ChessEpisodeDataset(Dataset):
         episode_indices.append(len(self.lerobot_dataset))  # End marker
 
         n_episodes = len(episode_indices) - 1
-        n_val = max(1, int(n_episodes * val_ratio))
+
+        # Use ceiling to ensure at least 1 episode for validation
+        # This implements Leave-One-Episode-Out as minimum validation
+        n_val = max(1, math.ceil(n_episodes * val_ratio))
         n_train = n_episodes - n_val
+
+        # Ensure we have at least 1 training episode
+        if n_train < 1 and n_episodes > 1:
+            n_train = 1
+            n_val = n_episodes - 1
 
         # Split by episodes (not frames) to avoid data leakage
         if split == "train":
@@ -196,7 +210,8 @@ class ChessEpisodeDataset(Dataset):
             # Use all data
             self.indices = list(range(len(self.lerobot_dataset)))
 
-        print(f"[{split}] Using {len(self.indices)} frames from {n_train if split == 'train' else n_val} episodes")
+        n_split = n_train if split == "train" else (n_val if split == "val" else n_episodes)
+        print(f"[{split}] Using {len(self.indices)} frames from {n_split} episodes")
 
     def _default_transform(self) -> T.Compose:
         """Default image preprocessing for π₀.₅."""

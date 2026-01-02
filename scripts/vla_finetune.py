@@ -133,6 +133,173 @@ def count_parameters(model: nn.Module) -> Dict[str, int]:
     }
 
 
+def find_learning_rate(
+    model: nn.Module,
+    dataloader,
+    config,
+    tokenizer=None,
+    min_lr: float = 1e-7,
+    max_lr: float = 1e-1,
+    num_steps: int = 100,
+) -> float:
+    """
+    Find optimal learning rate using the LR range test.
+
+    Gradually increases learning rate and tracks loss. The optimal LR is
+    typically where the loss decreases fastest (steepest slope).
+
+    Args:
+        model: Model to test
+        dataloader: Training dataloader
+        config: Training configuration
+        tokenizer: Tokenizer for language instructions
+        min_lr: Starting learning rate
+        max_lr: Maximum learning rate to test
+        num_steps: Number of steps to run
+
+    Returns:
+        Suggested learning rate
+    """
+    print("\n" + "=" * 60)
+    print("Learning Rate Finder")
+    print("=" * 60)
+
+    device = config.device
+    camera_keys = config.camera_keys
+
+    # Save model state to restore later
+    model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    # Create optimizer with min_lr
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=min_lr)
+
+    # LR schedule: exponential increase
+    lr_mult = (max_lr / min_lr) ** (1 / num_steps)
+
+    model.train()
+    losses = []
+    lrs = []
+    best_loss = float("inf")
+    batch_iter = iter(dataloader)
+
+    print(f"Testing LR range: {min_lr:.2e} to {max_lr:.2e}")
+
+    for step in range(num_steps):
+        # Get batch (cycle if needed)
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            batch_iter = iter(dataloader)
+            batch = next(batch_iter)
+
+        # Current learning rate
+        lr = min_lr * (lr_mult ** step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+        # Forward pass
+        optimizer.zero_grad()
+
+        observation_state = batch.get("observation.state")
+        target_action = batch.get("action")
+        language_instructions = batch.get("language_instruction", ["Move piece"])
+
+        if observation_state is not None:
+            observation_state = observation_state.to(device)
+        if target_action is not None:
+            target_action = target_action.to(device)
+
+        model_batch = {}
+        for cam_type in ['global', 'gripper', 'unused']:
+            cam_key = camera_keys[cam_type]
+            if cam_key in batch:
+                model_batch[cam_key] = batch[cam_key].to(device)
+
+        if observation_state is not None:
+            model_batch["observation.state"] = observation_state
+        if target_action is not None:
+            model_batch["action"] = target_action
+
+        if tokenizer is not None and language_instructions:
+            lang_list = [str(s) if s else "Move chess piece" for s in language_instructions]
+            tokenized = tokenizer(
+                lang_list, padding=True, truncation=True,
+                max_length=64, return_tensors="pt"
+            )
+            model_batch["observation.language.tokens"] = tokenized["input_ids"].to(device)
+            model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
+
+        try:
+            with autocast("cuda", enabled=config.mixed_precision):
+                loss, _ = model.forward(model_batch)
+
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+
+            current_loss = loss.item()
+            losses.append(current_loss)
+            lrs.append(lr)
+
+            # Stop if loss explodes
+            if current_loss > best_loss * 10:
+                print(f"  Step {step}: LR={lr:.2e}, Loss={current_loss:.4f} (stopping - loss exploded)")
+                break
+
+            if current_loss < best_loss:
+                best_loss = current_loss
+
+            if step % 20 == 0:
+                print(f"  Step {step}: LR={lr:.2e}, Loss={current_loss:.4f}")
+
+        except Exception as e:
+            print(f"  Step {step}: LR={lr:.2e}, Error: {e}")
+            break
+
+    # Restore model state
+    model.load_state_dict(model_state)
+
+    # Find optimal LR using "1/10th before explosion" heuristic
+    if len(losses) < 5:
+        print("[WARN] Not enough data points for LR finder")
+        return config.learning_rate
+
+    # Find the minimum loss and where loss starts exploding
+    min_loss = min(losses)
+    min_loss_idx = losses.index(min_loss)
+
+    # Find explosion point: where loss exceeds 2x the minimum
+    explosion_idx = len(losses) - 1
+    for i in range(min_loss_idx, len(losses)):
+        if losses[i] > min_loss * 2:
+            explosion_idx = i
+            break
+
+    # Optimal LR is typically 1/10th of the explosion LR
+    # Or equivalently, go back ~10 steps in log space
+    # We'll use the LR at about 1/3 of the way from start to explosion
+    # This is more robust than finding steepest descent
+    optimal_idx = max(1, int(explosion_idx * 0.6))  # 60% of way to explosion
+    suggested_lr = lrs[optimal_idx]
+
+    # Alternative: use LR at minimum loss point, divided by 3 for safety margin
+    min_loss_lr = lrs[min_loss_idx]
+    safe_lr = min_loss_lr / 3
+
+    # Use the more conservative of the two
+    if safe_lr < suggested_lr:
+        suggested_lr = safe_lr
+        optimal_idx = min_loss_idx
+
+    print(f"\n[LR Finder Results]")
+    print(f"  Min loss: {min_loss:.4f} at LR={lrs[min_loss_idx]:.2e} (step {min_loss_idx})")
+    print(f"  Explosion: LR={lrs[explosion_idx]:.2e} (step {explosion_idx})")
+    print(f"  Suggested: {suggested_lr:.2e}")
+
+    return suggested_lr
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -159,13 +326,20 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model: nn.Module,
+    model: Optional[nn.Module],
     optimizer: Optional[torch.optim.Optimizer],
     path: Path,
     device: str = "cuda",
 ) -> int:
     """
     Load training checkpoint.
+
+    Args:
+        model: Model to load weights into. If None, skip model loading
+               (useful when model was already loaded from checkpoint via factory).
+        optimizer: Optimizer to load state into. If None, skip optimizer loading.
+        path: Path to checkpoint file.
+        device: Device for loading.
 
     Returns:
         Starting epoch number
@@ -174,23 +348,22 @@ def load_checkpoint(
         print(f"[WARN] Checkpoint not found: {path}")
         return 0
 
-    # Load to CPU first to avoid OOM (model already on GPU)
+    # Load to CPU first to avoid OOM
     checkpoint = torch.load(path, map_location="cpu")
 
-    # Load model weights
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"[OK] Loaded model weights from: {path}")
+    # Load model weights (skip if model is None - already loaded via factory)
+    if model is not None:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(f"[OK] Loaded model weights from: {path}")
 
     # Check if training mode changed (LoRA <-> full)
     ckpt_full = checkpoint.get("full_finetuning", False)
-    current_trainable = sum(1 for p in model.parameters() if p.requires_grad)
-    ckpt_config = checkpoint.get("config", {})
 
     # Try to load optimizer state (may fail if param count changed)
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            print(f"[OK] Loaded optimizer state")
+            print(f"[OK] Loaded optimizer state from checkpoint")
         except ValueError as e:
             if "doesn't match the size" in str(e):
                 print(f"[WARN] Optimizer state incompatible (training mode changed)")
@@ -199,8 +372,11 @@ def load_checkpoint(
             else:
                 raise
 
-    # Clean up CPU checkpoint
+    # Get starting epoch
     epoch = checkpoint.get("epoch", 0) + 1
+    print(f"[OK] Resuming from epoch {epoch}")
+
+    # Clean up
     del checkpoint
 
     return epoch
@@ -450,6 +626,12 @@ Examples:
     # Full finetuning (all parameters)
     python scripts/vla_finetune.py --dataset data/lerobot_episodes/ --full
 
+    # With early stopping (stop if no improvement for 10 epochs)
+    python scripts/vla_finetune.py --dataset data/lerobot_episodes/ --early-stopping --patience 10
+
+    # Find optimal learning rate before training
+    python scripts/vla_finetune.py --dataset data/lerobot_episodes/ --find-lr
+
     # Fine-tune SmolVLA
     python scripts/vla_finetune.py --model smolvla --dataset data/lerobot_episodes/
 
@@ -483,6 +665,12 @@ Examples:
                         help="Disable Weights & Biases logging")
     parser.add_argument("--full", action="store_true",
                         help="Full finetuning (all parameters trainable, no freezing)")
+    parser.add_argument("--early-stopping", action="store_true",
+                        help="Enable early stopping when validation loss stops improving")
+    parser.add_argument("--patience", type=int, default=10,
+                        help="Early stopping patience (epochs without improvement, default: 10)")
+    parser.add_argument("--find-lr", action="store_true",
+                        help="Run learning rate finder before training")
 
     args = parser.parse_args()
 
@@ -536,6 +724,26 @@ Examples:
             print("[WARN] wandb not installed, disabling logging")
             config.use_wandb = False
 
+    # Determine checkpoint path BEFORE loading model
+    # This allows us to load directly from checkpoint instead of base weights
+    checkpoint_dir = Path(config.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_path = None
+    if args.continue_training:
+        resume_path = find_latest_checkpoint(checkpoint_dir)
+        if resume_path:
+            print(f"\n[CONTINUE] Found checkpoint: {resume_path}")
+        else:
+            print(f"\n[CONTINUE] No checkpoints found in {checkpoint_dir}, starting fresh")
+    elif args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            print(f"\n[RESUME] Using checkpoint: {resume_path}")
+        else:
+            print(f"\n[WARN] Checkpoint not found: {resume_path}, starting fresh")
+            resume_path = None
+
     # Load model
     print("\n" + "=" * 60)
     training_mode = "FULL" if args.full else "LoRA-style"
@@ -550,9 +758,10 @@ Examples:
     else:
         norm_stats_path = str(norm_stats_path)
 
-    # Load model using factory
+    # Load model using factory - pass checkpoint_path to load directly from checkpoint
     model_wrapper, tokenizer = load_vla_model(
         model_name=args.model,
+        checkpoint_path=str(resume_path) if resume_path else None,
         device=config.device,
         for_training=True,
         norm_stats_path=norm_stats_path,
@@ -604,6 +813,17 @@ Examples:
     print(f"\nImage size: {config.image_size}")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
+
+    # Run learning rate finder if requested
+    if args.find_lr:
+        suggested_lr = find_learning_rate(
+            model=model,
+            dataloader=train_loader,
+            config=config,
+            tokenizer=tokenizer,
+        )
+        print(f"\n[LR Finder] Updating learning rate: {config.learning_rate:.2e} -> {suggested_lr:.2e}")
+        config._learning_rate = suggested_lr
 
     # Create optimizer - 8-bit AdamW for PI0 (saves VRAM), standard for SmolVLA
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -660,25 +880,15 @@ Examples:
         if config.mixed_precision:
             print("[OK] Using native BFloat16 mixed precision (SmolVLA)")
 
-    # Setup checkpoint directory
-    checkpoint_dir = Path(config.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Resume from checkpoint
+    # Load optimizer state from checkpoint (model weights already loaded above)
     start_epoch = 0
-    resume_path = None
-
-    if args.continue_training:
-        resume_path = find_latest_checkpoint(checkpoint_dir)
-        if resume_path:
-            print(f"\n[CONTINUE] Found latest checkpoint: {resume_path}")
-        else:
-            print(f"\n[CONTINUE] No checkpoints found in {checkpoint_dir}, starting fresh")
-    elif args.resume:
-        resume_path = Path(args.resume)
-
     if resume_path:
-        start_epoch = load_checkpoint(model, optimizer, resume_path, config.device)
+        start_epoch = load_checkpoint(
+            model=None,  # Skip model loading - already loaded via load_vla_model
+            optimizer=optimizer,
+            path=resume_path,
+            device=config.device,
+        )
 
     # Compile model (PyTorch 2.0+)
     if config.compile_model and hasattr(torch, "compile"):
@@ -688,12 +898,17 @@ Examples:
     # Training loop
     print("\n" + "=" * 60)
     print("Starting Training")
+    if args.early_stopping:
+        print(f"  Early stopping enabled (patience={args.patience})")
     print("=" * 60)
 
     best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    final_epoch = start_epoch  # Track the last completed epoch
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start = time.time()
+        final_epoch = epoch + 1
 
         print(f"\n--- Epoch {epoch + 1}/{config.num_epochs} ---")
 
@@ -733,18 +948,28 @@ Examples:
                 checkpoint_dir / f"epoch_{epoch + 1:04d}.pt"
             )
 
-        # Save best model
+        # Save best model and track improvement
         if config.save_best and val_metrics["val_loss"] < best_val_loss:
             best_val_loss = val_metrics["val_loss"]
+            epochs_without_improvement = 0
             save_checkpoint(
                 model, optimizer, epoch + 1, val_metrics["val_loss"], config,
                 checkpoint_dir / "best.pt"
             )
             print(f"  [BEST] New best val loss: {best_val_loss:.6f}")
+        else:
+            epochs_without_improvement += 1
+            if args.early_stopping:
+                print(f"  [EARLY STOP] No improvement for {epochs_without_improvement}/{args.patience} epochs")
+
+        # Early stopping check
+        if args.early_stopping and epochs_without_improvement >= args.patience:
+            print(f"\n[EARLY STOP] Stopping training - no improvement for {args.patience} epochs")
+            break
 
     # Save final model
     save_checkpoint(
-        model, optimizer, config.num_epochs, val_metrics["val_loss"], config,
+        model, optimizer, final_epoch, val_metrics["val_loss"], config,
         checkpoint_dir / "final.pt"
     )
 
