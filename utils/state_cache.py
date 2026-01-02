@@ -84,6 +84,16 @@ class StateCache:
             print("[StateCache] Initializing with default state")
             self._initialize_default()
 
+    def refresh(self):
+        """
+        Reload cache from disk.
+
+        Use this for cross-process cache coherency when another process
+        (e.g., tele_op.py) is writing to the same cache file.
+        """
+        with self.lock:
+            self._load()
+
     def _initialize_default(self):
         """Initialize cache with default state."""
         self._state = deepcopy(self.DEFAULT_STATE)

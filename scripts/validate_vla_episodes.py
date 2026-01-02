@@ -582,7 +582,10 @@ class EpisodeValidator:
         y_offset += 15
 
         for i, jp in enumerate(joint_positions[:6]):
-            jp_val = jp if isinstance(jp, (int, float)) else 0.0
+            try:
+                jp_val = float(jp)
+            except (TypeError, ValueError):
+                jp_val = 0.0
             cv2.putText(info_panel, f"J{i}: {jp_val:6.2f}", (10, y_offset),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 255, 150), 1)
             y_offset += 12

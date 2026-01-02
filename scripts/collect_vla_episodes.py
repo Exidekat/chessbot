@@ -529,6 +529,9 @@ class EpisodeRecorder:
                 global_frame = self.global_cam_capture.get_latest_frame()
                 ret, gripper_frame = self.gripper_cam.read()
 
+                # Refresh cache from disk to get latest joint positions from tele_op.py
+                self.cache.refresh()
+
                 # Read robot state from cache (NO serial conflict!)
                 # Note: gripper is joint_5 in joint_positions
                 joint_positions = self.cache.get("robot_state.joint_positions")
