@@ -524,13 +524,13 @@ Examples:
     print("Loading Data")
     print("=" * 60)
 
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, _ = create_dataloaders(
         dataset_path=config.dataset_path,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
         val_split=config.val_split,
         image_size=config.image_size,  # Model-specific: 224 for PI0, 256 for SmolVLA
-        camera_keys=config.camera_keys,  # Model-specific camera key mapping
+        model_camera_keys=config.camera_keys,  # Model-specific camera key mapping
         state_dim=config.state_dim,  # Model-specific: 32 for PI0, 6 for SmolVLA
     )
 

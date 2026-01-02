@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """
-VLA Episode Collection Script
+VLA Episode Collection Script (LeRobot Format)
 
-Passive recording of tele-op sessions for VLA training data.
+Records tele-op sessions for VLA training in LeRobot v3.0 dataset format.
 Reads robot joint positions from state_cache.json (written by tele_op.py).
+
+Output Format:
+    LeRobot v3.0 dataset with:
+    - observation.images.global: 1280x720 global camera video
+    - observation.images.gripper: 224x224 gripper camera video
+    - observation.state: 6-DOF joint positions (radians)
+    - action: 6-DOF target joint positions
 
 Requirements:
 - tele_op.py running in another terminal (controls robot)
 - v4l2loopback loaded (for /dev/video7 virtual camera output)
 - Physical cameras connected:
-  - Global camera: WBC-0E01 at /dev/video4
-  - Gripper camera: eMeet C950 at /dev/video1
+  - Global camera: WBC-0E01
+  - Gripper camera: eMeet C950
 
 Usage:
     # Terminal 1: Start tele-op
     python scripts/tele_op.py
 
-    # Terminal 2: Start episode collection (default cameras)
-    python scripts/collect_vla_episodes.py --output data/episodes/
+    # Terminal 2: Start episode collection
+    python scripts/collect_vla_episodes.py --output data/lerobot_episodes/
 
     # With specific cameras
-    python scripts/collect_vla_episodes.py --output data/episodes/ \\
+    python scripts/collect_vla_episodes.py --output data/lerobot_episodes/ \\
         --global-camera /dev/video4 \\
-        --gripper-camera /dev/video1 \\
-        --virtual-camera /dev/video7
+        --gripper-camera /dev/video1
 """
 
 import argparse
@@ -58,13 +64,18 @@ from utils.camera_helpers import (
     select_camera,
 )
 
-# Try to import LeRobot (optional dependency)
+# Configure HuggingFace for offline/local usage
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"  # Disable HuggingFace Hub access
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+# Import LeRobot (required dependency)
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    LEROBOT_AVAILABLE = True
-except ImportError:
-    LEROBOT_AVAILABLE = False
-    print("[WARNING] LeRobot not installed. Install with: pip install lerobot")
+except ImportError as e:
+    print(f"[X] LeRobot not installed: {e}")
+    print("    Install with: pip install lerobot")
+    sys.exit(1)
 
 # Constants
 DEFAULT_FPS = 15
@@ -72,34 +83,34 @@ FRAME_INTERVAL = 1.0 / DEFAULT_FPS  # 0.0667 seconds
 POSITION_TOLERANCE_DEG = 2.0  # Degrees tolerance for position mismatch warning
 POSITION_TOLERANCE_RAD = POSITION_TOLERANCE_DEG * (np.pi / 180.0)  # ~0.0349 radians
 
-# LeRobot dataset features schema
+# LeRobot dataset features schema (v3.0 format)
+# Uses standard LeRobot naming: observation.images.*, observation.state, action
 # Note: gripper is joint_5 in joint_positions (no separate gripper_state)
 DATASET_FEATURES = {
-    "observation.global_camera": {
+    # Global camera (1280x720)
+    "observation.images.global": {
         "dtype": "video",
-        "shape": (720, 1280, 3),  # H, W, C (BGR from global camera)
+        "shape": (720, 1280, 3),  # H, W, C
         "names": ["height", "width", "channels"]
     },
-    "observation.gripper_camera": {
+    # Gripper camera (224x224)
+    "observation.images.gripper": {
         "dtype": "video",
-        "shape": (360, 640, 3),  # Gripper view (eMeet C950 actual resolution)
+        "shape": (224, 224, 3),  # H, W, C
         "names": ["height", "width", "channels"]
     },
-    "observation.joint_positions": {
+    # Robot state (6 DOF joint positions in radians)
+    "observation.state": {
         "dtype": "float32",
-        "shape": (6,),  # 6 SO-100 joints in radians (joint_5 is gripper)
+        "shape": (6,),
         "names": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
     },
+    # Action (6 DOF target joint positions)
     "action": {
         "dtype": "float32",
-        "shape": (6,),  # Copy of joint_positions (action cloning)
+        "shape": (6,),
         "names": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
     },
-    "language_instruction": {
-        "dtype": "string",
-        "shape": (1,),  # VLM prompt from move_decomposer
-        "names": None
-    }
 }
 
 
@@ -121,13 +132,12 @@ class EpisodeRecorder:
         engine_path: str = "stockfish",
         camera_rotation: str = "right",
         turn: str = "black",
-        use_lerobot: bool = True
     ):
         """
         Initialize episode recorder.
 
         Args:
-            output_dir: Directory to save episodes
+            output_dir: Directory to save episodes (LeRobot dataset)
             global_camera_device: Physical global camera device (WBC-0E01)
             gripper_camera_device: Physical gripper camera device (eMeet C950)
             virtual_camera_device: Virtual camera output device (v4l2loopback)
@@ -135,10 +145,8 @@ class EpisodeRecorder:
             engine_path: Path to UCI chess engine
             camera_rotation: Camera rotation ('top', 'right', 'bottom', 'left')
             turn: Whose turn to calculate move for ('white' or 'black')
-            use_lerobot: Whether to use LeRobot dataset format
         """
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.global_camera_device = global_camera_device
         self.gripper_camera_device = gripper_camera_device
@@ -147,7 +155,6 @@ class EpisodeRecorder:
         self.frame_interval = 1.0 / fps
         self.camera_rotation = camera_rotation
         self.turn = "w" if turn == "white" else "b"  # Normalize to single letter
-        self.use_lerobot = use_lerobot and LEROBOT_AVAILABLE
 
         # Initialize components
         self.cache = StateCache("data/state_cache.json")
@@ -182,50 +189,39 @@ class EpisodeRecorder:
         print(f"[OK] EpisodeRecorder initialized")
         print(f"     Output: {self.output_dir}")
         print(f"     FPS: {self.fps}")
-        print(f"     LeRobot: {'enabled' if self.use_lerobot else 'disabled (fallback to raw files)'}")
+        print(f"     Format: LeRobot v3.0")
 
     def _initialize_dataset(self):
         """Initialize or load LeRobot dataset."""
-        if not self.use_lerobot:
-            print("[INFO] LeRobot disabled, using raw file storage")
-            return
+        # LeRobot v3.0 uses meta/info.json
+        lerobot_meta = self.output_dir / "meta" / "info.json"
+        repo_id = f"local/chess_vla_{self.output_dir.name}"
 
-        try:
-            # LeRobot v0.4 uses meta/info.json
-            lerobot_meta = self.output_dir / "meta" / "info.json"
-            repo_id = f"local/chess_vla_{self.output_dir.name}"
+        if lerobot_meta.exists():
+            print(f"[INFO] Loading existing dataset from {self.output_dir}")
+            self.dataset = LeRobotDataset(
+                repo_id=repo_id,
+                root=str(self.output_dir),
+            )
+            self.episode_count = self.dataset.num_episodes
+        else:
+            # Handle existing directory - LeRobot.create() fails if directory exists
+            if self.output_dir.exists():
+                import shutil
+                print(f"[INFO] Removing existing directory: {self.output_dir}")
+                shutil.rmtree(self.output_dir)
 
-            if lerobot_meta.exists():
-                print(f"[INFO] Loading existing dataset from {self.output_dir}")
-                self.dataset = LeRobotDataset(
-                    repo_id=repo_id,
-                    root=str(self.output_dir),
-                    download_videos=False
-                )
-                self.episode_count = self.dataset.num_episodes
-            else:
-                # Handle existing directory - LeRobot.create() fails if directory exists
-                if self.output_dir.exists():
-                    import shutil
-                    print(f"[INFO] Removing existing directory: {self.output_dir}")
-                    shutil.rmtree(self.output_dir)
+            print(f"[INFO] Creating new LeRobot dataset at {self.output_dir}")
+            self.dataset = LeRobotDataset.create(
+                repo_id=repo_id,
+                root=str(self.output_dir),
+                fps=self.fps,
+                features=DATASET_FEATURES,
+                use_videos=True  # Enable MP4 encoding
+            )
+            self.episode_count = 0
 
-                print(f"[INFO] Creating new dataset at {self.output_dir}")
-                self.dataset = LeRobotDataset.create(
-                    repo_id=repo_id,
-                    root=str(self.output_dir),
-                    fps=self.fps,
-                    features=DATASET_FEATURES,
-                    use_videos=True  # Enable MP4 encoding
-                )
-                self.episode_count = 0
-
-            print(f"[OK] Dataset ready: {self.episode_count} existing episodes")
-
-        except Exception as e:
-            print(f"[ERROR] Failed to initialize LeRobot dataset: {e}")
-            print("[INFO] Falling back to raw file storage")
-            self.use_lerobot = False
+        print(f"[OK] Dataset ready: {self.episode_count} existing episodes")
 
     def start_cameras(self) -> bool:
         """
@@ -344,11 +340,7 @@ class EpisodeRecorder:
 
             try:
                 frames, stage_info, episode_index = item
-
-                if self.use_lerobot:
-                    self._save_episode_lerobot_impl(frames, stage_info, episode_index)
-                else:
-                    self._save_episode_raw_impl(frames, stage_info, episode_index)
+                self._save_episode_lerobot_impl(frames, stage_info, episode_index)
 
             except Exception as e:
                 print(f"[ERROR] Background save failed: {e}")
@@ -640,18 +632,28 @@ class EpisodeRecorder:
             print(f"[SAVE] Writing episode {episode_index} to LeRobot dataset...")
 
             with self.save_lock:
-                for frame_data in frames:
+                for frame_idx, frame_data in enumerate(frames):
                     # Convert BGR (OpenCV) to RGB for LeRobot video encoding
                     global_rgb = cv2.cvtColor(frame_data["global_frame"], cv2.COLOR_BGR2RGB)
                     gripper_rgb = cv2.cvtColor(frame_data["gripper_frame"], cv2.COLOR_BGR2RGB)
 
+                    # Convert numpy arrays to PIL Images for LeRobot
+                    from PIL import Image
+                    global_pil = Image.fromarray(global_rgb)
+                    gripper_pil = Image.fromarray(gripper_rgb)
+
+                    # Action: next joint position (or current for last frame)
+                    if frame_idx < len(frames) - 1:
+                        action = frames[frame_idx + 1]["joint_positions"]
+                    else:
+                        action = frame_data["joint_positions"]
+
                     self.dataset.add_frame({
-                        "observation.global_camera": global_rgb,
-                        "observation.gripper_camera": gripper_rgb,
-                        "observation.joint_positions": frame_data["joint_positions"],
-                        "action": frame_data["joint_positions"],  # Copy for action cloning
-                        "language_instruction": vlm_prompt,
-                        "task": vlm_prompt  # Required by LeRobot v0.4
+                        "observation.images.global": global_pil,
+                        "observation.images.gripper": gripper_pil,
+                        "observation.state": frame_data["joint_positions"],
+                        "action": action,
+                        "task": vlm_prompt  # Required by LeRobot
                     })
 
                 # Finalize episode (encode videos, write Parquet)
@@ -661,55 +663,6 @@ class EpisodeRecorder:
 
         except Exception as e:
             print(f"[ERROR] Failed to save episode {episode_index} to LeRobot: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _save_episode_raw_impl(self, frames: List[Dict], stage_info: Dict, episode_index: int):
-        """
-        Save single-stage episode as raw files (called from background thread).
-
-        Args:
-            frames: List of frame dictionaries for this stage
-            stage_info: Stage dictionary with 'description', 'vlm_prompt', etc.
-            episode_index: Pre-assigned episode index
-        """
-        try:
-            episode_dir = self.output_dir / f"episode_{episode_index:06d}"
-            episode_dir.mkdir(parents=True, exist_ok=True)
-
-            print(f"[SAVE] Saving episode {episode_index} to {episode_dir}...")
-
-            # Save frames as images
-            for frame_idx, frame_data in enumerate(frames):
-                cv2.imwrite(
-                    str(episode_dir / f"global_{frame_idx:06d}.png"),
-                    frame_data["global_frame"]
-                )
-                cv2.imwrite(
-                    str(episode_dir / f"gripper_{frame_idx:06d}.png"),
-                    frame_data["gripper_frame"]
-                )
-
-            # Save metadata (single-stage, single task)
-            metadata = {
-                "episode_index": episode_index,
-                "frame_count": len(frames),
-                "fps": self.fps,
-                "vlm_prompt": stage_info.get("vlm_prompt", ""),
-                "description": stage_info.get("description", ""),
-                "pickup_square": stage_info.get("pickup_square"),
-                "place_square": stage_info.get("place_square"),
-                "joint_positions": [frame["joint_positions"].tolist() for frame in frames],
-                "timestamps": [frame["timestamp"] for frame in frames]
-            }
-
-            with open(episode_dir / "metadata.json", "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            print(f"[SAVE] Episode {episode_index} saved: {len(frames)} frames")
-
-        except Exception as e:
-            print(f"[ERROR] Failed to save raw episode {episode_index}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -836,29 +789,26 @@ def main():
         epilog="""
 Examples:
     # Basic usage (requires tele_op.py running in another terminal)
-    python scripts/collect_vla_episodes.py --output data/episodes/
+    python scripts/collect_vla_episodes.py --output data/lerobot_episodes/
 
     # With specific cameras
-    python scripts/collect_vla_episodes.py --output data/episodes/ \\
+    python scripts/collect_vla_episodes.py --output data/lerobot_episodes/ \\
         --global-camera /dev/video4 \\
         --gripper-camera /dev/video1 \\
         --virtual-camera /dev/video7
 
     # Custom FPS and engine
-    python scripts/collect_vla_episodes.py --output data/episodes/ \\
+    python scripts/collect_vla_episodes.py --output data/lerobot_episodes/ \\
         --fps 30 \\
         --engine /usr/local/bin/stockfish
-
-    # Without LeRobot (raw file storage)
-    python scripts/collect_vla_episodes.py --output data/episodes/ --no-lerobot
         """
     )
 
     parser.add_argument(
         "--output",
         type=str,
-        default="data/episodes",
-        help="Output directory for episodes (default: data/episodes)"
+        default="data/lerobot_episodes",
+        help="Output directory for LeRobot dataset (default: data/lerobot_episodes)"
     )
 
     parser.add_argument(
@@ -912,19 +862,7 @@ Examples:
         help="Whose turn to calculate move for (default: black)"
     )
 
-    parser.add_argument(
-        "--no-lerobot",
-        action="store_true",
-        help="Disable LeRobot dataset format (use raw files)"
-    )
-
     args = parser.parse_args()
-
-    # Check if LeRobot is required but not available
-    if not args.no_lerobot and not LEROBOT_AVAILABLE:
-        print("[ERROR] LeRobot not installed. Install with: pip install lerobot")
-        print("[INFO] Or use --no-lerobot flag for raw file storage")
-        return 1
 
     # Camera selection: specified > auto-detect by name > prompt
     print("\n" + "=" * 60)
@@ -974,7 +912,6 @@ Examples:
         engine_path=args.engine,
         camera_rotation=args.rotation,
         turn=args.turn,
-        use_lerobot=not args.no_lerobot
     )
 
     # Run collection loop

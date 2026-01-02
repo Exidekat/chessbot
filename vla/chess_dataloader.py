@@ -1,20 +1,26 @@
 """
 Chess Episode Data Loader
 
-Loads collected episodes from LeRobot dataset format for VLA training.
-Transforms data to π₀.₅ model input format.
+Loads collected episodes from LeRobot v3.0 dataset format for VLA training.
+Transforms data to model input format (PI0, SmolVLA).
 
 Key features:
+- LeRobot v3.0 format with video storage
 - Quantile normalization of actions and states (industry practice)
 - Action chunking support (50 timesteps)
 - Multi-model support (PI0, SmolVLA)
 """
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
+
+# Configure HuggingFace for offline/local usage
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 try:
     import torch
@@ -28,22 +34,31 @@ except ImportError as e:
 from vla.normalization import ActionNormalizer
 
 try:
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
     LEROBOT_AVAILABLE = True
 except ImportError:
-    try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        LEROBOT_AVAILABLE = True
-    except ImportError:
-        LEROBOT_AVAILABLE = False
-        print("[WARN] LeRobot not available. Install with: pip install lerobot")
+    LEROBOT_AVAILABLE = False
+    print("[WARN] LeRobot not available. Install with: pip install lerobot")
 
 
-# Default camera keys for PI0 (backward compatible)
-DEFAULT_CAMERA_KEYS = {
+# Camera keys for PI0 (maps our naming to PI0's expected names)
+PI0_CAMERA_KEYS = {
     'global': 'observation.images.base_0_rgb',
     'gripper': 'observation.images.left_wrist_0_rgb',
     'unused': 'observation.images.right_wrist_0_rgb',
+}
+
+# Camera keys for SmolVLA
+SMOLVLA_CAMERA_KEYS = {
+    'global': 'observation.images.camera1',
+    'gripper': 'observation.images.camera2',
+    'unused': 'observation.images.camera3',
+}
+
+# Our dataset's camera keys (from collect_vla_episodes.py)
+DATASET_CAMERA_KEYS = {
+    'global': 'observation.images.global',
+    'gripper': 'observation.images.gripper',
 }
 
 
@@ -55,7 +70,7 @@ class ChessEpisodeDataset(Dataset):
     actions, and language instructions for VLA training.
 
     The dataset returns batches compatible with both PI0 and SmolVLA:
-    - observation.images.*: Camera view tensors (keys from camera_keys)
+    - observation.images.*: Camera view tensors (keys from model_camera_keys)
     - observation.state: Joint position tensor
     - action: Target action tensor
     - language_instruction: VLM prompt string
@@ -67,7 +82,7 @@ class ChessEpisodeDataset(Dataset):
         split: str = "train",
         transform: Optional[Any] = None,
         image_size: Tuple[int, int] = (224, 224),  # PI0: 224x224, SmolVLA: 256x256
-        camera_keys: Optional[Dict[str, str]] = None,  # Model-specific camera keys
+        model_camera_keys: Optional[Dict[str, str]] = None,  # Target model's camera keys
         state_dim: int = 32,  # PI0: 32, SmolVLA: 6
         use_global_camera: bool = True,
         use_gripper_camera: bool = True,
@@ -82,9 +97,10 @@ class ChessEpisodeDataset(Dataset):
             split: Dataset split ("train", "val", or "all")
             transform: Optional torchvision transforms for images
             image_size: Target image size for model input (default 224x224)
-            camera_keys: Model-specific camera key mapping, e.g.:
-                         PI0: {'global': 'observation.images.base_0_rgb', ...}
-                         SmolVLA: {'global': 'observation.images.camera1', ...}
+            model_camera_keys: Target model's camera key mapping, e.g.:
+                         PI0: PI0_CAMERA_KEYS
+                         SmolVLA: SMOLVLA_CAMERA_KEYS
+                         If None, uses PI0_CAMERA_KEYS as default.
             state_dim: State vector dimension (32 for PI0, 6 for SmolVLA)
             use_global_camera: Include global camera observations
             use_gripper_camera: Include gripper camera observations
@@ -95,7 +111,7 @@ class ChessEpisodeDataset(Dataset):
         self.dataset_path = Path(dataset_path)
         self.split = split
         self.image_size = image_size
-        self.camera_keys = camera_keys or DEFAULT_CAMERA_KEYS
+        self.model_camera_keys = model_camera_keys or PI0_CAMERA_KEYS
         self.state_dim = state_dim
         self.use_global_camera = use_global_camera
         self.use_gripper_camera = use_gripper_camera
@@ -202,11 +218,10 @@ class ChessEpisodeDataset(Dataset):
         Get a single training sample.
 
         Returns:
-            Dictionary with:
-                - observation.images.global_camera: (C, H, W) tensor (global camera)
-                - observation.images.gripper_camera: (C, H, W) tensor (gripper camera)
-                - observation.state: (6,) joint positions tensor
-                - action: (6,) action tensor
+            Dictionary with model-specific keys:
+                - observation.images.{model_key}: (C, H, W) tensor (cameras)
+                - observation.state: (state_dim,) joint positions tensor
+                - action: (50, 32) action chunk tensor
                 - language_instruction: str VLM prompt
         """
         # Map to dataset index
@@ -215,60 +230,37 @@ class ChessEpisodeDataset(Dataset):
 
         result = {}
 
+        # Dataset camera key -> Model camera key
+        # Dataset uses: observation.images.global, observation.images.gripper
+        # Model uses: PI0_CAMERA_KEYS or SMOLVLA_CAMERA_KEYS
+        dataset_global_key = DATASET_CAMERA_KEYS['global']  # observation.images.global
+        dataset_gripper_key = DATASET_CAMERA_KEYS['gripper']  # observation.images.gripper
+        model_global_key = self.model_camera_keys['global']
+        model_gripper_key = self.model_camera_keys['gripper']
+
         # Process global camera -> maps to model-specific key
-        # All images must be resized to self.image_size for the model
-        # PI0 uses 224x224, SmolVLA uses 256x256
-        global_key = self.camera_keys['global']
-        if self.use_global_camera and "observation.global_camera" in sample:
-            global_img = sample["observation.global_camera"]
-            if isinstance(global_img, torch.Tensor):
-                # Already tensor (C, H, W) or (H, W, C)
-                if global_img.dim() == 3 and global_img.shape[0] != 3:
-                    # (H, W, C) -> (C, H, W)
-                    global_img = global_img.permute(2, 0, 1)
-                global_img = global_img.float() / 255.0 if global_img.max() > 1.0 else global_img
-                # Resize to model input size
-                global_img = torch.nn.functional.interpolate(
-                    global_img.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
-                ).squeeze(0)
-                # Normalize
-                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                global_img = (global_img - mean) / std
-            else:
-                # Numpy array
-                global_img = self.transform(global_img)
-            result[global_key] = global_img
+        # All images resized to self.image_size (PI0: 224x224, SmolVLA: 256x256)
+        if self.use_global_camera and dataset_global_key in sample:
+            global_img = sample[dataset_global_key]
+            global_img = self._process_image(global_img)
+            result[model_global_key] = global_img
 
         # Process gripper camera -> maps to model-specific key
-        gripper_key = self.camera_keys['gripper']
-        if self.use_gripper_camera and "observation.gripper_camera" in sample:
-            gripper_img = sample["observation.gripper_camera"]
-            if isinstance(gripper_img, torch.Tensor):
-                if gripper_img.dim() == 3 and gripper_img.shape[0] != 3:
-                    gripper_img = gripper_img.permute(2, 0, 1)
-                gripper_img = gripper_img.float() / 255.0 if gripper_img.max() > 1.0 else gripper_img
-                # Resize to model input size
-                gripper_img = torch.nn.functional.interpolate(
-                    gripper_img.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
-                ).squeeze(0)
-                # Normalize
-                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                gripper_img = (gripper_img - mean) / std
-            else:
-                gripper_img = self.transform(gripper_img)
-            result[gripper_key] = gripper_img
+        if self.use_gripper_camera and dataset_gripper_key in sample:
+            gripper_img = sample[dataset_gripper_key]
+            gripper_img = self._process_image(gripper_img)
+            result[model_gripper_key] = gripper_img
 
         # Add dummy third camera - zeros for unused slot
         # This maintains compatibility with the 3-camera pretrained architecture
-        unused_key = self.camera_keys['unused']
-        result[unused_key] = torch.zeros(3, self.image_size[0], self.image_size[1])
+        if 'unused' in self.model_camera_keys:
+            unused_key = self.model_camera_keys['unused']
+            result[unused_key] = torch.zeros(3, self.image_size[0], self.image_size[1])
 
-        # Process joint positions (observation)
+        # Process joint positions (observation.state in our dataset)
         # PI0 expects 32-dim state (padded), SmolVLA expects 6-dim state
-        if "observation.joint_positions" in sample:
-            joint_pos = sample["observation.joint_positions"]
+        if "observation.state" in sample:
+            joint_pos = sample["observation.state"]
             if isinstance(joint_pos, np.ndarray):
                 joint_pos = torch.from_numpy(joint_pos).float()
             elif not isinstance(joint_pos, torch.Tensor):
@@ -282,8 +274,8 @@ class ChessEpisodeDataset(Dataset):
         # Process action (target)
         # Pretrained PI05 expects action chunks: (chunk_size, action_dim) = (50, 32)
         # We have a single 6-joint action, so we:
-        # 1. Apply quantile normalization to [-1, 1] range
-        # 2. Pad the action dimension to 32
+        # 1. Pad the action dimension to 32
+        # 2. Apply quantile normalization to [-1, 1] range
         # 3. Repeat the action 50 times (for action chunking during training)
         if "action" in sample:
             action = sample["action"]
@@ -292,22 +284,25 @@ class ChessEpisodeDataset(Dataset):
             elif not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32)
 
-            # Apply quantile normalization (industry practice)
-            # This maps actions to [-1, 1] range for stable training
-            if self.normalize_actions and self.normalizer is not None:
-                action = self.normalizer.normalize(action, key="action")
-
-            # Pad to 32 dimensions
+            # Pad to 32 dimensions first
             padded_action = torch.zeros(32)
             padded_action[:len(action)] = action
+
+            # Apply quantile normalization (industry practice)
+            # This maps actions to [-1, 1] range for stable training
+            # Note: normalization applied AFTER padding since stats were computed on padded data
+            if self.normalize_actions and self.normalizer is not None:
+                padded_action = self.normalizer.normalize(padded_action, key="action")
+
             # Repeat for action chunking (50 timesteps)
             chunk_size = 50
             action_chunk = padded_action.unsqueeze(0).repeat(chunk_size, 1)  # (50, 32)
             result["action"] = action_chunk
 
-        # Process language instruction
-        if "language_instruction" in sample:
-            lang = sample["language_instruction"]
+        # Process language instruction (from task field in LeRobot)
+        # LeRobot stores task descriptions which we use as language instructions
+        if "task" in sample:
+            lang = sample["task"]
             if isinstance(lang, (list, tuple)):
                 lang = lang[0] if lang else ""
             result["language_instruction"] = str(lang)
@@ -315,6 +310,27 @@ class ChessEpisodeDataset(Dataset):
             result["language_instruction"] = ""
 
         return result
+
+    def _process_image(self, img) -> torch.Tensor:
+        """Process image to normalized tensor."""
+        if isinstance(img, torch.Tensor):
+            # Already tensor (C, H, W) or (H, W, C)
+            if img.dim() == 3 and img.shape[0] != 3:
+                # (H, W, C) -> (C, H, W)
+                img = img.permute(2, 0, 1)
+            img = img.float() / 255.0 if img.max() > 1.0 else img
+            # Resize to model input size
+            img = torch.nn.functional.interpolate(
+                img.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
+            ).squeeze(0)
+            # ImageNet normalization
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            img = (img - mean) / std
+        else:
+            # Numpy array or PIL Image
+            img = self.transform(img)
+        return img
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -358,7 +374,7 @@ def create_dataloaders(
     num_workers: int = 4,
     val_split: float = 0.1,
     image_size: Tuple[int, int] = (224, 224),
-    camera_keys: Optional[Dict[str, str]] = None,
+    model_camera_keys: Optional[Dict[str, str]] = None,
     state_dim: int = 32,
     normalizer: Optional[ActionNormalizer] = None,
     normalize_actions: bool = True,
@@ -372,7 +388,7 @@ def create_dataloaders(
         num_workers: Number of data loading workers
         val_split: Fraction of data for validation
         image_size: Target image size
-        camera_keys: Model-specific camera key mapping (uses PI0 defaults if None)
+        model_camera_keys: Model's camera key mapping (PI0_CAMERA_KEYS or SMOLVLA_CAMERA_KEYS)
         state_dim: State vector dimension (32 for PI0, 6 for SmolVLA)
         normalizer: ActionNormalizer for quantile normalization (auto-loads if None)
         normalize_actions: Whether to apply normalization to actions
@@ -392,7 +408,7 @@ def create_dataloaders(
                 dataset_path=dataset_path,
                 split="all",
                 image_size=image_size,
-                camera_keys=camera_keys,
+                model_camera_keys=model_camera_keys,
                 state_dim=state_dim,
                 normalize_actions=False,  # Don't normalize for stats computation
             )
@@ -404,7 +420,7 @@ def create_dataloaders(
         dataset_path=dataset_path,
         split="train",
         image_size=image_size,
-        camera_keys=camera_keys,
+        model_camera_keys=model_camera_keys,
         state_dim=state_dim,
         normalizer=normalizer,
         normalize_actions=normalize_actions,
@@ -414,7 +430,7 @@ def create_dataloaders(
         dataset_path=dataset_path,
         split="val",
         image_size=image_size,
-        camera_keys=camera_keys,
+        model_camera_keys=model_camera_keys,
         state_dim=state_dim,
         normalizer=normalizer,
         normalize_actions=normalize_actions,

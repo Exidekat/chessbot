@@ -251,36 +251,119 @@ class ActionNormalizer:
         return key in self.stats
 
 
+def load_episodes_from_custom_format(dataset_path: str) -> List[Dict[str, np.ndarray]]:
+    """
+    Load episodes from custom ChessBot format (PNG files + metadata.json).
+
+    This format stores episodes as:
+        dataset_path/
+            episode_000000/
+                metadata.json  (contains joint_positions, vlm_prompt, etc.)
+                global_000000.png
+                gripper_000000.png
+                ...
+            episode_000001/
+                ...
+
+    Args:
+        dataset_path: Path to episodes directory
+
+    Returns:
+        List of dictionaries with 'action' and 'observation.joint_positions' keys
+    """
+    dataset_dir = Path(dataset_path)
+    samples = []
+
+    # Find all episode directories
+    episode_dirs = sorted(dataset_dir.glob("episode_*"))
+
+    if not episode_dirs:
+        raise ValueError(f"No episode directories found in {dataset_path}")
+
+    print(f"[NormStats] Found {len(episode_dirs)} episodes")
+
+    for ep_dir in episode_dirs:
+        metadata_path = ep_dir / "metadata.json"
+        if not metadata_path.exists():
+            print(f"[WARN] Skipping {ep_dir.name}: no metadata.json")
+            continue
+
+        # Load metadata
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+
+        # Extract joint positions (array of arrays, one per frame)
+        joint_positions = metadata.get("joint_positions", [])
+        if not joint_positions:
+            print(f"[WARN] Skipping {ep_dir.name}: no joint_positions")
+            continue
+
+        # Each frame becomes a sample
+        # For VLA training, action at frame t is joint position at frame t+1
+        # (or we can use the current position as the target for simplicity)
+        for i, jp in enumerate(joint_positions):
+            jp_array = np.array(jp, dtype=np.float32)
+
+            # Action = joint position (target position for the robot)
+            # For training, we treat current joint position as the action label
+            samples.append({
+                "action": jp_array,
+                "observation.joint_positions": jp_array,
+            })
+
+    print(f"[NormStats] Loaded {len(samples)} frames from {len(episode_dirs)} episodes")
+    return samples
+
+
 def compute_dataset_stats(
     dataset_path: str,
     output_path: Optional[str] = None,
-    feature_keys: List[str] = ["action", "observation.joint_positions"],
+    feature_keys: List[str] = ["action", "observation.state"],
 ) -> ActionNormalizer:
     """
     Convenience function to compute and save normalization statistics.
 
+    Supports both:
+    1. Custom ChessBot format (PNG files + metadata.json per episode)
+    2. LeRobot format (parquet files + HuggingFace metadata)
+
     Args:
-        dataset_path: Path to LeRobot dataset
+        dataset_path: Path to dataset directory
         output_path: Path to save stats JSON (default: dataset_path/norm_stats.json)
         feature_keys: Features to compute statistics for
 
     Returns:
         ActionNormalizer with computed statistics
     """
-    from vla.chess_dataloader import ChessEpisodeDataset
-
     if output_path is None:
         output_path = str(Path(dataset_path) / "norm_stats.json")
 
-    # Load dataset
-    dataset = ChessEpisodeDataset(
-        dataset_path=dataset_path,
-        split="all",  # Use all data for stats
-    )
+    # Check if this is custom format (has episode_* directories with metadata.json)
+    dataset_dir = Path(dataset_path)
+    episode_dirs = list(dataset_dir.glob("episode_*/metadata.json"))
+
+    if episode_dirs:
+        # Custom ChessBot format
+        print(f"[NormStats] Detected custom ChessBot format")
+        samples = load_episodes_from_custom_format(dataset_path)
+    else:
+        # Try LeRobot format
+        print(f"[NormStats] Trying LeRobot format...")
+        try:
+            from vla.chess_dataloader import ChessEpisodeDataset
+            dataset = ChessEpisodeDataset(
+                dataset_path=dataset_path,
+                split="all",
+                normalize_actions=False,  # Don't normalize during stats computation
+            )
+            # Convert to list of dicts
+            samples = [dataset[i] for i in range(len(dataset))]
+        except Exception as e:
+            raise ValueError(f"Could not load dataset: {e}")
 
     # Compute stats
     normalizer = ActionNormalizer()
-    normalizer.compute_stats(dataset, feature_keys=feature_keys)
+    normalizer.compute_stats(samples, feature_keys=feature_keys)
 
     # Save
     normalizer.save(output_path)
