@@ -35,7 +35,7 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     get_camera_index_from_device,
-    capture_1080p_downscale,
+    capture_4k_downscale,
     get_default_global_camera,
 )
 
@@ -52,7 +52,7 @@ def print_board(board: chess.Board):
 def capture_yuyv_720p(device_path, output_path):
     """
     DEPRECATED: Direct 720p YUYV capture (kept for fallback).
-    Use capture_1080p_downscale() instead for better quality.
+    Use capture_4k_downscale() instead for better quality.
 
     Capture a 1280x720 YUYV photo from the specified camera.
 
@@ -208,7 +208,7 @@ def main():
 
     # Step 1: Camera selection and photo capture
     print("=" * 60)
-    print("STAGE 1: Camera Capture (1080p MJPEG -> 720p Downscale)")
+    print("STAGE 1: Camera Capture (4K MJPEG -> 720p Downscale)")
     print("=" * 60)
 
     # Determine which camera to use: specified > auto-detect by name > prompt
@@ -249,7 +249,7 @@ def main():
     image_path = Path("data") / f"chessboard_capture_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    success = capture_1080p_downscale(device_path, image_path)
+    success = capture_4k_downscale(device_path, image_path)
     if not success:
         print("\n[X] Photo capture failed")
         return 1

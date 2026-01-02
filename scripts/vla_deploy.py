@@ -56,7 +56,7 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     get_camera_index_from_device,
-    capture_1080p_downscale,
+    capture_4k_downscale,
     get_default_global_camera,
     get_default_gripper_camera,
 )

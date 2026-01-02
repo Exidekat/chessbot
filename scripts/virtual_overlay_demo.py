@@ -48,7 +48,7 @@ from cameras.live_camera_capture import get_camera_index_from_device
 from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
-    capture_1080p_downscale,
+    capture_4k_downscale,
     get_default_global_camera,
 )
 
@@ -65,7 +65,7 @@ def print_board(board: chess.Board):
     print("=" * 40)
 
 
-# NOTE: Camera functions (get_available_cameras, select_camera, capture_1080p_downscale)
+# NOTE: Camera functions (get_available_cameras, select_camera, capture_4k_downscale)
 # imported from utils.camera_helpers
 # NOTE: rotate_square_for_camera, apply_stage_overlay_to_frame imported from guidance module
 
@@ -176,7 +176,7 @@ def main():
 
     # Step 1: Camera selection and photo capture
     print("=" * 60)
-    print("STAGE 1: Camera Capture (1080p MJPEG -> 720p Downscale)")
+    print("STAGE 1: Camera Capture (4K MJPEG -> 720p Downscale)")
     print("=" * 60)
 
     # Determine which camera to use: specified > auto-detect by name > prompt
@@ -217,7 +217,7 @@ def main():
     image_path = Path("data") / f"chessboard_capture_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    success = capture_1080p_downscale(device_path, image_path)
+    success = capture_4k_downscale(device_path, image_path)
     if not success:
         print("\n[X] Photo capture failed")
         return 1

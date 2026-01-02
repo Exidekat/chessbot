@@ -13,7 +13,7 @@ Functions:
 - get_available_cameras(): Detect all USB cameras via v4l2
 - select_camera(): Interactive camera selection prompt
 - get_camera_index_from_device(): Parse device path to OpenCV index
-- capture_1080p_downscale(): Capture 1080p MJPEG and downscale to 720p
+- capture_4k_downscale(): Capture 4K MJPEG and downscale to 720p
 """
 
 import sys
@@ -229,18 +229,18 @@ def get_camera_index_from_device(device_path: str) -> int:
         sys.exit(1)
 
 
-def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
+def capture_4k_downscale(device_path: str, output_path: Path) -> bool:
     """
-    Capture 1080p MJPEG video for 1 second, then downscale best frame to 1280x720.
+    Capture 4K MJPEG video for 1 second, then downscale best frame to 1280x720.
 
-    This approach uses the camera's 1080p MJPEG mode (which produces better quality
-    than direct 720p YUYV while being gentler on USB 2.0 bandwidth than 4K) and
-    downscales to the 720p resolution required by ChessBot's YOLO detection models.
+    This approach uses the camera's 4K MJPEG mode (which produces better quality
+    than direct 720p YUYV) and downscales to the 720p resolution required by
+    ChessBot's YOLO detection models.
 
     The function:
-    1. Configures camera to 1080p MJPEG @ 30fps via v4l2-ctl
+    1. Configures camera to 4K MJPEG @ 30fps via v4l2-ctl
     2. Captures frames for 1 second
-    3. Selects middle frame (avoids motion blur at start/end)
+    3. Selects last frame (ensures autofocus/exposure have settled)
     4. Downscales to 1280x720 using LANCZOS4 interpolation
     5. Saves as PNG
 
@@ -257,7 +257,7 @@ def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
 
     Example:
         >>> from pathlib import Path
-        >>> success = capture_1080p_downscale("/dev/video0", Path("board.png"))
+        >>> success = capture_4k_downscale("/dev/video0", Path("board.png"))
         >>> if success:
         >>>     print("Captured successfully!")
     """
@@ -265,19 +265,30 @@ def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
 
     print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
 
-    # Configure camera for MJPEG 1920x1080 (1080p)
-    print(f"[CameraCapture] Setting MJPEG 1920x1080 @ 30fps format...")
+    # Configure camera for MJPEG 3840x2160 (4K)
+    print(f"[CameraCapture] Setting MJPEG 3840x2160 @ 30fps format...")
     try:
         subprocess.run([
             "v4l2-ctl",
             f"--device={device_path}",
-            "--set-fmt-video=width=1920,height=1080,pixelformat=MJPG",
+            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
             "--set-parm=30"
         ], check=True, capture_output=True, text=True)
-        print(f"[CameraCapture] [OK] Format set to MJPEG 1920x1080 @ 30fps")
+        print(f"[CameraCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
     except subprocess.CalledProcessError as e:
         print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
         print(f"[CameraCapture] Continuing with OpenCV defaults...")
+
+    # Reset camera to consistent auto settings (in case previous runs changed them)
+    try:
+        subprocess.run([
+            "v4l2-ctl",
+            f"--device={device_path}",
+            "--set-ctrl=white_balance_automatic=1",
+            "--set-ctrl=focus_automatic_continuous=1",
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        pass  # Non-critical, continue with capture
 
     # Open camera with V4L2 backend
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
@@ -287,8 +298,8 @@ def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
         return False
 
     # Explicitly set resolution and FPS in OpenCV
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
@@ -298,12 +309,12 @@ def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
 
-    if width != 1920 or height != 1080:
-        print(f"[CameraCapture] Warning: Expected 1920x1080, got {width}x{height}")
+    if width != 3840 or height != 2160:
+        print(f"[CameraCapture] Warning: Expected 3840x2160, got {width}x{height}")
         print(f"[CameraCapture] Attempting to continue with available resolution")
 
     # Capture frames for 1 second
-    print(f"[CameraCapture] Capturing 1080p frames for 1 second...")
+    print(f"[CameraCapture] Capturing 4K frames for 1 second...")
     frames = []
     start_time = time.time()
     frame_count = 0
@@ -318,7 +329,7 @@ def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
         frames.append(frame)
         frame_count += 1
 
-    print(f"[CameraCapture] [OK] Captured {len(frames)} 1080p frames")
+    print(f"[CameraCapture] [OK] Captured {len(frames)} 4K frames")
 
     # Release camera early (before processing)
     del cap
@@ -329,10 +340,10 @@ def capture_1080p_downscale(device_path: str, output_path: Path) -> bool:
         print(f"[CameraCapture] [X] No frames captured")
         return False
 
-    # Use the middle frame (best chance of avoiding motion blur from start/end)
-    middle_idx = len(frames) // 2
-    best_frame = frames[middle_idx]
-    print(f"[CameraCapture] Using frame {middle_idx + 1}/{len(frames)} (middle frame)")
+    # Use the last frame (ensures autofocus/exposure have settled)
+    last_idx = len(frames) - 1
+    best_frame = frames[last_idx]
+    print(f"[CameraCapture] Using frame {last_idx + 1}/{len(frames)} (last frame)")
 
     # Downscale to 1280x720 using high-quality interpolation
     print(f"[CameraCapture] Downscaling from {best_frame.shape[1]}x{best_frame.shape[0]} to 1280x720...")
