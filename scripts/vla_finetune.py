@@ -645,7 +645,7 @@ Examples:
         choices=list_models(),
         help="Model type to fine-tune (default: pi0)"
     )
-    parser.add_argument("--dataset", type=str, default="data/episodes",
+    parser.add_argument("--dataset", type=str, default="data/lerobot_episodes",
                         help="Path to LeRobot dataset")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory for checkpoints (default: checkpoints/chess_{model})")
@@ -870,15 +870,11 @@ Examples:
         milestones=[config.warmup_steps],
     )
 
-    # Mixed precision scaler - only for PI0 (SmolVLA uses BFloat16 which is incompatible with GradScaler)
-    # GradScaler is only needed for float16, not bfloat16
-    if config.mixed_precision and args.model == "pi0":
-        scaler = torch.amp.GradScaler("cuda")
-        print("[OK] Using GradScaler for mixed precision (PI0)")
-    else:
-        scaler = None
-        if config.mixed_precision:
-            print("[OK] Using native BFloat16 mixed precision (SmolVLA)")
+    # Mixed precision - both PI0 and SmolVLA now use BFloat16
+    # GradScaler is NOT needed for bfloat16, only for float16
+    scaler = None
+    if config.mixed_precision:
+        print("[OK] Using native BFloat16 mixed precision")
 
     # Load optimizer state from checkpoint (model weights already loaded above)
     start_epoch = 0

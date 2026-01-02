@@ -104,6 +104,7 @@ class SmolVLAModel(VLAModelMixin):
         self._mean_tensor: Optional[torch.Tensor] = None
         self._std_tensor: Optional[torch.Tensor] = None
         self.normalizer: Optional[ActionNormalizer] = None
+        self._warned_no_normalizer: bool = False
 
     @classmethod
     def from_pretrained(
@@ -152,7 +153,7 @@ class SmolVLAModel(VLAModelMixin):
         # Load custom checkpoint weights on top of base model
         if has_custom_checkpoint:
             print(f"[SmolVLA] Loading fine-tuned weights from: {checkpoint_path}")
-            ckpt = torch.load(checkpoint_path, map_location=device)
+            ckpt = torch.load(checkpoint_path, map_location="cpu")  # Load to CPU to avoid OOM
             instance.policy.load_state_dict(ckpt["model_state_dict"])
             epoch = ckpt.get("epoch", "?")
             print(f"[SmolVLA] Loaded checkpoint from epoch {epoch}")
@@ -360,7 +361,9 @@ class SmolVLAModel(VLAModelMixin):
         else:
             # No normalizer - output is raw (may not be in valid joint range)
             predicted_joints = normalized_action
-            print("[WARN] No normalizer - using raw action output")
+            if not self._warned_no_normalizer:
+                print("[WARN] No normalizer - using raw action output (warning shown once)")
+                self._warned_no_normalizer = True
 
         # Clip to valid joint range (0 to 2*pi radians for SO-100)
         predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)

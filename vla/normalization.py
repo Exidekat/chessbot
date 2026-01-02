@@ -152,6 +152,15 @@ class ActionNormalizer:
             q01 = np.array(stats.q01, dtype=np.float32)
             q99 = np.array(stats.q99, dtype=np.float32)
 
+        # Handle dimension mismatch: truncate stats to match input dimension
+        # This happens when stats were saved with padding (e.g., 32D for PI0)
+        # but model uses fewer dimensions (e.g., 6D for SmolVLA)
+        input_dim = values.shape[-1]
+        stats_dim = len(stats.q01)
+        if input_dim < stats_dim:
+            q01 = q01[:input_dim]
+            q99 = q99[:input_dim]
+
         # Handle shape broadcasting
         # Values can be (dim,), (batch, dim), or (batch, chunk, dim)
         while q01.ndim < values.ndim:
@@ -210,6 +219,15 @@ class ActionNormalizer:
         else:
             q01 = np.array(stats.q01, dtype=np.float32)
             q99 = np.array(stats.q99, dtype=np.float32)
+
+        # Handle dimension mismatch: truncate stats to match input dimension
+        # This happens when stats were saved with padding (e.g., 32D for PI0)
+        # but model uses fewer dimensions (e.g., 6D for SmolVLA)
+        input_dim = values.shape[-1]
+        stats_dim = len(stats.q01)
+        if input_dim < stats_dim:
+            q01 = q01[:input_dim]
+            q99 = q99[:input_dim]
 
         # Handle shape broadcasting
         while q01.ndim < values.ndim:

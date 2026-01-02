@@ -326,10 +326,6 @@ class VLAWrapper:
             current_state=current_state
         )
 
-        # DEBUG: Print raw model output
-        print(f"[DEBUG] Raw model output: {result['raw_action']}")
-        print(f"[DEBUG] Current robot state: {current_state}")
-
         predicted_joints = result["joint_positions"]
 
         predicted_action = {
@@ -561,15 +557,18 @@ def vla_control_loop(
             if vla.execute_action(action, speed=0.5):
                 action_count += 1
 
-            # Print status every 30 frames
+            # Print status every 30 frames (reduced from every frame)
             if frame_count % 30 == 0:
                 elapsed = time.time() - start_time
                 hz = frame_count / elapsed if elapsed > 0 else 0
+                pred_joints = action["joint_positions"]
                 if robot_state:
-                    print(f"[VLA] Frame {frame_count}: {hz:.1f} Hz, "
-                          f"joints[0-2]=[{robot_state.joint_positions[0]:.2f}, "
-                          f"{robot_state.joint_positions[1]:.2f}, "
-                          f"{robot_state.joint_positions[2]:.2f}]")
+                    curr_joints = robot_state.joint_positions
+                    print(f"[VLA] Frame {frame_count}: {hz:.1f} Hz")
+                    print(f"  Current: [{curr_joints[0]:.2f}, {curr_joints[1]:.2f}, {curr_joints[2]:.2f}, "
+                          f"{curr_joints[3]:.2f}, {curr_joints[4]:.2f}, {curr_joints[5]:.2f}]")
+                    print(f"  Target:  [{pred_joints[0]:.2f}, {pred_joints[1]:.2f}, {pred_joints[2]:.2f}, "
+                          f"{pred_joints[3]:.2f}, {pred_joints[4]:.2f}, {pred_joints[5]:.2f}]")
 
             frame_count += 1
 
@@ -790,7 +789,7 @@ def main():
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to fine-tuned checkpoint (default: base model weights)"
+        help="Path to fine-tuned checkpoint (default: checkpoints/chess_{model}/best.pt if exists)"
     )
     parser.add_argument(
         "--global-camera",
@@ -856,8 +855,8 @@ def main():
     parser.add_argument(
         "--norm-stats",
         type=str,
-        default=None,
-        help="Path to norm_stats.json for action denormalization (e.g., data/episodes/norm_stats.json)"
+        default="data/lerobot_episodes/norm_stats.json",
+        help="Path to norm_stats.json for action denormalization (default: data/lerobot_episodes/norm_stats.json)"
     )
     parser.add_argument(
         "--chunk-execution",
@@ -872,6 +871,17 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Set default checkpoint based on model type if not specified
+    if args.checkpoint is None:
+        default_checkpoints = {
+            "pi0": "checkpoints/chess_pi0/best.pt",
+            "smolvla": "checkpoints/chess_smolvla/best.pt",
+        }
+        default_ckpt = default_checkpoints.get(args.model)
+        if default_ckpt and Path(default_ckpt).exists():
+            args.checkpoint = default_ckpt
+            print(f"[INFO] Using default checkpoint: {default_ckpt}")
 
     # Normalize turn argument to single letter for internal use
     turn_letter = "w" if args.turn == "white" else "b"
@@ -1051,6 +1061,30 @@ def main():
         chunk_execution=args.chunk_execution,
         control_freq=args.control_freq,
     )
+
+    # CRITICAL: Validate normalizer when robot is connected
+    # Without normalization, raw model outputs will send robot to dangerous positions
+    if robot_controller is not None:
+        normalizer = vla.model_wrapper.normalizer
+        if normalizer is None or not normalizer.has_stats("action"):
+            print("\n" + "=" * 60)
+            print("[X] FATAL: No action normalizer loaded!")
+            print("=" * 60)
+            print("    VLA model outputs normalized values in [-1, 1] range.")
+            print("    Without denormalization, these raw values will be sent")
+            print("    directly to the robot as joint positions, causing")
+            print("    dangerous and unpredictable movements.")
+            print()
+            print("    To fix, provide the normalization stats file:")
+            print("      --norm-stats data/lerobot_episodes/norm_stats.json")
+            print()
+            print("    The norm_stats.json file is generated during episode")
+            print("    collection and contains the min/max values for each joint.")
+            print("=" * 60)
+            robot_controller.disconnect()
+            if virtual_cam:
+                virtual_cam.stop()
+            return 1
 
     # Step 5: Initialize guidance components
     print("\n" + "=" * 60)

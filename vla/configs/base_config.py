@@ -34,8 +34,8 @@ class BaseTrainingConfig(ABC):
     num_workers: int = 4
 
     # Training (common structure, values may be overridden)
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 4  # Effective batch size = 16
+    batch_size: int = 4  # Reduced for 24GB VRAM with PI0 (~3B params)
+    gradient_accumulation_steps: int = 2  # Double effective batch size
     weight_decay: float = 0.01
     num_epochs: int = 100
     warmup_steps: int = 100

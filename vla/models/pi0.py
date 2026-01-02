@@ -92,6 +92,7 @@ class PI0Model(VLAModelMixin):
         self._mean_tensor: Optional[torch.Tensor] = None
         self._std_tensor: Optional[torch.Tensor] = None
         self.normalizer: Optional[ActionNormalizer] = None
+        self._warned_no_normalizer: bool = False
 
     @classmethod
     def from_pretrained(
@@ -135,12 +136,16 @@ class PI0Model(VLAModelMixin):
         # Always load base model architecture from HuggingFace first
         print(f"[PI0] Loading base model from: {cls.DEFAULT_PRETRAINED_PATH}")
         instance.policy = PI05Policy.from_pretrained(cls.DEFAULT_PRETRAINED_PATH)
-        instance.policy = instance.policy.to(device)
+
+        # Convert to bfloat16 for memory efficiency (13GB -> 7GB)
+        # bfloat16 is preferred over float16 for training stability
+        instance.policy = instance.policy.to(device, dtype=torch.bfloat16)
+        print(f"[PI0] Model converted to bfloat16 for memory efficiency")
 
         # Load custom checkpoint weights on top of base model
         if has_custom_checkpoint:
             print(f"[PI0] Loading fine-tuned weights from: {checkpoint_path}")
-            ckpt = torch.load(checkpoint_path, map_location=device)
+            ckpt = torch.load(checkpoint_path, map_location="cpu")  # Load to CPU to avoid OOM
             instance.policy.load_state_dict(ckpt["model_state_dict"])
             epoch = ckpt.get("epoch", "?")
             print(f"[PI0] Loaded checkpoint from epoch {epoch}")
@@ -350,7 +355,9 @@ class PI0Model(VLAModelMixin):
         else:
             # No normalizer - output is raw (may not be in valid joint range)
             predicted_joints = normalized_action
-            print("[WARN] No normalizer - using raw action output")
+            if not self._warned_no_normalizer:
+                print("[WARN] No normalizer - using raw action output (warning shown once)")
+                self._warned_no_normalizer = True
 
         # Clip to valid joint range (0 to 2*pi radians for SO-100)
         predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)
