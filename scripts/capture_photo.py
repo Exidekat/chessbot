@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
-    get_camera_index_from_device
+    get_camera_index_from_device,
+    get_default_global_camera,
 )
 
 
@@ -178,32 +179,38 @@ def main():
     # Ensure results directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Determine which camera to use
+    # Determine which camera to use: specified > auto-detect by name > prompt
     if args.device:
         # User specified device
         device_path = args.device
-        print(f"\nUsing specified device: {device_path}")
+        print(f"\n[OK] Using specified device: {device_path}")
     else:
-        # Auto-detect cameras
-        print("\nDetecting available cameras...")
-        cameras = get_available_cameras()
-
-        if not cameras:
-            print("\n✗ No cameras found!")
-            print("\nTroubleshooting:")
-            print("  1. Check camera is connected via USB")
-            print("  2. Check camera permissions: ls -l /dev/video*")
-            print("  3. Add user to video group: sudo usermod -a -G video $USER")
-            print("  4. Verify with: v4l2-ctl --list-devices")
-            return 1
-
-        if len(cameras) == 1:
-            # Auto-select single camera
-            device_path = cameras[0][0]
-            print(f"\n✓ Auto-selected camera: {device_path} - {cameras[0][1]}")
+        # Try auto-detect by name first (WBC-0E01)
+        device_path = get_default_global_camera()
+        if device_path:
+            print(f"\n[OK] Auto-detected global camera: {device_path} (WBC-0E01)")
         else:
-            # Multiple cameras - prompt user
-            device_path = select_camera(cameras)
+            # Fallback to camera selection
+            print("\nDetecting available cameras...")
+            cameras = get_available_cameras()
+
+            if not cameras:
+                print("\n[X] No cameras found!")
+                print("\nTroubleshooting:")
+                print("  1. Check camera is connected via USB")
+                print("  2. Check camera permissions: ls -l /dev/video*")
+                print("  3. Add user to video group: sudo usermod -a -G video $USER")
+                print("  4. Verify with: v4l2-ctl --list-devices")
+                return 1
+
+            if len(cameras) == 1:
+                # Auto-select single camera
+                device_path = cameras[0][0]
+                print(f"\n[OK] Auto-selected camera: {device_path} - {cameras[0][1]}")
+            else:
+                # Multiple cameras - prompt user
+                print("[WARN] WBC-0E01 not found, prompting for selection...")
+                device_path = select_camera(cameras)
 
     # Capture photo
     print("\n" + "=" * 60)

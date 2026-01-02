@@ -21,7 +21,7 @@ import subprocess
 import time
 import gc
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 try:
     import cv2
@@ -91,6 +91,63 @@ def get_available_cameras() -> List[Tuple[str, str]]:
                 cap.release()
 
     return cameras
+
+
+# Hardware constants for auto-detection
+GLOBAL_CAMERA_PREFIX = "WBC-0E01"
+GRIPPER_CAMERA_PREFIX = "HD Webcam eMeet C950"
+
+
+def find_camera_by_name(name_prefix: str) -> Optional[str]:
+    """
+    Find first camera device matching a name prefix.
+
+    Args:
+        name_prefix: Device name prefix to match (e.g., "WBC-0E01", "HD Webcam eMeet C950")
+
+    Returns:
+        Device path (e.g., "/dev/video2") or None if not found
+
+    Example:
+        >>> device = find_camera_by_name("WBC-0E01")
+        >>> if device:
+        >>>     print(f"Found WBC-0E01 at {device}")
+    """
+    cameras = get_available_cameras()
+    for device_path, device_info in cameras:
+        if device_info.startswith(name_prefix):
+            return device_path
+    return None
+
+
+def get_default_global_camera() -> Optional[str]:
+    """
+    Auto-detect global/overhead camera (WBC-0E01).
+
+    Returns:
+        Device path (e.g., "/dev/video2") or None if not found
+
+    Example:
+        >>> device = get_default_global_camera()
+        >>> if device:
+        >>>     print(f"[OK] Auto-detected global camera: {device}")
+    """
+    return find_camera_by_name(GLOBAL_CAMERA_PREFIX)
+
+
+def get_default_gripper_camera() -> Optional[str]:
+    """
+    Auto-detect gripper camera (eMeet C950).
+
+    Returns:
+        Device path (e.g., "/dev/video0") or None if not found
+
+    Example:
+        >>> device = get_default_gripper_camera()
+        >>> if device:
+        >>>     print(f"[OK] Auto-detected gripper camera: {device}")
+    """
+    return find_camera_by_name(GRIPPER_CAMERA_PREFIX)
 
 
 def select_camera(cameras: List[Tuple[str, str]]) -> str:

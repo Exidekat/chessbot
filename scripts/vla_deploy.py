@@ -56,7 +56,9 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     get_camera_index_from_device,
-    capture_1080p_downscale
+    capture_1080p_downscale,
+    get_default_global_camera,
+    get_default_gripper_camera,
 )
 from utils.keyboard_input import KeyboardInput
 from controls.robot_controller import (
@@ -725,8 +727,8 @@ def main():
     parser.add_argument(
         "--gripper-camera",
         type=str,
-        default="/dev/video0",
-        help="Gripper camera device (default: /dev/video0 - eMeet C950)"
+        default=None,
+        help="Gripper camera device (auto-detects eMeet C950 if not specified)"
     )
     parser.add_argument(
         "--engine",
@@ -862,27 +864,43 @@ def main():
     print("STAGE 2: Camera Selection")
     print("=" * 60)
 
-    # Detect cameras
-    cameras = get_available_cameras()
-    if not cameras:
-        print("[X] No cameras found!")
-        if robot_arm:
-            robot_arm.disconnect()
-        return 1
-
-    # Global camera selection
+    # Global camera selection: specified > auto-detect by name > prompt
     if args.global_camera:
         global_camera = args.global_camera
         print(f"[OK] Global camera: {global_camera} (specified)")
-    elif len(cameras) == 1:
-        global_camera = cameras[0][0]
-        print(f"[OK] Global camera: {global_camera} (auto-selected)")
     else:
-        global_camera = select_camera(cameras)
+        global_camera = get_default_global_camera()
+        if global_camera:
+            print(f"[OK] Global camera: {global_camera} (auto-detected WBC-0E01)")
+        else:
+            # Fallback to user prompt
+            cameras = get_available_cameras()
+            if not cameras:
+                print("[X] No cameras found!")
+                if robot_arm:
+                    robot_arm.disconnect()
+                return 1
+            elif len(cameras) == 1:
+                global_camera = cameras[0][0]
+                print(f"[OK] Global camera: {global_camera} (auto-selected)")
+            else:
+                print("[WARN] WBC-0E01 not found, prompting for selection...")
+                global_camera = select_camera(cameras)
 
-    # Gripper camera
-    gripper_camera = args.gripper_camera
-    print(f"[OK] Gripper camera: {gripper_camera}")
+    # Gripper camera selection: specified > auto-detect by name > error
+    if args.gripper_camera:
+        gripper_camera = args.gripper_camera
+        print(f"[OK] Gripper camera: {gripper_camera} (specified)")
+    else:
+        gripper_camera = get_default_gripper_camera()
+        if gripper_camera:
+            print(f"[OK] Gripper camera: {gripper_camera} (auto-detected eMeet C950)")
+        else:
+            print("[X] Gripper camera (eMeet C950) not found!")
+            print("    Use --gripper-camera to specify manually")
+            if robot_arm:
+                robot_arm.disconnect()
+            return 1
 
     # Validate BOTH cameras work before loading model (fail fast)
     # Both are required: global for overlay detection, gripper for VLA input

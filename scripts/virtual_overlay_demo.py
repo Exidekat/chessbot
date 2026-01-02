@@ -48,7 +48,8 @@ from cameras.live_camera_capture import get_camera_index_from_device
 from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
-    capture_1080p_downscale
+    capture_1080p_downscale,
+    get_default_global_camera,
 )
 
 from PIL import Image
@@ -178,32 +179,38 @@ def main():
     print("STAGE 1: Camera Capture (1080p MJPEG -> 720p Downscale)")
     print("=" * 60)
 
-    # Determine which camera to use
+    # Determine which camera to use: specified > auto-detect by name > prompt
     if args.global_camera:
         # User specified device
         device_path = args.global_camera
-        print(f"Using specified device: {device_path}")
+        print(f"[OK] Using specified device: {device_path}")
     else:
-        # Auto-detect cameras
-        print("Detecting available cameras...")
-        cameras = get_available_cameras()
-
-        if not cameras:
-            print("\n[X] No cameras found!")
-            print("\nTroubleshooting:")
-            print("  1. Check camera is connected via USB")
-            print("  2. Check camera permissions: ls -l /dev/video*")
-            print("  3. Add user to video group: sudo usermod -a -G video $USER")
-            print("  4. Verify with: v4l2-ctl --list-devices")
-            return 1
-
-        if len(cameras) == 1:
-            # Auto-select single camera
-            device_path = cameras[0][0]
-            print(f"[OK] Auto-selected camera: {device_path} - {cameras[0][1]}")
+        # Try auto-detect by name first (WBC-0E01)
+        device_path = get_default_global_camera()
+        if device_path:
+            print(f"[OK] Auto-detected global camera: {device_path} (WBC-0E01)")
         else:
-            # Multiple cameras - prompt user
-            device_path = select_camera(cameras)
+            # Fallback to camera selection
+            print("Detecting available cameras...")
+            cameras = get_available_cameras()
+
+            if not cameras:
+                print("\n[X] No cameras found!")
+                print("\nTroubleshooting:")
+                print("  1. Check camera is connected via USB")
+                print("  2. Check camera permissions: ls -l /dev/video*")
+                print("  3. Add user to video group: sudo usermod -a -G video $USER")
+                print("  4. Verify with: v4l2-ctl --list-devices")
+                return 1
+
+            if len(cameras) == 1:
+                # Auto-select single camera
+                device_path = cameras[0][0]
+                print(f"[OK] Auto-selected camera: {device_path} - {cameras[0][1]}")
+            else:
+                # Multiple cameras - prompt user
+                print("[WARN] WBC-0E01 not found, prompting for selection...")
+                device_path = select_camera(cameras)
 
     # Capture photo using 4K MJPEG with downscaling to 720p
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

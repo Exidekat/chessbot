@@ -50,7 +50,13 @@ from guidance import (
 from guidance.move_decomposer import decompose_move
 from utils.state_cache import StateCache
 from utils.keyboard_input import KeyboardInput
-from utils.camera_helpers import get_camera_index_from_device
+from utils.camera_helpers import (
+    get_camera_index_from_device,
+    get_default_global_camera,
+    get_default_gripper_camera,
+    get_available_cameras,
+    select_camera,
+)
 
 # Try to import LeRobot (optional dependency)
 try:
@@ -855,15 +861,15 @@ Examples:
     parser.add_argument(
         "--global-camera",
         type=str,
-        default="/dev/video4",
-        help="Physical global camera device (WBC-0E01, default: /dev/video4)"
+        default=None,
+        help="Physical global camera device (auto-detects WBC-0E01 if not specified)"
     )
 
     parser.add_argument(
         "--gripper-camera",
         type=str,
-        default="/dev/video1",
-        help="Physical gripper camera device (eMeet C950, default: /dev/video1)"
+        default=None,
+        help="Physical gripper camera device (auto-detects eMeet C950 if not specified)"
     )
 
     parser.add_argument(
@@ -917,11 +923,49 @@ Examples:
         print("[INFO] Or use --no-lerobot flag for raw file storage")
         return 1
 
+    # Camera selection: specified > auto-detect by name > prompt
+    print("\n" + "=" * 60)
+    print("Camera Selection")
+    print("=" * 60)
+
+    # Global camera
+    if args.global_camera:
+        global_camera = args.global_camera
+        print(f"[OK] Global camera: {global_camera} (specified)")
+    else:
+        global_camera = get_default_global_camera()
+        if global_camera:
+            print(f"[OK] Global camera: {global_camera} (auto-detected WBC-0E01)")
+        else:
+            cameras = get_available_cameras()
+            if not cameras:
+                print("[X] No cameras found!")
+                return 1
+            elif len(cameras) == 1:
+                global_camera = cameras[0][0]
+                print(f"[OK] Global camera: {global_camera} (auto-selected)")
+            else:
+                print("[WARN] WBC-0E01 not found, prompting for selection...")
+                global_camera = select_camera(cameras)
+
+    # Gripper camera
+    if args.gripper_camera:
+        gripper_camera = args.gripper_camera
+        print(f"[OK] Gripper camera: {gripper_camera} (specified)")
+    else:
+        gripper_camera = get_default_gripper_camera()
+        if gripper_camera:
+            print(f"[OK] Gripper camera: {gripper_camera} (auto-detected eMeet C950)")
+        else:
+            print("[X] Gripper camera (eMeet C950) not found!")
+            print("    Use --gripper-camera to specify manually")
+            return 1
+
     # Create recorder
     recorder = EpisodeRecorder(
         output_dir=args.output,
-        global_camera_device=args.global_camera,
-        gripper_camera_device=args.gripper_camera,
+        global_camera_device=global_camera,
+        gripper_camera_device=gripper_camera,
         virtual_camera_device=args.virtual_camera,
         fps=args.fps,
         engine_path=args.engine,

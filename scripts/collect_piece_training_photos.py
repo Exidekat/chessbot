@@ -21,7 +21,12 @@ from datetime import datetime
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.camera_helpers import get_camera_index_from_device
+from utils.camera_helpers import (
+    get_camera_index_from_device,
+    get_default_global_camera,
+    get_available_cameras,
+    select_camera,
+)
 
 
 def capture_training_photos(device_path, output_dir, count=30):
@@ -187,8 +192,8 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        required=True,
-        help="Camera device (e.g., /dev/video0)"
+        default=None,
+        help="Camera device (auto-detects WBC-0E01 if not specified)"
     )
     parser.add_argument(
         "--output",
@@ -205,6 +210,26 @@ def main():
 
     args = parser.parse_args()
 
+    # Camera selection: specified > auto-detect by name > prompt
+    if args.device:
+        device_path = args.device
+        print(f"[OK] Using specified device: {device_path}")
+    else:
+        device_path = get_default_global_camera()
+        if device_path:
+            print(f"[OK] Auto-detected global camera: {device_path} (WBC-0E01)")
+        else:
+            cameras = get_available_cameras()
+            if not cameras:
+                print("[X] No cameras found!")
+                return 1
+            elif len(cameras) == 1:
+                device_path = cameras[0][0]
+                print(f"[OK] Auto-selected camera: {device_path}")
+            else:
+                print("[WARN] WBC-0E01 not found, prompting for selection...")
+                device_path = select_camera(cameras)
+
     # Create output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -212,13 +237,13 @@ def main():
     print("=" * 60)
     print("Piece Detection Training Photo Collection")
     print("=" * 60)
-    print(f"Camera: {args.device}")
+    print(f"Camera: {device_path}")
     print(f"Output: {output_dir}")
     print(f"Target: {args.count} photos")
     print()
 
     # Capture photos
-    success = capture_training_photos(args.device, output_dir, args.count)
+    success = capture_training_photos(device_path, output_dir, args.count)
 
     if success:
         return 0
