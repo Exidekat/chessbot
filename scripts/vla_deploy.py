@@ -206,7 +206,14 @@ def capture_gripper_frame(device_path):
 
 
 class VLAWrapper:
-    """Unified wrapper for VLA models (PI0, SmolVLA) with SO-100 integration."""
+    """
+    Unified wrapper for VLA models (PI0, SmolVLA) with SO-100 integration.
+
+    Supports:
+    - Multi-model loading (PI0, SmolVLA)
+    - Quantile normalization/denormalization
+    - Action chunk execution (50-step trajectories)
+    """
 
     def __init__(
         self,
@@ -214,7 +221,10 @@ class VLAWrapper:
         checkpoint_path: Optional[str] = None,
         device: str = "cuda",
         robot_arm: Optional[SO100Arm] = None,
-        robot_controller: Optional[RobotController] = None
+        robot_controller: Optional[RobotController] = None,
+        norm_stats_path: Optional[str] = None,
+        chunk_execution: bool = False,
+        control_freq: float = 50.0,
     ):
         """
         Initialize VLA model.
@@ -225,24 +235,36 @@ class VLAWrapper:
             device: Device to run model on ("cuda" or "cpu")
             robot_arm: SO100Arm instance for robot control (deprecated, use robot_controller)
             robot_controller: RobotController instance for position-controlled robot
+            norm_stats_path: Path to norm_stats.json for action denormalization
+            chunk_execution: If True, execute full 50-step action chunks
+            control_freq: Control frequency in Hz (default 50 Hz for chunk execution)
         """
         self.model_name = model_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.robot_arm = robot_arm
         self.robot_controller = robot_controller
+        self.chunk_execution = chunk_execution
+        self.control_freq = control_freq
+        self.control_dt = 1.0 / control_freq
 
         print("\n" + "=" * 60)
         print(f"Loading VLA Model ({model_name.upper()})")
         print("=" * 60)
 
-        # Load model and tokenizer using factory
+        # Load model and tokenizer using factory with normalizer
         self.model_wrapper, self.tokenizer = load_vla_model(
             model_name=model_name,
             checkpoint_path=checkpoint_path,
-            device=device
+            device=device,
+            norm_stats_path=norm_stats_path,
         )
         self.policy = self.model_wrapper.policy
+
+        if norm_stats_path:
+            print(f"Normalizer: {norm_stats_path}")
+        if chunk_execution:
+            print(f"Chunk execution: ENABLED ({control_freq} Hz)")
 
         if robot_controller:
             print(f"Robot: SO-100 via RobotController (position-controlled)")
@@ -321,13 +343,23 @@ class VLAWrapper:
         """
         Execute predicted action on SO-100 arm.
 
+        If chunk_execution is enabled and action contains action_chunk,
+        executes the full 50-step trajectory at control_freq Hz.
+
         Args:
             action: Action dict from predict_action()
+                   - joint_positions: Single-step target (6D)
+                   - action_chunk: Optional 50-step trajectory (50, 6)
             speed: Movement speed (0.0-1.0)
 
         Returns:
             bool: True if execution successful
         """
+        # Check for chunk-based execution
+        if self.chunk_execution and "action_chunk" in action:
+            return self._execute_action_chunk(action["action_chunk"])
+
+        # Single-step execution (original behavior)
         # Prefer RobotController (position-controlled with continuous holding)
         if self.robot_controller:
             self.robot_controller.set_target_positions(action["joint_positions"])
@@ -344,6 +376,48 @@ class VLAWrapper:
 
         print("[VLA] No robot connected, skipping execution")
         return False
+
+    def _execute_action_chunk(self, action_chunk: np.ndarray) -> bool:
+        """
+        Execute a full action chunk (50-step trajectory).
+
+        This is the industry-standard approach used by PI0 and SmolVLA.
+        The chunk is executed at self.control_freq Hz (default 50 Hz).
+
+        Args:
+            action_chunk: Array of shape (50, 6) with target joint positions
+
+        Returns:
+            bool: True if execution successful
+        """
+        if not self.robot_controller and not self.robot_arm:
+            print("[VLA] No robot connected, skipping chunk execution")
+            return False
+
+        chunk_size = len(action_chunk)
+        print(f"[VLA] Executing {chunk_size}-step action chunk at {self.control_freq} Hz")
+
+        for step_idx, target_joints in enumerate(action_chunk):
+            step_start = time.time()
+
+            # Send target to robot
+            if self.robot_controller:
+                self.robot_controller.set_target_positions(target_joints)
+            elif self.robot_arm:
+                self.robot_arm.move_joints(
+                    target_joints,
+                    speed=1.0,  # Full speed for chunk execution
+                    blocking=False
+                )
+
+            # Maintain timing (control_dt = 1/control_freq)
+            elapsed = time.time() - step_start
+            sleep_time = self.control_dt - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        print(f"[VLA] Chunk execution complete ({chunk_size} steps)")
+        return True
 
     def get_robot_state(self) -> Optional[SO100State]:
         """Get current robot state from controller or arm."""
@@ -779,6 +853,23 @@ def main():
         action="store_true",
         help="Run without robot connection (visualization only)"
     )
+    parser.add_argument(
+        "--norm-stats",
+        type=str,
+        default=None,
+        help="Path to norm_stats.json for action denormalization (e.g., data/episodes/norm_stats.json)"
+    )
+    parser.add_argument(
+        "--chunk-execution",
+        action="store_true",
+        help="Enable 50-step action chunk execution (industry practice)"
+    )
+    parser.add_argument(
+        "--control-freq",
+        type=float,
+        default=50.0,
+        help="Control frequency in Hz for chunk execution (default: 50.0)"
+    )
 
     args = parser.parse_args()
 
@@ -955,7 +1046,10 @@ def main():
         model_name=args.model,
         checkpoint_path=args.checkpoint,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        robot_controller=robot_controller
+        robot_controller=robot_controller,
+        norm_stats_path=args.norm_stats,
+        chunk_execution=args.chunk_execution,
+        control_freq=args.control_freq,
     )
 
     # Step 5: Initialize guidance components

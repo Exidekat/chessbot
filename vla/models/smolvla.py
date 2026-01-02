@@ -3,6 +3,11 @@ SmolVLA VLA Model Implementation
 
 This module provides the SmolVLA model wrapper implementing the VLAModelBase interface.
 SmolVLA is an efficient vision-language-action model trained on the LeRobot community data.
+
+Key changes from naive implementation:
+- Uses quantile denormalization for action output (industry practice)
+- Treats model output as ABSOLUTE positions, not deltas
+- Supports action chunking
 """
 
 from typing import Dict, Any, Tuple, Optional
@@ -23,6 +28,7 @@ except ImportError as e:
 
 from .registry import register_model
 from .base import VLAModelMixin
+from vla.normalization import ActionNormalizer
 
 
 # Chess robot camera configuration for SmolVLA
@@ -97,6 +103,7 @@ class SmolVLAModel(VLAModelMixin):
         self.device: str = "cpu"
         self._mean_tensor: Optional[torch.Tensor] = None
         self._std_tensor: Optional[torch.Tensor] = None
+        self.normalizer: Optional[ActionNormalizer] = None
 
     @classmethod
     def from_pretrained(
@@ -104,6 +111,8 @@ class SmolVLAModel(VLAModelMixin):
         checkpoint_path: Optional[str] = None,
         device: str = "cuda",
         for_training: bool = False,
+        normalizer: Optional[ActionNormalizer] = None,
+        norm_stats_path: Optional[str] = None,
     ) -> "SmolVLAModel":
         """
         Load SmolVLA model from pretrained weights or checkpoint.
@@ -113,6 +122,8 @@ class SmolVLAModel(VLAModelMixin):
                            loads base weights from HuggingFace.
             device: Device to run model on ("cuda" or "cpu").
             for_training: If True, set model to training mode.
+            normalizer: ActionNormalizer for denormalizing outputs.
+            norm_stats_path: Path to norm_stats.json (used if normalizer is None).
 
         Returns:
             SmolVLAModel instance ready for inference or training.
@@ -150,6 +161,17 @@ class SmolVLAModel(VLAModelMixin):
         # Pre-compute normalization tensors
         instance._mean_tensor = torch.tensor(cls.IMAGENET_MEAN).view(3, 1, 1).to(device)
         instance._std_tensor = torch.tensor(cls.IMAGENET_STD).view(3, 1, 1).to(device)
+
+        # Setup action normalizer for denormalization during inference
+        if normalizer is not None:
+            instance.normalizer = normalizer
+            print(f"[SmolVLA] Using provided normalizer")
+        elif norm_stats_path and Path(norm_stats_path).exists():
+            instance.normalizer = ActionNormalizer(norm_stats_path)
+            print(f"[SmolVLA] Loaded normalizer from {norm_stats_path}")
+        else:
+            instance.normalizer = None
+            print(f"[SmolVLA] No normalizer loaded - model outputs will be raw (not denormalized)")
 
         return instance
 
@@ -263,16 +285,24 @@ class SmolVLAModel(VLAModelMixin):
         """
         Predict action from observation and language prompt.
 
+        SmolVLA outputs normalized action values in [-1, 1] range.
+        We denormalize to get absolute joint positions.
+
+        NOTE: Per industry practice (SmolVLA paper), the model predicts
+        ABSOLUTE joint positions, not deltas. The current_state parameter
+        is kept for compatibility but is not used for delta computation.
+
         Args:
             observation: Preprocessed observation dict from preprocess_observation()
             language_prompt: Natural language instruction
-            current_state: Current robot state for delta action computation
+            current_state: Current robot state (for reference, not used for deltas)
 
         Returns:
             Dictionary with:
-                - joint_positions: Predicted joint positions (6D)
+                - joint_positions: Predicted absolute joint positions (6D)
+                - action_chunk: Full action chunk if available
                 - confidence: Confidence score (always 1.0)
-                - raw_action: Raw model output for debugging
+                - raw_action: Raw normalized model output for debugging
         """
         # Tokenize prompt and add to observation
         token_dict = self.tokenize_prompt(language_prompt)
@@ -285,35 +315,53 @@ class SmolVLAModel(VLAModelMixin):
 
         # Extract action as numpy
         if isinstance(action_tensor, torch.Tensor):
-            action = action_tensor.cpu().numpy()
+            raw_action = action_tensor.cpu().numpy()
         else:
-            action = np.array(action_tensor)
+            raw_action = np.array(action_tensor)
 
-        # Handle batch dimension
-        if len(action.shape) > 1:
-            action = action[0]
-
-        # Get current state for delta computation
-        if current_state is not None:
-            state_6d = current_state.astype(np.float32)
+        # Handle batch and chunk dimensions
+        if len(raw_action.shape) == 3:
+            # (batch, chunk, dim) -> take first batch
+            raw_action = raw_action[0]
+        if len(raw_action.shape) == 2:
+            # (chunk, dim) -> this is an action chunk
+            action_chunk = raw_action[:, :6].astype(np.float32)
+            # Use first timestep for immediate execution
+            normalized_action = raw_action[0, :6].astype(np.float32)
         else:
-            # Extract from observation if available
-            state_tensor = observation.get("observation.state")
-            if state_tensor is not None:
-                state_6d = state_tensor.cpu().numpy()[0, :6]
-            else:
-                state_6d = np.zeros(6, dtype=np.float32)
+            # (dim,) -> single action
+            normalized_action = raw_action[:6].astype(np.float32)
+            action_chunk = None
 
-        # SmolVLA also outputs deltas (flow-matching), apply to current state
-        if len(action) >= 6:
-            action_deltas = action[:6].astype(np.float32)
-            predicted_joints = state_6d + action_deltas
-            predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)
+        # Denormalize action (from [-1, 1] to absolute joint positions)
+        # This is the industry-standard approach used by SmolVLA
+        if self.normalizer is not None and self.normalizer.has_stats("action"):
+            # Denormalize to get absolute joint positions
+            predicted_joints = self.normalizer.denormalize(
+                normalized_action, key="action"
+            )
+            if action_chunk is not None:
+                action_chunk = self.normalizer.denormalize(
+                    action_chunk, key="action"
+                )
         else:
-            predicted_joints = state_6d
+            # No normalizer - output is raw (may not be in valid joint range)
+            predicted_joints = normalized_action
+            print("[WARN] No normalizer - using raw action output")
 
-        return {
+        # Clip to valid joint range (0 to 2*pi radians for SO-100)
+        predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)
+        if action_chunk is not None:
+            action_chunk = np.clip(action_chunk, 0.0, 2 * np.pi)
+
+        result = {
             "joint_positions": predicted_joints,
             "confidence": 1.0,
-            "raw_action": action[:6] if len(action) >= 6 else action,
+            "raw_action": normalized_action,
         }
+
+        # Include full action chunk if available (for chunk-based execution)
+        if action_chunk is not None:
+            result["action_chunk"] = action_chunk
+
+        return result

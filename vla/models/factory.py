@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .registry import get_model_class, list_models
 from .base import VLAModelBase, Tokenizer
+from vla.normalization import ActionNormalizer
 
 
 def load_vla_model(
@@ -16,6 +17,8 @@ def load_vla_model(
     checkpoint_path: Optional[str] = None,
     device: str = "cuda",
     for_training: bool = False,
+    normalizer: Optional[ActionNormalizer] = None,
+    norm_stats_path: Optional[str] = None,
 ) -> Tuple[VLAModelBase, Tokenizer]:
     """
     Factory function to load any registered VLA model.
@@ -25,6 +28,7 @@ def load_vla_model(
     - Checkpoint loading (fine-tuned or base weights)
     - Device placement
     - Tokenizer initialization
+    - Action normalizer loading for proper denormalization
 
     Args:
         model_name: Model type identifier. Options: "pi0", "smolvla".
@@ -33,6 +37,8 @@ def load_vla_model(
                         loads base weights from HuggingFace.
         device: Device to run model on ("cuda" or "cpu"). Default: "cuda".
         for_training: If True, set model to training mode. If False, eval mode.
+        normalizer: ActionNormalizer for denormalizing model outputs.
+        norm_stats_path: Path to norm_stats.json (used if normalizer is None).
 
     Returns:
         Tuple of (model_wrapper, tokenizer):
@@ -43,8 +49,12 @@ def load_vla_model(
         ValueError: If model_name is not registered
 
     Example:
-        >>> # Load PI0 for inference
-        >>> model, tokenizer = load_vla_model("pi0", device="cuda")
+        >>> # Load PI0 for inference with normalizer
+        >>> model, tokenizer = load_vla_model(
+        ...     "pi0",
+        ...     device="cuda",
+        ...     norm_stats_path="data/episodes/norm_stats.json"
+        ... )
         >>> action = model.predict_action(obs, "Pick up the pawn")
 
         >>> # Load SmolVLA for training
@@ -53,7 +63,8 @@ def load_vla_model(
         >>> # Load fine-tuned checkpoint
         >>> model, tokenizer = load_vla_model(
         ...     "pi0",
-        ...     checkpoint_path="checkpoints/chess_pi0/best.pt"
+        ...     checkpoint_path="checkpoints/chess_pi0/best.pt",
+        ...     norm_stats_path="data/episodes/norm_stats.json"
         ... )
 
         >>> # List available models
@@ -79,6 +90,8 @@ def load_vla_model(
         checkpoint_path=checkpoint_path,
         device=device,
         for_training=for_training,
+        normalizer=normalizer,
+        norm_stats_path=norm_stats_path,
     )
 
     # Return model and tokenizer

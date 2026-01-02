@@ -102,23 +102,23 @@ class RobotController:
     # Joint 1 (Shoulder) - prone to oscillation, fights gravity
     JOINT_1_DEADBAND = 0.0           # no deadband (gravity-fighting)
     JOINT_1_SMOOTHING_ALPHA = 1.0    # Low-pass filter (20% new target) (disabled)
-    JOINT_1_SPEED_LIMIT = 500        # steps/sec
+    JOINT_1_SPEED_LIMIT = 1000        # steps/sec
     JOINT_1_ACCEL = 50               # acceleration limit
     JOINT_1_TORQUE = 300            # 30% max torque
 
     # Joint 2 (Elbow) - stable, no dampening needed
     JOINT_2_DEADBAND = 0.0           # no deadband
     JOINT_2_SMOOTHING_ALPHA = 1.0    # no smoothing (100% new target)
-    JOINT_2_SPEED_LIMIT = 1000       # steps/sec
+    JOINT_2_SPEED_LIMIT = 1500       # steps/sec
     JOINT_2_ACCEL = 0              # acceleration limit
     JOINT_2_TORQUE = 200            # 20% max torque
 
     # Joint 3 (Wrist Pitch) - stable, no dampening needed
     JOINT_3_DEADBAND = 0.0           # no deadband
     JOINT_3_SMOOTHING_ALPHA = 1.0    # no smoothing
-    JOINT_3_SPEED_LIMIT = 1000       # steps/sec
-    JOINT_3_ACCEL = 100              # acceleration limit
-    JOINT_3_TORQUE = 200            # 20% max torque
+    JOINT_3_SPEED_LIMIT = 1500       # steps/sec
+    JOINT_3_ACCEL = 0              # acceleration limit
+    JOINT_3_TORQUE = 100            # 10% max torque
 
     # Joint 4 (Wrist Roll) - stable, no dampening needed
     JOINT_4_DEADBAND = 0.0           # no deadband
@@ -249,6 +249,9 @@ class RobotController:
         """
         Disable torque on all motors with retry logic.
 
+        Also zeros torque limits to minimize residual resistance from
+        the servo's internal controller (important for leader arm feel).
+
         Returns:
             bool: True if torque was successfully released
         """
@@ -258,8 +261,25 @@ class RobotController:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Send torque disable command to each motor
+                # Send torque disable and zero torque limit for each motor
                 for motor_id in self.arm.MOTOR_IDS:
+                    # First, set torque limit to 0 (register 0x30, 2 bytes)
+                    # This minimizes any residual holding force
+                    packet = [
+                        *self.arm.HEADER,
+                        motor_id,
+                        0x05,  # Length: 2 byte data
+                        self.arm.INSTR_WRITE,
+                        0x30,  # Torque Limit register
+                        0x00,  # Low byte = 0
+                        0x00   # High byte = 0
+                    ]
+                    checksum = self.arm._calculate_checksum(packet[2:])
+                    packet.append(checksum)
+                    self.arm.serial.write(bytes(packet))
+                    time.sleep(0.005)
+
+                    # Then disable torque enable flag (register 0x28)
                     packet = [
                         *self.arm.HEADER,
                         motor_id,
@@ -274,7 +294,7 @@ class RobotController:
                     time.sleep(0.005)
 
                 self.torque_enabled = False
-                print(f"[{self.port}] Torque released")
+                print(f"[{self.port}] Torque released (limit zeroed)")
                 return True
 
             except Exception as e:

@@ -3,6 +3,11 @@ Chess Episode Data Loader
 
 Loads collected episodes from LeRobot dataset format for VLA training.
 Transforms data to π₀.₅ model input format.
+
+Key features:
+- Quantile normalization of actions and states (industry practice)
+- Action chunking support (50 timesteps)
+- Multi-model support (PI0, SmolVLA)
 """
 
 import sys
@@ -18,6 +23,9 @@ try:
 except ImportError as e:
     print(f"[X] Failed to import torch: {e}")
     sys.exit(1)
+
+# Import normalization utilities
+from vla.normalization import ActionNormalizer
 
 try:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -63,13 +71,15 @@ class ChessEpisodeDataset(Dataset):
         state_dim: int = 32,  # PI0: 32, SmolVLA: 6
         use_global_camera: bool = True,
         use_gripper_camera: bool = True,
+        normalizer: Optional[ActionNormalizer] = None,  # For quantile normalization
+        normalize_actions: bool = True,  # Apply normalization to actions
     ):
         """
         Initialize chess episode dataset.
 
         Args:
             dataset_path: Path to LeRobot dataset directory
-            split: Dataset split ("train" or "val")
+            split: Dataset split ("train", "val", or "all")
             transform: Optional torchvision transforms for images
             image_size: Target image size for model input (default 224x224)
             camera_keys: Model-specific camera key mapping, e.g.:
@@ -78,6 +88,9 @@ class ChessEpisodeDataset(Dataset):
             state_dim: State vector dimension (32 for PI0, 6 for SmolVLA)
             use_global_camera: Include global camera observations
             use_gripper_camera: Include gripper camera observations
+            normalizer: ActionNormalizer instance for quantile normalization.
+                       If None, loads from dataset_path/norm_stats.json if exists.
+            normalize_actions: Whether to apply normalization to actions
         """
         self.dataset_path = Path(dataset_path)
         self.split = split
@@ -86,6 +99,22 @@ class ChessEpisodeDataset(Dataset):
         self.state_dim = state_dim
         self.use_global_camera = use_global_camera
         self.use_gripper_camera = use_gripper_camera
+        self.normalize_actions = normalize_actions
+
+        # Setup normalizer
+        if normalizer is not None:
+            self.normalizer = normalizer
+        else:
+            # Try to load from dataset directory
+            stats_path = self.dataset_path / "norm_stats.json"
+            if stats_path.exists():
+                self.normalizer = ActionNormalizer(str(stats_path))
+                print(f"[OK] Loaded normalization stats from {stats_path}")
+            else:
+                self.normalizer = None
+                if normalize_actions:
+                    print(f"[WARN] No norm_stats.json found at {stats_path}")
+                    print(f"       Run: python -m vla.normalization --dataset {dataset_path}")
 
         if not LEROBOT_AVAILABLE:
             raise ImportError("LeRobot is required. Install with: pip install lerobot")
@@ -253,14 +282,21 @@ class ChessEpisodeDataset(Dataset):
         # Process action (target)
         # Pretrained PI05 expects action chunks: (chunk_size, action_dim) = (50, 32)
         # We have a single 6-joint action, so we:
-        # 1. Pad the action dimension to 32
-        # 2. Repeat the action 50 times (for action chunking during training)
+        # 1. Apply quantile normalization to [-1, 1] range
+        # 2. Pad the action dimension to 32
+        # 3. Repeat the action 50 times (for action chunking during training)
         if "action" in sample:
             action = sample["action"]
             if isinstance(action, np.ndarray):
                 action = torch.from_numpy(action).float()
             elif not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32)
+
+            # Apply quantile normalization (industry practice)
+            # This maps actions to [-1, 1] range for stable training
+            if self.normalize_actions and self.normalizer is not None:
+                action = self.normalizer.normalize(action, key="action")
+
             # Pad to 32 dimensions
             padded_action = torch.zeros(32)
             padded_action[:len(action)] = action
@@ -324,7 +360,9 @@ def create_dataloaders(
     image_size: Tuple[int, int] = (224, 224),
     camera_keys: Optional[Dict[str, str]] = None,
     state_dim: int = 32,
-) -> Tuple[DataLoader, DataLoader]:
+    normalizer: Optional[ActionNormalizer] = None,
+    normalize_actions: bool = True,
+) -> Tuple[DataLoader, DataLoader, Optional[ActionNormalizer]]:
     """
     Create train and validation dataloaders.
 
@@ -336,16 +374,40 @@ def create_dataloaders(
         image_size: Target image size
         camera_keys: Model-specific camera key mapping (uses PI0 defaults if None)
         state_dim: State vector dimension (32 for PI0, 6 for SmolVLA)
+        normalizer: ActionNormalizer for quantile normalization (auto-loads if None)
+        normalize_actions: Whether to apply normalization to actions
 
     Returns:
-        Tuple of (train_loader, val_loader)
+        Tuple of (train_loader, val_loader, normalizer)
     """
+    # Load or create normalizer (shared between train/val)
+    if normalizer is None and normalize_actions:
+        stats_path = Path(dataset_path) / "norm_stats.json"
+        if stats_path.exists():
+            normalizer = ActionNormalizer(str(stats_path))
+        else:
+            print(f"[WARN] norm_stats.json not found. Computing statistics...")
+            # Compute stats from training data
+            temp_dataset = ChessEpisodeDataset(
+                dataset_path=dataset_path,
+                split="all",
+                image_size=image_size,
+                camera_keys=camera_keys,
+                state_dim=state_dim,
+                normalize_actions=False,  # Don't normalize for stats computation
+            )
+            normalizer = ActionNormalizer()
+            normalizer.compute_stats(temp_dataset)
+            normalizer.save(str(stats_path))
+
     train_dataset = ChessEpisodeDataset(
         dataset_path=dataset_path,
         split="train",
         image_size=image_size,
         camera_keys=camera_keys,
         state_dim=state_dim,
+        normalizer=normalizer,
+        normalize_actions=normalize_actions,
     )
 
     val_dataset = ChessEpisodeDataset(
@@ -354,6 +416,8 @@ def create_dataloaders(
         image_size=image_size,
         camera_keys=camera_keys,
         state_dim=state_dim,
+        normalizer=normalizer,
+        normalize_actions=normalize_actions,
     )
 
     train_loader = DataLoader(
@@ -376,7 +440,7 @@ def create_dataloaders(
         drop_last=False,
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, normalizer
 
 
 if __name__ == "__main__":
