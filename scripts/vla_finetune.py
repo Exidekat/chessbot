@@ -3,14 +3,17 @@
 VLA Finetuning Script - Multi-Model Support
 
 Fine-tune PI0 or SmolVLA on collected chess robot episodes using LoRA-style training
-(freeze vision encoder, train action head).
+(freeze vision encoder, train action head) or full finetuning (all parameters).
 
 Usage:
-    # Fine-tune PI0 (default)
-    python scripts/vla_finetune.py --dataset data/episodes/
+    # Fine-tune PI0 with LoRA-style training (default - freezes vision/language)
+    python scripts/vla_finetune.py --dataset data/lerobot_episodes/
+
+    # Full finetuning (all parameters trainable)
+    python scripts/vla_finetune.py --dataset data/lerobot_episodes/ --full
 
     # Fine-tune SmolVLA
-    python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
+    python scripts/vla_finetune.py --model smolvla --dataset data/lerobot_episodes/
 
     # With config file
     python scripts/vla_finetune.py --model pi0 --config vla/chess_training.yaml
@@ -22,7 +25,7 @@ Usage:
     python scripts/vla_finetune.py --model smolvla --resume checkpoints/chess_smolvla/epoch_0050.pt
 
 Requirements:
-    - GPU with >22GB VRAM for LoRA finetuning
+    - GPU with >22GB VRAM for LoRA finetuning, >40GB for full finetuning
     - Collected episodes in LeRobot format (via collect_vla_episodes.py)
     - LeRobot dependencies installed
 """
@@ -98,6 +101,26 @@ def freeze_language_backbone(model: nn.Module) -> int:
     return frozen_count
 
 
+def unfreeze_all_params(model: nn.Module) -> int:
+    """
+    Unfreeze all model parameters for full finetuning.
+
+    Args:
+        model: VLA model
+
+    Returns:
+        Number of unfrozen parameters
+    """
+    unfrozen_count = 0
+
+    for param in model.parameters():
+        if not param.requires_grad:
+            param.requires_grad = True
+            unfrozen_count += param.numel()
+
+    return unfrozen_count
+
+
 def count_parameters(model: nn.Module) -> Dict[str, int]:
     """Count total and trainable parameters."""
     total = sum(p.numel() for p in model.parameters())
@@ -128,6 +151,7 @@ def save_checkpoint(
         "loss": loss,
         "config": config.to_dict(),
         "model_name": config.model_name,
+        "full_finetuning": not (config.freeze_vision_encoder or config.freeze_language_encoder),
     }
 
     torch.save(checkpoint, path)
@@ -153,12 +177,27 @@ def load_checkpoint(
     # Load to CPU first to avoid OOM (model already on GPU)
     checkpoint = torch.load(path, map_location="cpu")
 
+    # Load model weights
     model.load_state_dict(checkpoint["model_state_dict"])
     print(f"[OK] Loaded model weights from: {path}")
 
+    # Check if training mode changed (LoRA <-> full)
+    ckpt_full = checkpoint.get("full_finetuning", False)
+    current_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    ckpt_config = checkpoint.get("config", {})
+
+    # Try to load optimizer state (may fail if param count changed)
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        print(f"[OK] Loaded optimizer state")
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print(f"[OK] Loaded optimizer state")
+        except ValueError as e:
+            if "doesn't match the size" in str(e):
+                print(f"[WARN] Optimizer state incompatible (training mode changed)")
+                print(f"       Checkpoint was {'full' if ckpt_full else 'LoRA-style'} finetuning")
+                print(f"       Starting with fresh optimizer state")
+            else:
+                raise
 
     # Clean up CPU checkpoint
     epoch = checkpoint.get("epoch", 0) + 1
@@ -405,11 +444,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Fine-tune PI0 (default)
-    python scripts/vla_finetune.py --dataset data/episodes/
+    # Fine-tune PI0 with LoRA-style training (default)
+    python scripts/vla_finetune.py --dataset data/lerobot_episodes/
+
+    # Full finetuning (all parameters)
+    python scripts/vla_finetune.py --dataset data/lerobot_episodes/ --full
 
     # Fine-tune SmolVLA
-    python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
+    python scripts/vla_finetune.py --model smolvla --dataset data/lerobot_episodes/
 
     # Continue from latest checkpoint
     python scripts/vla_finetune.py --model pi0 --continue
@@ -439,6 +481,8 @@ Examples:
                         help="Override learning rate")
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable Weights & Biases logging")
+    parser.add_argument("--full", action="store_true",
+                        help="Full finetuning (all parameters trainable, no freezing)")
 
     args = parser.parse_args()
 
@@ -463,6 +507,10 @@ Examples:
         config._learning_rate = args.lr
     if args.no_wandb:
         config.use_wandb = False
+    if args.full:
+        # Full finetuning: disable all freezing
+        config.freeze_vision_encoder = False
+        config.freeze_language_encoder = False
 
     # Validate configuration
     errors = config.validate()
@@ -490,27 +538,46 @@ Examples:
 
     # Load model
     print("\n" + "=" * 60)
-    print(f"Loading Model ({args.model.upper()})")
+    training_mode = "FULL" if args.full else "LoRA-style"
+    print(f"Loading Model ({args.model.upper()}) - {training_mode} finetuning")
     print("=" * 60)
+
+    # Build norm_stats_path from dataset path
+    norm_stats_path = Path(config.dataset_path) / "norm_stats.json"
+    if not norm_stats_path.exists():
+        norm_stats_path = None
+        print(f"[WARN] No norm_stats.json found in dataset - model will not have normalizer")
+    else:
+        norm_stats_path = str(norm_stats_path)
 
     # Load model using factory
     model_wrapper, tokenizer = load_vla_model(
         model_name=args.model,
         device=config.device,
         for_training=True,
+        norm_stats_path=norm_stats_path,
     )
 
     # Get the underlying policy for training
     model = model_wrapper.policy
 
-    # Freeze backbones for LoRA-style training
-    if config.freeze_vision_encoder:
-        frozen_vision = freeze_vision_backbone(model)
-        print(f"[OK] Froze vision encoder ({frozen_vision:,} parameters)")
+    # Handle parameter freezing based on training mode
+    if args.full:
+        # Full finetuning: unfreeze ALL parameters (some models freeze by default)
+        unfrozen = unfreeze_all_params(model)
+        if unfrozen > 0:
+            print(f"[OK] Unfroze {unfrozen:,} parameters for full finetuning")
+        else:
+            print("[OK] Full finetuning enabled - all parameters already trainable")
+    else:
+        # LoRA-style: freeze vision and/or language encoders
+        if config.freeze_vision_encoder:
+            frozen_vision = freeze_vision_backbone(model)
+            print(f"[OK] Froze vision encoder ({frozen_vision:,} parameters)")
 
-    if config.freeze_language_encoder:
-        frozen_lang = freeze_language_backbone(model)
-        print(f"[OK] Froze language encoder ({frozen_lang:,} parameters)")
+        if config.freeze_language_encoder:
+            frozen_lang = freeze_language_backbone(model)
+            print(f"[OK] Froze language encoder ({frozen_lang:,} parameters)")
 
     # Count parameters
     param_counts = count_parameters(model)
