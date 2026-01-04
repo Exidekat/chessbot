@@ -2,9 +2,10 @@
 # Upload ChessBot LeRobot dataset to HuggingFace Hub
 #
 # Usage:
-#   ./scripts/upload_lerobot_dataset.sh                    # Upload to default repo
-#   ./scripts/upload_lerobot_dataset.sh --repo user/name   # Upload to custom repo
-#   ./scripts/upload_lerobot_dataset.sh --dry-run          # Preview without uploading
+#   ./scripts/upload_lerobot_dataset.sh                                    # Upload default dataset
+#   ./scripts/upload_lerobot_dataset.sh --dataset data/clean_lerobot_episodes  # Upload cleaned dataset
+#   ./scripts/upload_lerobot_dataset.sh --repo user/name                   # Upload to custom repo
+#   ./scripts/upload_lerobot_dataset.sh --dry-run                          # Preview without uploading
 #
 # Prerequisites:
 #   - huggingface-cli login (or HF_TOKEN environment variable)
@@ -14,16 +15,21 @@ set -e
 
 # Default configuration
 DEFAULT_REPO="exidekat/chessbot-lerobot"
-DATASET_PATH="data/lerobot_episodes"
+DEFAULT_DATASET="data/lerobot_episodes"
 REPO_TYPE="dataset"
 
 # Parse arguments
 REPO_ID="$DEFAULT_REPO"
+DATASET_PATH="$DEFAULT_DATASET"
 DRY_RUN=false
 PRIVATE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --dataset)
+            DATASET_PATH="$2"
+            shift 2
+            ;;
         --repo)
             REPO_ID="$2"
             shift 2
@@ -42,6 +48,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
+            echo "  --dataset PATH    Dataset path (default: $DEFAULT_DATASET)"
             echo "  --repo REPO_ID    HuggingFace repo (default: $DEFAULT_REPO)"
             echo "  --dry-run         Preview files without uploading"
             echo "  --private         Create private repository"

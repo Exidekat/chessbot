@@ -167,8 +167,20 @@ python scripts/validate_vla_episodes.py --dataset data/episodes/ --no-lerobot
 # Convert collected episodes to LeRobot format (required before finetuning)
 python scripts/convert_to_lerobot.py --input data/episodes/ --output data/lerobot_episodes/
 
-# Upload dataset to HuggingFace (default repo: exidekat/chessbot-lerobot)
+# Clean dataset by removing consecutive static frames (reduces dataset size ~25-30%)
+python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output data/clean_lerobot_episodes/
+
+# Preview cleaning without creating output (dry run)
+python scripts/clean_lerobot_dataset.py --dry-run
+
+# Clean with custom tolerance (default: 0.005 radians)
+python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output data/clean_lerobot_episodes/ --tolerance 0.01
+
+# Upload default dataset to HuggingFace (repo: exidekat/chessbot-lerobot)
 ./scripts/upload_lerobot_dataset.sh
+
+# Upload cleaned dataset to HuggingFace
+./scripts/upload_lerobot_dataset.sh --dataset data/clean_lerobot_episodes/
 
 # Upload dataset to custom HuggingFace repository
 ./scripts/upload_lerobot_dataset.sh --repo myuser/my-chess-dataset
@@ -177,7 +189,7 @@ python scripts/convert_to_lerobot.py --input data/episodes/ --output data/lerobo
 ./scripts/upload_lerobot_dataset.sh --dry-run
 
 # Upload as private repository
-./scripts/upload_lerobot_dataset.sh --private
+./scripts/upload_lerobot_dataset.sh --dataset data/clean_lerobot_episodes/ --private
 
 ## VLA Finetuning (Multi-Model: PI0, SmolVLA)
 
