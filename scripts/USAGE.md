@@ -162,13 +162,30 @@ python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/e
 # Force raw file mode (disable LeRobot)
 python scripts/validate_vla_episodes.py --dataset data/episodes/ --no-lerobot
 
+## LeRobot Dataset Management
+
+# Convert collected episodes to LeRobot format (required before finetuning)
+python scripts/convert_to_lerobot.py --input data/episodes/ --output data/lerobot_episodes/
+
+# Upload dataset to HuggingFace (default repo: exidekat/chessbot-lerobot)
+./scripts/upload_lerobot_dataset.sh
+
+# Upload dataset to custom HuggingFace repository
+./scripts/upload_lerobot_dataset.sh --repo myuser/my-chess-dataset
+
+# Preview upload without actually uploading (dry run)
+./scripts/upload_lerobot_dataset.sh --dry-run
+
+# Upload as private repository
+./scripts/upload_lerobot_dataset.sh --private
+
 ## VLA Finetuning (Multi-Model: PI0, SmolVLA)
 
 # Fine-tune PI0 model on collected episodes (default)
-python scripts/vla_finetune.py --dataset data/episodes/
+python scripts/vla_finetune.py --dataset data/lerobot_episodes/
 
 # Fine-tune SmolVLA model on collected episodes
-python scripts/vla_finetune.py --model smolvla --dataset data/episodes/
+python scripts/vla_finetune.py --model smolvla --dataset data/lerobot_episodes/
 
 # Fine-tune with custom output directory
 python scripts/vla_finetune.py --model pi0 --output checkpoints/my_chess_pi0/
