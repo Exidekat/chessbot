@@ -173,8 +173,8 @@ python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output 
 # Preview cleaning without creating output (dry run)
 python scripts/clean_lerobot_dataset.py --dry-run
 
-# Clean with custom tolerance (default: 0.005 radians)
-python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output data/clean_lerobot_episodes/ --tolerance 0.01
+# Clean with custom tolerance (default: 0.01 radians)
+python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output data/clean_lerobot_episodes/ --tolerance 0.005
 
 # Upload default dataset to HuggingFace (repo: exidekat/chessbot-lerobot)
 ./scripts/upload_lerobot_dataset.sh

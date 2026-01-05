@@ -170,20 +170,32 @@ class ChessEpisodeDataset(Dataset):
         Uses ceiling for validation count to ensure at least 1 episode is
         used for validation (Leave-One-Episode-Out minimum).
         """
-        # Get episode boundaries
+        # Get episode boundaries from metadata (fast - no video decoding needed)
+        # LeRobot stores dataset_from_index and dataset_to_index per episode
         episode_indices = []
-        current_episode = -1
 
-        for idx in range(len(self.lerobot_dataset)):
-            sample = self.lerobot_dataset[idx]
-            ep_idx = sample.get("episode_index", 0)
-            if ep_idx != current_episode:
-                episode_indices.append(idx)
-                current_episode = ep_idx
-
-        episode_indices.append(len(self.lerobot_dataset))  # End marker
-
-        n_episodes = len(episode_indices) - 1
+        try:
+            # Use episode metadata for fast boundary lookup
+            n_episodes = self.lerobot_dataset.meta.total_episodes
+            for ep_idx in range(n_episodes):
+                ep_meta = self.lerobot_dataset.meta.episodes[ep_idx]
+                from_idx = ep_meta.get("dataset_from_index", 0)
+                episode_indices.append(from_idx)
+            episode_indices.append(len(self.lerobot_dataset))  # End marker
+        except (AttributeError, KeyError):
+            # Fallback: scan parquet data (still fast, no video decoding)
+            import pyarrow.parquet as pq
+            data_dir = self.dataset_path / "data"
+            all_indices = []
+            for pq_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
+                df = pq.read_table(pq_file, columns=["episode_index", "index"]).to_pandas()
+                for ep_idx in df["episode_index"].unique():
+                    ep_df = df[df["episode_index"] == ep_idx]
+                    all_indices.append((ep_idx, ep_df["index"].min()))
+            all_indices.sort(key=lambda x: x[0])
+            episode_indices = [idx for _, idx in all_indices]
+            episode_indices.append(len(self.lerobot_dataset))  # End marker
+            n_episodes = len(episode_indices) - 1
 
         # Use ceiling to ensure at least 1 episode for validation
         # This implements Leave-One-Episode-Out as minimum validation

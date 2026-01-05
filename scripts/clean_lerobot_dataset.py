@@ -194,7 +194,7 @@ def clean_episode(
 def clean_dataset(
     input_path: str,
     output_path: str,
-    tolerance: float = 0.005,
+    tolerance: float = 0.01,
     verbose: bool = True,
 ) -> Dict:
     """
@@ -495,6 +495,11 @@ def clean_dataset(
             if col.startswith("stats/") and col not in record:
                 record[col] = orig_row[col]
 
+        # Add meta/episodes file index (which metadata file this episode is in)
+        meta_file_idx = ep_idx // episodes_per_file
+        record["meta/episodes/chunk_index"] = 0
+        record["meta/episodes/file_index"] = meta_file_idx
+
         updated_records.append(record)
         dataset_from += new_length
 
@@ -579,8 +584,8 @@ def main():
     parser.add_argument(
         "--tolerance", "-t",
         type=float,
-        default=0.005,
-        help="Tolerance for considering frames 'same' (default: 0.005)"
+        default=0.01,
+        help="Tolerance for considering frames 'same' (default: 0.01)"
     )
     parser.add_argument(
         "--dry-run",
