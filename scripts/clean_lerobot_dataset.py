@@ -15,6 +15,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import List, Tuple, Dict, Set, Optional
@@ -24,7 +25,10 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from scipy.ndimage import gaussian_filter1d
+
+# Add parent directory to path for utils import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.angle_utils import fix_angle_spikes, smooth_actions
 
 
 class FilterMode(Enum):
@@ -33,101 +37,10 @@ class FilterMode(Enum):
     MAGNITUDE = "magnitude"    # New: action magnitude filtering
 
 
-def unwrap_angles(
-    angles: np.ndarray,
-    threshold: float = 2.5,
-    spike_window: int = 5,
-) -> np.ndarray:
-    """
-    Fix angle discontinuities: both wraparound and spikes/glitches.
-
-    Handles two types of issues:
-    1. Angle wraparound at -pi/+pi boundary (continuous motion through boundary)
-    2. Spikes/glitches where value jumps and returns within a few frames
-
-    For spikes, we interpolate over the anomalous frames rather than
-    shifting all following frames.
-
-    Args:
-        angles: Array of joint angles (N, num_joints) or (N,)
-        threshold: Jump threshold in radians (default: 2.5)
-        spike_window: Max frames to look ahead for spike return (default: 5)
-
-    Returns:
-        Corrected angles with continuous trajectories
-    """
-    if angles.ndim == 1:
-        angles = angles.reshape(-1, 1)
-
-    corrected = angles.copy().astype(np.float64)
-    n_frames, n_joints = corrected.shape
-
-    for j in range(n_joints):
-        i = 1
-        while i < n_frames:
-            diff = corrected[i, j] - corrected[i-1, j]
-
-            if abs(diff) > threshold:
-                # Found a large jump - check if it's a spike or wraparound
-                pre_spike_val = corrected[i-1, j]
-
-                # Look ahead to see if value returns to pre-spike level
-                spike_end = None
-                for k in range(i, min(i + spike_window + 1, n_frames)):
-                    return_diff = corrected[k, j] - pre_spike_val
-                    # Check if we're back near the original value
-                    if abs(return_diff) < threshold / 2:
-                        # Value returned - this was a spike
-                        spike_end = k
-                        break
-
-                if spike_end is not None and spike_end > i:
-                    # SPIKE DETECTED: interpolate over the anomalous frames
-                    # Find the next valid value after the spike
-                    post_spike_val = corrected[spike_end, j]
-
-                    # Linear interpolation from pre-spike to post-spike
-                    for idx in range(i, spike_end):
-                        t = (idx - (i - 1)) / (spike_end - (i - 1))
-                        corrected[idx, j] = pre_spike_val + t * (post_spike_val - pre_spike_val)
-
-                    i = spike_end + 1
-                else:
-                    # TRUE WRAPAROUND: shift all following frames
-                    if diff > threshold:
-                        corrected[i:, j] -= 2 * np.pi
-                    else:
-                        corrected[i:, j] += 2 * np.pi
-                    i += 1
-            else:
-                i += 1
-
-    return corrected
-
-
-def smooth_actions(
-    actions: np.ndarray,
-    sigma: float = 1.0,
-) -> np.ndarray:
-    """
-    Apply Gaussian smoothing to action sequences.
-
-    Args:
-        actions: Array of actions (N, num_joints)
-        sigma: Standard deviation for Gaussian kernel (default: 1.0)
-
-    Returns:
-        Smoothed actions
-    """
-    if actions.ndim == 1:
-        return gaussian_filter1d(actions, sigma=sigma, axis=0)
-
-    # Apply smoothing independently to each joint
-    smoothed = np.zeros_like(actions)
-    for j in range(actions.shape[1]):
-        smoothed[:, j] = gaussian_filter1d(actions[:, j], sigma=sigma)
-
-    return smoothed
+# Alias for backward compatibility
+def unwrap_angles(angles: np.ndarray, threshold: float = 2.5, spike_window: int = 5) -> np.ndarray:
+    """Alias for fix_angle_spikes() - backward compatible name."""
+    return fix_angle_spikes(angles, threshold=threshold, spike_window=spike_window)
 
 
 def find_idle_frames_by_magnitude(

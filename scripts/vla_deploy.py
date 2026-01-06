@@ -69,6 +69,9 @@ from controls.robot_controller import (
 # Import VLA model loading (multi-model support)
 from vla.models import load_vla_model, list_models
 
+# Import real-time spike filter for observation consistency with training data
+from utils.angle_utils import RealTimeSpikeFilter
+
 # Import SO-100 arm control
 try:
     from controls.so100_arm import SO100Arm, SO100State
@@ -248,6 +251,14 @@ class VLAWrapper:
         self.control_freq = control_freq
         self.control_dt = 1.0 / control_freq
 
+        # Initialize real-time spike filter for observation.state
+        # Uses same threshold as training data preprocessing for consistency
+        self.spike_filter = RealTimeSpikeFilter(
+            num_joints=6,
+            threshold=2.5,  # Same as clean_lerobot_dataset.py
+            history_size=5,
+        )
+
         print("\n" + "=" * 60)
         print(f"Loading VLA Model ({model_name.upper()})")
         print("=" * 60)
@@ -265,6 +276,7 @@ class VLAWrapper:
             print(f"Normalizer: {norm_stats_path}")
         if chunk_execution:
             print(f"Chunk execution: ENABLED ({control_freq} Hz)")
+        print(f"Spike filter: ENABLED (threshold={self.spike_filter.threshold} rad)")
 
         if robot_controller:
             print(f"Robot: SO-100 via RobotController (position-controlled)")
@@ -305,7 +317,10 @@ class VLAWrapper:
         """
         # Get current robot state as numpy array
         if robot_state:
-            current_state = robot_state.joint_positions.astype(np.float32)
+            raw_state = robot_state.joint_positions.astype(np.float32)
+            # Apply spike filter for consistency with training data preprocessing
+            # This fixes encoder glitches that would confuse the model
+            current_state = self.spike_filter.process(raw_state).astype(np.float32)
         else:
             # Placeholder state when no robot connected
             current_state = np.zeros(6, dtype=np.float32)
@@ -428,6 +443,12 @@ class VLAWrapper:
         if self.robot_controller:
             self.robot_controller.set_home_targets()
             print("[VLA] Robot reset to home position")
+        # Reset spike filter to clear history for fresh start
+        self.spike_filter.reset()
+
+    def reset_spike_filter(self):
+        """Reset the spike filter (call when starting a new move/sequence)."""
+        self.spike_filter.reset()
 
 
 def vla_control_loop(
