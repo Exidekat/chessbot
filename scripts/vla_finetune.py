@@ -901,6 +901,13 @@ Examples:
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     final_epoch = start_epoch  # Track the last completed epoch
+    val_metrics = None  # Initialize to detect if training loop ran
+
+    # Check if already past target epochs
+    if start_epoch >= config.num_epochs:
+        print(f"\n[WARN] Already at epoch {start_epoch}, but num_epochs={config.num_epochs}")
+        print(f"       Use --epochs {start_epoch + 10} to continue training")
+        sys.exit(0)
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start = time.time()
@@ -963,17 +970,21 @@ Examples:
             print(f"\n[EARLY STOP] Stopping training - no improvement for {args.patience} epochs")
             break
 
-    # Save final model
-    save_checkpoint(
-        model, optimizer, final_epoch, val_metrics["val_loss"], config,
-        checkpoint_dir / "final.pt"
-    )
+    # Save final model (only if training actually ran)
+    if val_metrics is not None:
+        save_checkpoint(
+            model, optimizer, final_epoch, val_metrics["val_loss"], config,
+            checkpoint_dir / "final.pt"
+        )
+    else:
+        print("\n[WARN] No training epochs completed - skipping final checkpoint")
 
     print("\n" + "=" * 60)
     print("Training Complete!")
     print("=" * 60)
     print(f"\nModel: {args.model.upper()}")
-    print(f"Best validation loss: {best_val_loss:.6f}")
+    if best_val_loss < float("inf"):
+        print(f"Best validation loss: {best_val_loss:.6f}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
     if config.use_wandb:
