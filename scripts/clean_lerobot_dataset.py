@@ -1,25 +1,199 @@
 #!/usr/bin/env python3
 """
-Clean LeRobot Dataset - Remove Consecutive Static Frames
+Clean LeRobot Dataset - Advanced Preprocessing for VLA Training
 
-Removes consecutive frames where joint positions don't change (within tolerance).
-For each run of N static frames, keeps only the first and last frame.
+Features:
+- Angle unwrapping: Fixes +-pi discontinuities in joint angles
+- Action smoothing: Gaussian filtering to reduce jitter
+- Idle frame filtering: Remove frames where robot isn't moving
 
-This reduces dataset size while preserving meaningful motion data.
+Based on best practices from OpenPI, VLA-Cache, and OpenVLA.
+See: https://github.com/Physical-Intelligence/openpi
 """
 
 import argparse
 import json
 import shutil
 import subprocess
+from enum import Enum
 from pathlib import Path
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Optional
 import tempfile
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from scipy.ndimage import gaussian_filter1d
+
+
+class FilterMode(Enum):
+    """Filtering mode for removing idle frames."""
+    POSITION = "position"      # Original: position-based comparison
+    MAGNITUDE = "magnitude"    # New: action magnitude filtering
+
+
+def unwrap_angles(
+    angles: np.ndarray,
+    threshold: float = 2.5,
+    spike_window: int = 5,
+) -> np.ndarray:
+    """
+    Fix angle discontinuities: both wraparound and spikes/glitches.
+
+    Handles two types of issues:
+    1. Angle wraparound at -pi/+pi boundary (continuous motion through boundary)
+    2. Spikes/glitches where value jumps and returns within a few frames
+
+    For spikes, we interpolate over the anomalous frames rather than
+    shifting all following frames.
+
+    Args:
+        angles: Array of joint angles (N, num_joints) or (N,)
+        threshold: Jump threshold in radians (default: 2.5)
+        spike_window: Max frames to look ahead for spike return (default: 5)
+
+    Returns:
+        Corrected angles with continuous trajectories
+    """
+    if angles.ndim == 1:
+        angles = angles.reshape(-1, 1)
+
+    corrected = angles.copy().astype(np.float64)
+    n_frames, n_joints = corrected.shape
+
+    for j in range(n_joints):
+        i = 1
+        while i < n_frames:
+            diff = corrected[i, j] - corrected[i-1, j]
+
+            if abs(diff) > threshold:
+                # Found a large jump - check if it's a spike or wraparound
+                pre_spike_val = corrected[i-1, j]
+
+                # Look ahead to see if value returns to pre-spike level
+                spike_end = None
+                for k in range(i, min(i + spike_window + 1, n_frames)):
+                    return_diff = corrected[k, j] - pre_spike_val
+                    # Check if we're back near the original value
+                    if abs(return_diff) < threshold / 2:
+                        # Value returned - this was a spike
+                        spike_end = k
+                        break
+
+                if spike_end is not None and spike_end > i:
+                    # SPIKE DETECTED: interpolate over the anomalous frames
+                    # Find the next valid value after the spike
+                    post_spike_val = corrected[spike_end, j]
+
+                    # Linear interpolation from pre-spike to post-spike
+                    for idx in range(i, spike_end):
+                        t = (idx - (i - 1)) / (spike_end - (i - 1))
+                        corrected[idx, j] = pre_spike_val + t * (post_spike_val - pre_spike_val)
+
+                    i = spike_end + 1
+                else:
+                    # TRUE WRAPAROUND: shift all following frames
+                    if diff > threshold:
+                        corrected[i:, j] -= 2 * np.pi
+                    else:
+                        corrected[i:, j] += 2 * np.pi
+                    i += 1
+            else:
+                i += 1
+
+    return corrected
+
+
+def smooth_actions(
+    actions: np.ndarray,
+    sigma: float = 1.0,
+) -> np.ndarray:
+    """
+    Apply Gaussian smoothing to action sequences.
+
+    Args:
+        actions: Array of actions (N, num_joints)
+        sigma: Standard deviation for Gaussian kernel (default: 1.0)
+
+    Returns:
+        Smoothed actions
+    """
+    if actions.ndim == 1:
+        return gaussian_filter1d(actions, sigma=sigma, axis=0)
+
+    # Apply smoothing independently to each joint
+    smoothed = np.zeros_like(actions)
+    for j in range(actions.shape[1]):
+        smoothed[:, j] = gaussian_filter1d(actions[:, j], sigma=sigma)
+
+    return smoothed
+
+
+def find_idle_frames_by_magnitude(
+    actions: np.ndarray,
+    threshold: float = 0.01,
+) -> Set[int]:
+    """
+    Find idle frames based on action change magnitude (delta norm).
+
+    This follows OpenPI's approach: filter frames where the action
+    CHANGE is below a threshold, indicating the robot isn't moving.
+
+    For position-based action datasets (like ours), we compute the
+    difference between consecutive frames to detect motion.
+
+    For a run of N idle frames, keeps first and last, removes middle frames.
+
+    Args:
+        actions: Array of action values (N, num_joints)
+        threshold: Minimum action change magnitude to consider "moving" (default: 0.01)
+
+    Returns:
+        Set of frame indices to REMOVE
+    """
+    n_frames = len(actions)
+    if n_frames < 3:
+        return set()
+
+    # Compute action CHANGE magnitude (L2 norm of differences)
+    # For position-based actions, this detects actual motion
+    action_diffs = np.diff(actions, axis=0)  # (N-1, num_joints)
+    diff_magnitudes = np.linalg.norm(action_diffs, axis=1)  # (N-1,)
+
+    # Pad to match original length (first frame has no prior, so mark as "moving")
+    action_magnitudes = np.zeros(n_frames)
+    action_magnitudes[1:] = diff_magnitudes  # Frame i's magnitude = change from i-1 to i
+    action_magnitudes[0] = threshold + 1  # First frame always considered "moving"
+
+    # Find idle frames (below threshold)
+    is_idle = action_magnitudes < threshold
+
+    # Find runs of idle frames and mark middle ones for removal
+    frames_to_remove = set()
+    run_start = None
+
+    for i in range(n_frames):
+        if is_idle[i]:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None:
+                # End of idle run - remove middle frames (keep first and last)
+                run_end = i - 1  # Last idle frame
+                if run_end > run_start:
+                    for frame_idx in range(run_start + 1, run_end):
+                        frames_to_remove.add(frame_idx)
+                run_start = None
+
+    # Handle run that extends to end
+    if run_start is not None:
+        run_end = n_frames - 1
+        if run_end > run_start:
+            for frame_idx in range(run_start + 1, run_end):
+                frames_to_remove.add(frame_idx)
+
+    return frames_to_remove
 
 
 def find_static_frames(
@@ -162,22 +336,61 @@ def extract_frames_to_video(
 
 def clean_episode(
     episode_df: pd.DataFrame,
-    tolerance: float,
-) -> Tuple[pd.DataFrame, Set[int], int, int]:
+    mode: FilterMode = FilterMode.MAGNITUDE,
+    tolerance: float = 0.01,
+    idle_threshold: float = 0.01,
+    do_unwrap_angles: bool = True,
+    unwrap_threshold: float = 3.0,
+    do_smooth_actions: bool = False,
+    smooth_sigma: float = 1.0,
+) -> Tuple[pd.DataFrame, Set[int], int, int, Dict]:
     """
-    Clean a single episode by removing static middle frames.
+    Clean a single episode with advanced preprocessing.
+
+    Pipeline order: unwrap -> smooth -> filter
 
     Args:
         episode_df: DataFrame for one episode
-        tolerance: Tolerance for considering frames "same"
+        mode: Filtering mode (POSITION or MAGNITUDE)
+        tolerance: Tolerance for position-based filtering
+        idle_threshold: Threshold for magnitude-based filtering
+        do_unwrap_angles: Whether to fix +-pi angle jumps
+        unwrap_threshold: Jump threshold for unwrapping
+        do_smooth_actions: Whether to apply Gaussian smoothing
+        smooth_sigma: Smoothing sigma
 
     Returns:
-        Tuple of (cleaned_df, removed_frame_indices, original_count, new_count)
+        Tuple of (cleaned_df, removed_frame_indices, original_count, new_count, preprocess_info)
     """
     states = np.array(episode_df["observation.state"].tolist())
     actions = np.array(episode_df["action"].tolist())
 
-    frames_to_remove = find_static_frames(states, actions, tolerance)
+    preprocess_info = {
+        "unwrap_fixes_state": 0,
+        "unwrap_fixes_action": 0,
+    }
+
+    # Step 1: Angle unwrapping (fixes discontinuities first)
+    if do_unwrap_angles:
+        orig_states = states.copy()
+        orig_actions = actions.copy()
+
+        states = unwrap_angles(states, threshold=unwrap_threshold)
+        actions = unwrap_angles(actions, threshold=unwrap_threshold)
+
+        # Count fixes (significant changes)
+        preprocess_info["unwrap_fixes_state"] = int(np.sum(np.abs(states - orig_states) > 0.1))
+        preprocess_info["unwrap_fixes_action"] = int(np.sum(np.abs(actions - orig_actions) > 0.1))
+
+    # Step 2: Action smoothing (on continuous data)
+    if do_smooth_actions:
+        actions = smooth_actions(actions, sigma=smooth_sigma)
+
+    # Step 3: Filter idle frames
+    if mode == FilterMode.MAGNITUDE:
+        frames_to_remove = find_idle_frames_by_magnitude(actions, idle_threshold)
+    else:
+        frames_to_remove = find_static_frames(states, actions, tolerance)
 
     original_count = len(episode_df)
 
@@ -185,25 +398,46 @@ def clean_episode(
     all_frame_indices = episode_df["frame_index"].values
     keep_mask = ~np.isin(all_frame_indices, list(frames_to_remove))
 
+    # Update the DataFrame with preprocessed values
     cleaned_df = episode_df[keep_mask].copy()
+
+    # Replace state and action values with preprocessed versions
+    cleaned_indices = np.where(keep_mask)[0]
+    cleaned_df["observation.state"] = [states[i].tolist() for i in cleaned_indices]
+    cleaned_df["action"] = [actions[i].tolist() for i in cleaned_indices]
+
     new_count = len(cleaned_df)
 
-    return cleaned_df, frames_to_remove, original_count, new_count
+    return cleaned_df, frames_to_remove, original_count, new_count, preprocess_info
 
 
 def clean_dataset(
     input_path: str,
     output_path: str,
+    mode: FilterMode = FilterMode.MAGNITUDE,
     tolerance: float = 0.01,
+    idle_threshold: float = 0.01,
+    unwrap_angles: bool = True,
+    unwrap_threshold: float = 3.0,
+    smooth_actions: bool = False,
+    smooth_sigma: float = 1.0,
     verbose: bool = True,
 ) -> Dict:
     """
-    Clean a LeRobot dataset by removing static frames.
+    Clean a LeRobot dataset with advanced preprocessing for VLA training.
+
+    Pipeline order: unwrap angles -> smooth actions -> filter idle frames
 
     Args:
         input_path: Path to input LeRobot dataset
         output_path: Path to output cleaned dataset
-        tolerance: Tolerance for frame comparison
+        mode: Filtering mode (POSITION or MAGNITUDE)
+        tolerance: Tolerance for position-based filtering
+        idle_threshold: Threshold for magnitude-based filtering
+        unwrap_angles: Whether to fix +-pi angle jumps
+        unwrap_threshold: Jump threshold for unwrapping
+        smooth_actions: Whether to apply Gaussian smoothing
+        smooth_sigma: Smoothing sigma
         verbose: Print progress
 
     Returns:
@@ -226,7 +460,13 @@ def clean_dataset(
         print(f"[*] Loading dataset from: {input_dir}")
         print(f"    Original episodes: {info['total_episodes']}")
         print(f"    Original frames: {info['total_frames']}")
-        print(f"    Tolerance: {tolerance}")
+        print(f"    Filter mode: {mode.value}")
+        if mode == FilterMode.MAGNITUDE:
+            print(f"    Idle threshold: {idle_threshold}")
+        else:
+            print(f"    Position tolerance: {tolerance}")
+        print(f"    Angle unwrapping: {unwrap_angles}")
+        print(f"    Action smoothing: {smooth_actions}")
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -260,8 +500,15 @@ def clean_dataset(
         for ep_idx in df["episode_index"].unique():
             ep_df = df[df["episode_index"] == ep_idx].copy()
 
-            cleaned_df, removed_frames, orig_count, new_count = clean_episode(
-                ep_df, tolerance
+            cleaned_df, removed_frames, orig_count, new_count, preprocess_info = clean_episode(
+                ep_df,
+                mode=mode,
+                tolerance=tolerance,
+                idle_threshold=idle_threshold,
+                do_unwrap_angles=unwrap_angles,
+                unwrap_threshold=unwrap_threshold,
+                do_smooth_actions=smooth_actions,
+                smooth_sigma=smooth_sigma,
             )
 
             # Build frame mapping for video
@@ -287,17 +534,23 @@ def clean_dataset(
             stats["cleaned_frames"] += new_count
             stats["removed_frames"] += (orig_count - new_count)
             stats["episodes_processed"] += 1
+            stats["unwrap_fixes_state"] = stats.get("unwrap_fixes_state", 0) + preprocess_info["unwrap_fixes_state"]
+            stats["unwrap_fixes_action"] = stats.get("unwrap_fixes_action", 0) + preprocess_info["unwrap_fixes_action"]
             stats["per_episode"].append({
                 "episode": ep_idx,
                 "original": orig_count,
                 "cleaned": new_count,
                 "removed": orig_count - new_count,
                 "reduction_pct": round(100 * (orig_count - new_count) / orig_count, 1) if orig_count > 0 else 0,
+                "unwrap_fixes": preprocess_info["unwrap_fixes_state"] + preprocess_info["unwrap_fixes_action"],
             })
 
             if verbose:
                 reduction = 100 * (orig_count - new_count) / orig_count if orig_count > 0 else 0
-                print(f"    Episode {ep_idx}: {orig_count} -> {new_count} frames ({reduction:.1f}% reduction)")
+                unwrap_info = ""
+                if preprocess_info["unwrap_fixes_state"] + preprocess_info["unwrap_fixes_action"] > 0:
+                    unwrap_info = f" [{preprocess_info['unwrap_fixes_state'] + preprocess_info['unwrap_fixes_action']} unwrap fixes]"
+                print(f"    Episode {ep_idx}: {orig_count} -> {new_count} frames ({reduction:.1f}% reduction){unwrap_info}")
 
     # Combine all cleaned data
     if all_cleaned_dfs:
@@ -529,6 +782,9 @@ def clean_dataset(
         print(f"    Removed frames: {stats['removed_frames']}")
         reduction = 100 * stats['removed_frames'] / stats['original_frames'] if stats['original_frames'] > 0 else 0
         print(f"    Total reduction: {reduction:.1f}%")
+        total_unwrap_fixes = stats.get("unwrap_fixes_state", 0) + stats.get("unwrap_fixes_action", 0)
+        if total_unwrap_fixes > 0:
+            print(f"    Angle unwrap fixes: {total_unwrap_fixes} (state: {stats.get('unwrap_fixes_state', 0)}, action: {stats.get('unwrap_fixes_action', 0)})")
         print(f"    Output: {output_dir}")
 
     return stats
@@ -567,7 +823,24 @@ def recompute_stats(dataset_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Clean LeRobot dataset by removing static frames"
+        description="Clean LeRobot dataset with advanced preprocessing for VLA training",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Default: action magnitude filtering with angle unwrapping
+    python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes
+
+    # With action smoothing
+    python scripts/clean_lerobot_dataset.py --smooth-actions --smooth-sigma 1.0
+
+    # Backward compatible: position-based filtering
+    python scripts/clean_lerobot_dataset.py --mode position --tolerance 0.01
+
+    # Dry run to preview changes
+    python scripts/clean_lerobot_dataset.py --dry-run
+
+Based on OpenPI, VLA-Cache, and OpenVLA best practices.
+        """
     )
     parser.add_argument(
         "--input", "-i",
@@ -581,12 +854,60 @@ def main():
         default="data/clean_lerobot_episodes",
         help="Output cleaned dataset path"
     )
+
+    # Filtering mode
+    parser.add_argument(
+        "--mode", "-m",
+        type=str,
+        choices=["position", "magnitude"],
+        default="magnitude",
+        help="Filtering mode: 'magnitude' (action norm, recommended) or 'position' (original)"
+    )
     parser.add_argument(
         "--tolerance", "-t",
         type=float,
         default=0.01,
-        help="Tolerance for considering frames 'same' (default: 0.01)"
+        help="Position tolerance for 'position' mode (default: 0.01)"
     )
+    parser.add_argument(
+        "--idle-threshold",
+        type=float,
+        default=0.01,
+        help="Action magnitude threshold for 'magnitude' mode (default: 0.01)"
+    )
+
+    # Angle unwrapping
+    parser.add_argument(
+        "--unwrap-angles",
+        action="store_true",
+        default=True,
+        help="Fix +-pi jumps in joint angles (default: True)"
+    )
+    parser.add_argument(
+        "--no-unwrap-angles",
+        action="store_true",
+        help="Disable angle unwrapping"
+    )
+    parser.add_argument(
+        "--unwrap-threshold",
+        type=float,
+        default=2.5,
+        help="Jump threshold for spike/angle detection in radians (default: 2.5)"
+    )
+
+    # Action smoothing
+    parser.add_argument(
+        "--smooth-actions",
+        action="store_true",
+        help="Apply Gaussian smoothing to actions (after unwrapping)"
+    )
+    parser.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian smoothing sigma (default: 1.0)"
+    )
+
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -600,14 +921,27 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle --no-unwrap-angles flag
+    if args.no_unwrap_angles:
+        args.unwrap_angles = False
+
     if args.dry_run:
         print("[DRY RUN] Analyzing dataset without creating output...")
-        # Just analyze and report
+        print(f"    Mode: {args.mode}")
+        if args.mode == "magnitude":
+            print(f"    Idle threshold: {args.idle_threshold}")
+        else:
+            print(f"    Position tolerance: {args.tolerance}")
+        print(f"    Angle unwrapping: {args.unwrap_angles}")
+        print(f"    Action smoothing: {args.smooth_actions}")
+        print()
+
         input_dir = Path(args.input)
         data_dir = input_dir / "data"
 
         total_orig = 0
         total_keep = 0
+        total_unwrap_fixes = 0
 
         for pq_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
             df = pq.read_table(pq_file).to_pandas()
@@ -617,7 +951,23 @@ def main():
                 states = np.array(ep_df["observation.state"].tolist())
                 actions = np.array(ep_df["action"].tolist())
 
-                removed = find_static_frames(states, actions, args.tolerance)
+                # Preview preprocessing
+                if args.unwrap_angles:
+                    orig_states = states.copy()
+                    states = unwrap_angles(states, threshold=args.unwrap_threshold)
+                    actions = unwrap_angles(actions, threshold=args.unwrap_threshold)
+                    # Count fixes
+                    fixes = np.sum(np.abs(states - orig_states) > 0.1)
+                    total_unwrap_fixes += fixes
+
+                if args.smooth_actions:
+                    actions = smooth_actions(actions, sigma=args.smooth_sigma)
+
+                # Select filtering method
+                if args.mode == "magnitude":
+                    removed = find_idle_frames_by_magnitude(actions, args.idle_threshold)
+                else:
+                    removed = find_static_frames(states, actions, args.tolerance)
 
                 orig = len(ep_df)
                 keep = orig - len(removed)
@@ -630,12 +980,20 @@ def main():
         print()
         print(f"Total: {total_orig} -> {total_keep} frames")
         print(f"Would remove: {total_orig - total_keep} frames ({100*(total_orig-total_keep)/total_orig:.1f}%)")
+        if args.unwrap_angles and total_unwrap_fixes > 0:
+            print(f"Angle unwrap fixes: {total_unwrap_fixes} corrections")
         return
 
     clean_dataset(
         args.input,
         args.output,
+        mode=FilterMode(args.mode),
         tolerance=args.tolerance,
+        idle_threshold=args.idle_threshold,
+        unwrap_angles=args.unwrap_angles,
+        unwrap_threshold=args.unwrap_threshold,
+        smooth_actions=args.smooth_actions,
+        smooth_sigma=args.smooth_sigma,
         verbose=not args.quiet,
     )
 

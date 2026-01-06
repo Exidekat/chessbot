@@ -599,7 +599,9 @@ def validate(
                 model_batch["observation.language.attention_mask"] = tokenized["attention_mask"].bool().to(device)
 
             try:
-                loss, loss_dict = model.forward(model_batch)
+                # Use autocast for mixed precision (same as training)
+                with autocast("cuda", enabled=config.mixed_precision):
+                    loss, loss_dict = model.forward(model_batch)
                 total_loss += loss.item()
                 total_action_loss += loss_dict.get("loss", loss.item())
                 num_batches += 1

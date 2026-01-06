@@ -167,14 +167,26 @@ python scripts/validate_vla_episodes.py --dataset data/episodes/ --no-lerobot
 # Convert collected episodes to LeRobot format (required before finetuning)
 python scripts/convert_to_lerobot.py --input data/episodes/ --output data/lerobot_episodes/
 
-# Clean dataset by removing consecutive static frames (reduces dataset size ~25-30%)
+# Clean dataset with advanced preprocessing (default: magnitude filtering + angle unwrapping)
 python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output data/clean_lerobot_episodes/
 
-# Preview cleaning without creating output (dry run)
+# Preview cleaning without creating output (dry run shows what would be removed)
 python scripts/clean_lerobot_dataset.py --dry-run
 
-# Clean with custom tolerance (default: 0.01 radians)
-python scripts/clean_lerobot_dataset.py --input data/lerobot_episodes/ --output data/clean_lerobot_episodes/ --tolerance 0.005
+# Clean with action magnitude filtering (new default, follows OpenPI best practices)
+python scripts/clean_lerobot_dataset.py --mode magnitude --idle-threshold 0.01
+
+# Clean with position-based filtering (original behavior, backward compatible)
+python scripts/clean_lerobot_dataset.py --mode position --tolerance 0.01
+
+# Clean with angle unwrapping + Gaussian smoothing (fixes +-pi jumps, reduces jitter)
+python scripts/clean_lerobot_dataset.py --unwrap-angles --smooth-actions --smooth-sigma 1.0
+
+# Clean without angle unwrapping (disable discontinuity fixes)
+python scripts/clean_lerobot_dataset.py --no-unwrap-angles
+
+# Clean with custom angle unwrap threshold (default: 3.0 radians, ~171 degrees)
+python scripts/clean_lerobot_dataset.py --unwrap-threshold 2.8
 
 # Upload default dataset to HuggingFace (repo: exidekat/chessbot-lerobot)
 ./scripts/upload_lerobot_dataset.sh
