@@ -83,7 +83,9 @@ sudo apt-get install -y \
     libavformat-dev \
     libswscale-dev \
     build-essential \
-    git
+    git \
+    ffmpeg
+sudo apt-get install -y v4l2*
 
 echo_info "System dependencies installed."
 
@@ -132,6 +134,9 @@ else
 
     echo_info "cuSPARSELt installed."
 fi
+
+# Step 2.5: Other pip dependencies
+python -m pip install -r requirements.txt
 
 # =============================================================================
 # Step 3: PyTorch Installation
