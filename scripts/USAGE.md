@@ -302,6 +302,30 @@ cp data/training/runs/piece_finetune/weights/best.pt data/best_transformed_detec
 # Step 5: Test fine-tuned piece detection model
 python scripts/best_move_demo.py --debug
 
+## Label Validation (Review and Correct Labels Before Training)
+
+# Validate piece labels by image (shows all bboxes per image)
+python scripts/validate_piece_labels.py --data data/training/piece_dataset/
+
+# Also accepts data.yaml path (auto-extracts parent directory)
+python scripts/validate_piece_labels.py --data data/training/piece_dataset/data.yaml
+
+# Controls:
+#   y/SPACE = all labels correct, next image
+#   e = edit mode (fix labels)
+#   s = skip image
+#   u = go back
+#   q = quit
+#   h = help
+#
+# Edit Mode:
+#   Click = select bbox
+#   0-9, 0-9 = change class (two digits, e.g. 09 = W-pawn)
+#   d = delete selected
+#   a = add mode (draw new bbox)
+#   ENTER = save
+#   ESC = cancel
+
 ## Visualization Tool
 
 # Start visualization tool in development mode (React HMR + FastAPI reload)
