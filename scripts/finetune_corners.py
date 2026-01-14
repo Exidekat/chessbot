@@ -18,12 +18,9 @@ from ultralytics import YOLO
 import random
 import shutil
 import yaml
-import cv2
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from utils.image_preprocessing import preprocess_for_corner_detection
 
 
 def create_train_val_split(dataset_dir, val_fraction=0.1):
@@ -82,28 +79,19 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
     val_img_dir.mkdir(parents=True, exist_ok=True)
     val_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-    # Preprocess and copy training files
-    # IMPORTANT: Apply grayscale + CLAHE preprocessing for consistency with inference
-    print("  Preprocessing training images (grayscale + CLAHE)...")
+    # Symlink training files
     for img_file in train_files:
         lbl_file = labels_dir / (img_file.stem + ".txt")
 
-        # Preprocess image and save (not symlink - we need the preprocessed version)
-        preprocessed = preprocess_for_corner_detection(str(img_file))
-        cv2.imwrite(str(train_img_dir / img_file.name), preprocessed)
-
+        (train_img_dir / img_file.name).symlink_to(img_file.absolute())
         if lbl_file.exists():
             (train_lbl_dir / lbl_file.name).symlink_to(lbl_file.absolute())
 
-    # Preprocess and copy validation files
-    print("  Preprocessing validation images (grayscale + CLAHE)...")
+    # Symlink validation files
     for img_file in val_files:
         lbl_file = labels_dir / (img_file.stem + ".txt")
 
-        # Preprocess image and save
-        preprocessed = preprocess_for_corner_detection(str(img_file))
-        cv2.imwrite(str(val_img_dir / img_file.name), preprocessed)
-
+        (val_img_dir / img_file.name).symlink_to(img_file.absolute())
         if lbl_file.exists():
             (val_lbl_dir / lbl_file.name).symlink_to(lbl_file.absolute())
 
@@ -123,10 +111,11 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
     print(f"  Created temp split: {temp_dir}")
     print()
 
-    return str(temp_yaml_path)
+    return str(temp_yaml_path), num_train, num_val
 
 
-def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=1280):
+def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=1280,
+                          val_fraction=0.2, lr=0.0001, patience=20, freeze=10):
     """
     Fine-tune corner detection model.
 
@@ -136,6 +125,10 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
         output_dir: Directory for training outputs
         epochs: Number of training epochs
         imgsz: Image size for training (default: 1280 to match 1280x720 camera resolution)
+        val_fraction: Fraction of data for validation (default: 0.2 = 20%)
+        lr: Learning rate (default: 0.0001 - low for fine-tuning)
+        patience: Early stopping patience (default: 20)
+        freeze: Number of layers to freeze (default: 10 - freeze backbone)
     """
     print("=" * 60)
     print("CORNER DETECTION MODEL FINE-TUNING")
@@ -144,13 +137,17 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
     print(f"Dataset: {data_yaml}")
     print(f"Epochs: {epochs}")
     print(f"Image size: {imgsz}")
+    print(f"Learning rate: {lr}")
+    print(f"Validation fraction: {val_fraction*100:.0f}%")
+    print(f"Early stopping patience: {patience}")
+    print(f"Frozen layers: {freeze}")
     print(f"Output: {output_dir}")
     print("=" * 60)
     print()
 
     # Create train/val split
     dataset_dir = Path(data_yaml).parent
-    temp_yaml = create_train_val_split(dataset_dir, val_fraction=0.1)
+    temp_yaml, num_train, num_val = create_train_val_split(dataset_dir, val_fraction=val_fraction)
 
     # Track temp directory for cleanup
     temp_dir = Path(temp_yaml).parent
@@ -184,13 +181,16 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
         print("This may take 10-30 minutes depending on dataset size and hardware")
         print()
         print("Training configuration:")
-        print("  - Random 90/10 train/val split (2 images held out for validation)")
+        print(f"  - Train/val split: {num_train}/{num_val} images ({100*(1-val_fraction):.0f}%/{100*val_fraction:.0f}%)")
+        print(f"  - Frozen backbone layers: {freeze}")
+        print(f"  - Learning rate: {lr} (low for fine-tuning)")
+        print(f"  - Early stopping patience: {patience} epochs")
         print()
         print("Augmentations enabled:")
         print("  - Brightness variation: 70% (strong - handles lighting changes)")
         print("  - Color jitter: hue 1.5%, saturation 40%")
         print("  - Geometric: rotation 5deg, translation 5%, scale 10%")
-        print("  - Horizontal flip: 50% (effectively doubles dataset to 40 images)")
+        print(f"  - Horizontal flip: 50% (effectively ~{num_train * 2} augmented samples)")
         print()
 
         results = model.train(
@@ -200,17 +200,19 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
             project=output_dir,
             name="corner_finetune",
             exist_ok=True,
-            patience=10,  # Early stopping patience
+            patience=patience,  # Early stopping patience (configurable)
             save=True,
             plots=True,
-            device=0,  # Use CUDA GPU (device 0)
+            device='cuda',  # Use CUDA GPU (auto-selects available device)
             batch=16,  # Larger batch for GPU
-            optimizer='Adam',
-            lr0=0.001,  # Lower learning rate for fine-tuning
+            optimizer='AdamW',  # AdamW has better weight decay handling
+            lr0=lr,  # Learning rate (configurable, default low for fine-tuning)
             lrf=0.01,
-            weight_decay=0.0005,
-            warmup_epochs=3,
+            weight_decay=0.001,  # Slightly higher for regularization
+            warmup_epochs=5,  # Longer warmup for stability
             amp=True,  # Enable AMP for GPU acceleration
+            seed=42,  # Reproducibility per project conventions
+            freeze=freeze,  # Freeze backbone layers for fine-tuning
 
             # Lighting augmentation (critical for varying lighting conditions)
             hsv_h=0.015,  # Slight hue variation (color temperature changes)
@@ -289,6 +291,30 @@ def main():
         default=1280,
         help="Image size for training (default: 1280 to match 1280x720 camera resolution)"
     )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of data for validation (default: 0.2 = 20%%)"
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.0001,
+        help="Learning rate (default: 0.0001 - low for fine-tuning to prevent overfitting)"
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="Early stopping patience in epochs (default: 20)"
+    )
+    parser.add_argument(
+        "--freeze",
+        type=int,
+        default=10,
+        help="Number of backbone layers to freeze (default: 10 - freeze backbone, train detection head)"
+    )
 
     args = parser.parse_args()
 
@@ -318,7 +344,11 @@ def main():
             base_model=str(base_model),
             output_dir=str(output_dir),
             epochs=args.epochs,
-            imgsz=args.imgsz
+            imgsz=args.imgsz,
+            val_fraction=args.val_fraction,
+            lr=args.lr,
+            patience=args.patience,
+            freeze=args.freeze
         )
         return 0
     except Exception as e:

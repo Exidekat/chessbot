@@ -7,7 +7,8 @@ for fine-tuning the CORNER DETECTION model (not piece detection).
 Purpose: Capture 20+ photos to teach the model to recognize YOUR board's corners.
 
 IMPORTANT: Uses the same 4K MJPEG -> 720p downscale pipeline as inference scripts
-to ensure training data matches inference conditions (lighting, exposure, etc.)
+(best_move_demo.py, collect_vla_episodes.py) to ensure training data matches
+inference conditions exactly (compression artifacts, interpolation, exposure, etc.)
 
 Usage:
     python scripts/collect_corner_training_photos.py --device /dev/video0 --count 20
@@ -20,6 +21,7 @@ import cv2
 import subprocess
 from datetime import datetime
 import time
+import gc
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -34,7 +36,11 @@ from utils.camera_helpers import (
 
 def capture_training_photos(device_path, output_dir, count=20):
     """
-    Capture training photos interactively.
+    Capture training photos interactively using 4K MJPEG -> 720p downscale.
+
+    This matches the exact capture pipeline used in deployment scripts
+    (best_move_demo.py, collect_vla_episodes.py) to ensure training data
+    has the same characteristics as inference data.
 
     Args:
         device_path: Camera device path
@@ -45,47 +51,64 @@ def capture_training_photos(device_path, output_dir, count=20):
 
     print(f"\n[TrainingCapture] Opening camera: {device_path}")
 
-    # Configure camera for YUYV format
-    print(f"[TrainingCapture] Setting YUYV 1280x720 format...")
+    # Configure camera for 4K MJPEG - SAME AS DEPLOYMENT SCRIPTS
+    print(f"[TrainingCapture] Setting MJPEG 3840x2160 @ 30fps format...")
     try:
         subprocess.run([
             "v4l2-ctl",
             f"--device={device_path}",
-            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV"
+            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
+            "--set-parm=30"
         ], check=True, capture_output=True, text=True)
-        print(f"[TrainingCapture] [OK] Format set to YUYV 1280x720")
+        print(f"[TrainingCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
     except subprocess.CalledProcessError as e:
         print(f"[TrainingCapture] Warning: Could not set format: {e}")
 
-    # Open camera
+    # Reset camera to consistent auto settings
+    try:
+        subprocess.run([
+            "v4l2-ctl",
+            f"--device={device_path}",
+            "--set-ctrl=white_balance_automatic=1",
+            "--set-ctrl=focus_automatic_continuous=1",
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        pass  # Non-critical
+
+    # Open camera with V4L2 backend
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
 
     if not cap.isOpened():
         print(f"[TrainingCapture] [X] Failed to open camera")
         return False
 
-    # Explicitly set resolution in OpenCV (v4l2-ctl may not persist)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Explicitly set 4K MJPEG in OpenCV
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
     # Verify resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[TrainingCapture] Camera resolution: {width}x{height}")
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"[TrainingCapture] Camera resolution: {width}x{height} @ {fps}fps")
 
-    if width != 1280 or height != 720:
-        print(f"[TrainingCapture] Warning: Expected 1280x720, got {width}x{height}")
-        print(f"[TrainingCapture] Camera may not support YUYV at 720p, using available resolution")
+    if width != 3840 or height != 2160:
+        print(f"[TrainingCapture] Warning: Expected 3840x2160, got {width}x{height}")
+        print(f"[TrainingCapture] Attempting to continue with available resolution")
 
-    # Warm up
-    print("[TrainingCapture] Warming up camera...")
-    for _ in range(5):
+    # Warm up camera (let autofocus/exposure settle)
+    print("[TrainingCapture] Warming up camera (1 second)...")
+    start = time.time()
+    while time.time() - start < 1.0:
         cap.read()
 
     print("\n" + "=" * 60)
     print("CORNER DETECTION TRAINING PHOTO COLLECTION")
     print("=" * 60)
     print(f"Target: {count} photos")
+    print(f"Format: 4K MJPEG -> 720p downscale (matches deployment)")
     print("\nInstructions:")
     print("  - Press SPACE to capture a photo")
     print("  - Press Q to finish early")
@@ -97,48 +120,59 @@ def capture_training_photos(device_path, output_dir, count=20):
     captured = 0
 
     while captured < count:
-        ret, frame = cap.read()
+        ret, frame_4k = cap.read()
 
         if not ret:
             print("[TrainingCapture] [X] Failed to read frame")
             break
 
-        # Draw status overlay
-        display_frame = frame.copy()
+        # Downscale to 720p using LANCZOS4 - SAME AS DEPLOYMENT SCRIPTS
+        frame_720p = cv2.resize(frame_4k, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
+
+        # Draw status overlay on display copy
+        display_frame = frame_720p.copy()
         status_text = f"Photos: {captured}/{count} - Press SPACE to capture, Q to quit"
         cv2.putText(display_frame, status_text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Show format info
+        format_text = f"4K MJPEG -> 720p (matches deployment)"
+        cv2.putText(display_frame, format_text, (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         cv2.imshow("Corner Training Photo Collection", display_frame)
 
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord(' '):
-            # Capture photo
+            # Save the downscaled 720p frame (NOT the 4K frame)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"board_{captured+1:03d}_{timestamp}.png"
             filepath = output_dir / filename
 
-            cv2.imwrite(str(filepath), frame)
+            cv2.imwrite(str(filepath), frame_720p)
             captured += 1
 
-            print(f"[OK] Captured {captured}/{count}: {filename}")
+            print(f"[OK] Captured {captured}/{count}: {filename} (720p from 4K)")
 
         elif key == ord('q'):
             print(f"\n[TrainingCapture] Finished early with {captured} photos")
             break
 
-    cap.release()
+    # Release camera using GC (WBC-0E01 quirk workaround)
+    del cap
+    gc.collect()
     cv2.destroyAllWindows()
 
     print("\n" + "=" * 60)
     print(f"[OK] Training photo collection complete!")
     print(f"Total photos: {captured}")
+    print(f"Format: 4K MJPEG -> 720p downscale (matches deployment)")
     print(f"Saved to: {output_dir}")
     print("=" * 60)
     print()
     print("Next steps:")
-    print(f"  1. Label corners: python scripts/label_corners.py --input {output_dir} --output data/training/corner_dataset")
+    print(f"  1. Label corners: python scripts/label_corners.py --input {output_dir}")
     print(f"  2. Train model: python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml --epochs 100")
     print("=" * 60)
 
@@ -194,12 +228,18 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Check for existing images (we ADD to them, never delete)
+    existing_images = list(output_dir.glob("*.png")) + list(output_dir.glob("*.jpg"))
+
     print("=" * 60)
     print("Corner Detection Training Photo Collection")
     print("=" * 60)
     print(f"Camera: {device_path}")
     print(f"Output: {output_dir}")
-    print(f"Target: {args.count} photos")
+    if existing_images:
+        print(f"Existing images: {len(existing_images)} (will be PRESERVED)")
+    print(f"New images to capture: {args.count}")
+    print(f"Total after capture: {len(existing_images) + args.count}")
     print()
 
     # Capture photos

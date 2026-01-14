@@ -4,6 +4,10 @@ Label Corners for Corner Detection Training
 Interactive tool to label the 4 CORNERS of the chessboard in training photos.
 This creates a YOLO-format dataset specifically for fine-tuning the CORNER detection model.
 
+IMPORTANT: Images are preprocessed (grayscale + CLAHE) BEFORE labeling to match
+the preprocessing applied during inference. This ensures training data distribution
+matches inference data distribution.
+
 NOTE: This is for CORNER detection only, not piece detection.
 
 Usage:
@@ -24,21 +28,23 @@ from utils.image_preprocessing import preprocess_for_corner_detection
 
 
 class CornerLabeler:
-    """Interactive corner labeling tool."""
+    """Interactive corner labeling tool with preprocessing."""
 
     def __init__(self, image_path):
         self.image_path = image_path
-
-        # Load and preprocess image (grayscale + CLAHE)
-        # This shows the user the same view the model will see during inference
-        self.image = preprocess_for_corner_detection(str(image_path))
-        if self.image is None:
+        self.original_image = cv2.imread(str(image_path))
+        if self.original_image is None:
             raise ValueError(f"Failed to load image: {image_path}")
+
+        # Preprocess image (grayscale + CLAHE) to match inference pipeline
+        # This is CRITICAL: labels must be created on preprocessed images
+        # because the model will see preprocessed images during inference
+        self.image = preprocess_for_corner_detection(self.original_image)
 
         self.display_image = self.image.copy()
         self.corners = []  # List of (x, y) tuples
         self.corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-        self.window_name = "Label Corners (Preprocessed) - Click 4 corners: TL, TR, BR, BL"
+        self.window_name = "Label Corners (PREPROCESSED) - Click 4 corners: TL, TR, BR, BL"
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse clicks."""
@@ -165,10 +171,15 @@ def create_yolo_dataset(input_dir, output_dir):
         return False
 
     print("\n" + "=" * 60)
-    print(f"CORNER LABELING")
+    print(f"CORNER LABELING (WITH PREPROCESSING)")
     print("=" * 60)
     print(f"Found {len(image_files)} images")
-    print("\nInstructions:")
+    print()
+    print("PREPROCESSING: Images will be converted to grayscale + CLAHE")
+    print("  This matches the preprocessing applied during inference.")
+    print("  Labels are created on preprocessed images for consistency.")
+    print()
+    print("Instructions:")
     print("  1. Click 4 corners in order: TL, TR, BR, BL")
     print("  2. Press R to reset if you make a mistake")
     print("  3. Press ENTER to save and move to next image")
@@ -181,9 +192,9 @@ def create_yolo_dataset(input_dir, output_dir):
     for idx, image_file in enumerate(image_files):
         print(f"\n[{idx+1}/{len(image_files)}] Processing: {image_file.name}")
 
-        # Check if already labeled
+        # Check if already labeled (preprocessed images are saved as .png)
         label_dest = labels_dir / (image_file.stem + ".txt")
-        image_dest = images_dir / image_file.name
+        image_dest = images_dir / (image_file.stem + ".png")
 
         if label_dest.exists() and image_dest.exists():
             print(f"  [Already labeled] Skipping...")
@@ -199,26 +210,25 @@ def create_yolo_dataset(input_dir, output_dir):
                 print("  [Skipped]")
                 continue
 
-            # Get image dimensions
-            img = cv2.imread(str(image_file))
-            img_height, img_width = img.shape[:2]
+            # Get preprocessed image dimensions (same as original)
+            img_height, img_width = labeler.image.shape[:2]
 
             # Convert to YOLO format
             yolo_labels = convert_to_yolo_format(corners, img_width, img_height)
 
-            # Save image and label
-            image_dest = images_dir / image_file.name
+            # Save PREPROCESSED image and label
+            # Using .png to preserve quality (CLAHE grayscale)
+            image_dest = images_dir / (image_file.stem + ".png")
             label_dest = labels_dir / (image_file.stem + ".txt")
 
-            # Save preprocessed image (not original - training should match inference)
-            preprocessed = preprocess_for_corner_detection(str(image_file))
-            cv2.imwrite(str(image_dest), preprocessed)
+            # Save preprocessed image (NOT the original!)
+            cv2.imwrite(str(image_dest), labeler.image)
 
             # Write label file
             with open(label_dest, 'w') as f:
                 f.write('\n'.join(yolo_labels))
 
-            print(f"  [OK] Saved to dataset")
+            print(f"  [OK] Saved preprocessed image to dataset")
             labeled_count += 1
 
         except Exception as e:
