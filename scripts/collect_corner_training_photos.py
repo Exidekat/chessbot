@@ -6,6 +6,9 @@ for fine-tuning the CORNER DETECTION model (not piece detection).
 
 Purpose: Capture 20+ photos to teach the model to recognize YOUR board's corners.
 
+IMPORTANT: Uses the same 4K MJPEG -> 720p downscale pipeline as inference scripts
+to ensure training data matches inference conditions (lighting, exposure, etc.)
+
 Usage:
     python scripts/collect_corner_training_photos.py --device /dev/video0 --count 20
 """
@@ -16,6 +19,7 @@ from pathlib import Path
 import cv2
 import subprocess
 from datetime import datetime
+import time
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
