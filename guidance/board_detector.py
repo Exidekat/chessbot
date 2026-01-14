@@ -856,6 +856,79 @@ class BoardDetector:
         cv2.imwrite(output_path, img_vis)
         print(f"  → Grid visualization saved to {output_path}")
 
+    def visualize_placements(self, image: Image.Image, detections: np.ndarray, boxes: object,
+                             x_coords: List[float], y_coords: List[float],
+                             output_path: str = "data/chessboard_placements.png"):
+        """
+        Visualize piece placement decision points on the grid.
+
+        Shows a dot at the "decision point" for each detection - the point used
+        to determine which square the piece belongs to. This is the center-x of
+        the bounding box and the center of the bottom 25% (y at 87.5% of bbox height).
+
+        Args:
+            image: Transformed board image
+            detections: Detection bounding boxes (transformed)
+            boxes: YOLO boxes object with confidence and class info
+            x_coords: X coordinates of vertical grid lines
+            y_coords: Y coordinates of horizontal grid lines
+            output_path: Where to save the visualization
+        """
+        # Convert PIL to cv2
+        img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        img_vis = img_cv.copy()
+
+        # Draw grid lines (blue)
+        for x in x_coords:
+            cv2.line(img_vis, (int(x), 0), (int(x), img_vis.shape[0]), (255, 0, 0), 2)
+        for y in y_coords:
+            cv2.line(img_vis, (0, int(y)), (img_vis.shape[1], int(y)), (255, 0, 0), 2)
+
+        # Get class info
+        classes = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else boxes.cls
+        confidences = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf
+
+        # Draw placement points for each detection
+        for i, detection in enumerate(detections):
+            x1, y1, x2, y2 = detection[:4]
+
+            # Calculate the "decision point" - center of bottom 25% of bbox
+            # This matches the IoU calculation in connect_square_to_detection
+            center_x = (x1 + x2) / 2
+            bbox_height = y2 - y1
+            # Bottom 25% starts at 75% down, so center of bottom 25% is at 87.5%
+            decision_y = y1 + (bbox_height * 0.875)
+
+            # Get piece info
+            cls = int(classes[i])
+            piece = self.piece_map.get(cls, '?')
+            conf = confidences[i]
+
+            # Color based on confidence (same as visualize_detections)
+            color = self.get_confidence_color(conf)
+
+            # Draw filled circle at decision point
+            cv2.circle(img_vis, (int(center_x), int(decision_y)), 8, color, -1)
+            # Draw outline for visibility
+            cv2.circle(img_vis, (int(center_x), int(decision_y)), 8, (0, 0, 0), 2)
+
+            # Draw piece label near the dot
+            label = piece
+            label_x = int(center_x) + 12
+            label_y = int(decision_y) + 5
+
+            # Draw label background
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(img_vis, (label_x - 2, label_y - label_h - 2),
+                         (label_x + label_w + 2, label_y + 2), (0, 0, 0), -1)
+
+            # Draw label text
+            cv2.putText(img_vis, label, (label_x, label_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        cv2.imwrite(output_path, img_vis)
+        print(f"  → Placement visualization saved to {output_path}")
+
     def get_confidence_color(self, confidence: float) -> Tuple[int, int, int]:
         """
         Get BGR color based on confidence value (0.0 to 1.0).
@@ -1033,6 +1106,7 @@ class BoardDetector:
         if debug:
             print(f"[BoardDetector]   Grid: {len(x_coords)-1}x{len(y_coords)-1} squares")
             self.visualize_grid(transformed_image, x_coords, y_coords)
+            self.visualize_placements(transformed_image, detections, boxes, x_coords, y_coords)
 
         # Step 5: Create squares
         if debug:
