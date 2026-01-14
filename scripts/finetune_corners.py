@@ -23,16 +23,16 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def create_train_val_split(dataset_dir, val_fraction=0.1):
+def create_train_val_split(dataset_dir, val_fraction=0.0):
     """
     Create temporary train/val split directories.
 
     Args:
         dataset_dir: Path to dataset directory containing images/ and labels/
-        val_fraction: Fraction of data to use for validation (default: 0.1 = 10%)
+        val_fraction: Fraction of data to use for validation (default: 0.0 = use full set for both)
 
     Returns:
-        Path to temporary data.yaml
+        Tuple of (path to temporary data.yaml, num_train, num_val)
     """
     dataset_path = Path(dataset_dir)
     images_dir = dataset_path / "images"
@@ -44,23 +44,36 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
     if len(image_files) == 0:
         raise ValueError(f"No images found in {images_dir}")
 
-    # Calculate split
-    num_val = max(1, int(len(image_files) * val_fraction))
-    num_train = len(image_files) - num_val
+    # Determine split strategy
+    if val_fraction <= 0:
+        # Use full dataset for both train and val (no holdout)
+        train_files = image_files
+        val_files = image_files
+        num_train = len(image_files)
+        num_val = len(image_files)
 
-    # Randomly shuffle and split
-    random.seed(42)  # For reproducibility
-    shuffled_files = image_files.copy()
-    random.shuffle(shuffled_files)
+        print(f"\n[Dataset Split]")
+        print(f"  Total images: {len(image_files)}")
+        print(f"  Training: {num_train} images (100%)")
+        print(f"  Validation: {num_val} images (100% - same as training)")
+        print(f"  Mode: Full dataset for both train/val (no holdout)")
+    else:
+        # Random split with holdout
+        num_val = max(1, int(len(image_files) * val_fraction))
+        num_train = len(image_files) - num_val
 
-    val_files = shuffled_files[:num_val]
-    train_files = shuffled_files[num_val:]
+        random.seed(42)  # For reproducibility
+        shuffled_files = image_files.copy()
+        random.shuffle(shuffled_files)
 
-    print(f"\n[Dataset Split]")
-    print(f"  Total images: {len(image_files)}")
-    print(f"  Training: {num_train} images ({100*(1-val_fraction):.0f}%)")
-    print(f"  Validation: {num_val} images ({100*val_fraction:.0f}%)")
-    print(f"  Random seed: 42")
+        val_files = shuffled_files[:num_val]
+        train_files = shuffled_files[num_val:]
+
+        print(f"\n[Dataset Split]")
+        print(f"  Total images: {len(image_files)}")
+        print(f"  Training: {num_train} images ({100*(1-val_fraction):.0f}%)")
+        print(f"  Validation: {num_val} images ({100*val_fraction:.0f}%)")
+        print(f"  Random seed: 42")
 
     # Create temporary split directories
     temp_dir = dataset_path / "temp_split"
@@ -91,9 +104,13 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
     for img_file in val_files:
         lbl_file = labels_dir / (img_file.stem + ".txt")
 
-        (val_img_dir / img_file.name).symlink_to(img_file.absolute())
-        if lbl_file.exists():
-            (val_lbl_dir / lbl_file.name).symlink_to(lbl_file.absolute())
+        # Skip if already exists (when using full dataset for both)
+        val_img_link = val_img_dir / img_file.name
+        val_lbl_link = val_lbl_dir / lbl_file.name
+        if not val_img_link.exists():
+            val_img_link.symlink_to(img_file.absolute())
+        if lbl_file.exists() and not val_lbl_link.exists():
+            val_lbl_link.symlink_to(lbl_file.absolute())
 
     # Create temporary data.yaml
     temp_data_yaml = {
@@ -115,7 +132,7 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
 
 
 def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=1280,
-                          val_fraction=0.2, lr=0.0001, patience=20, freeze=10):
+                          val_fraction=0.0, lr=0.0001, patience=20, freeze=10):
     """
     Fine-tune corner detection model.
 
@@ -125,7 +142,7 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
         output_dir: Directory for training outputs
         epochs: Number of training epochs
         imgsz: Image size for training (default: 1280 to match 1280x720 camera resolution)
-        val_fraction: Fraction of data for validation (default: 0.2 = 20%)
+        val_fraction: Fraction of data for validation (default: 0.0 = use full set for both)
         lr: Learning rate (default: 0.0001 - low for fine-tuning)
         patience: Early stopping patience (default: 20)
         freeze: Number of layers to freeze (default: 10 - freeze backbone)
@@ -294,8 +311,8 @@ def main():
     parser.add_argument(
         "--val-fraction",
         type=float,
-        default=0.2,
-        help="Fraction of data for validation (default: 0.2 = 20%%)"
+        default=0.0,
+        help="Fraction of data for validation (default: 0.0 = use full set for both train/val)"
     )
     parser.add_argument(
         "--lr",

@@ -189,6 +189,11 @@ def main():
         choices=["white", "black"],
         help="Whose turn to calculate move for (default: black)"
     )
+    parser.add_argument(
+        "--yuyv",
+        action="store_true",
+        help="Use YUYV 720p capture instead of 4K MJPEG downscale (uncompressed, lower quality)"
+    )
 
     args = parser.parse_args()
 

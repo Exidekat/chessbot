@@ -53,15 +53,17 @@ class LiveCameraCapture:
         >>> capture.stop()
     """
 
-    def __init__(self, device_path: str):
+    def __init__(self, device_path: str, use_yuyv: bool = False):
         """
         Initialize live camera capture.
 
         Args:
             device_path: Camera device path (e.g., /dev/video7)
+            use_yuyv: If True, use YUYV 720p instead of MJPEG (default: False)
         """
         self.device_path = device_path
         self.camera_index = get_camera_index_from_device(device_path)
+        self.use_yuyv = use_yuyv
         self.running = False
         self.thread = None
         self.latest_frame = None
