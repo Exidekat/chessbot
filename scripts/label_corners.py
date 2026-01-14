@@ -20,20 +20,25 @@ import shutil
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from utils.image_preprocessing import preprocess_for_corner_detection
+
 
 class CornerLabeler:
     """Interactive corner labeling tool."""
 
     def __init__(self, image_path):
         self.image_path = image_path
-        self.image = cv2.imread(str(image_path))
+
+        # Load and preprocess image (grayscale + CLAHE)
+        # This shows the user the same view the model will see during inference
+        self.image = preprocess_for_corner_detection(str(image_path))
         if self.image is None:
             raise ValueError(f"Failed to load image: {image_path}")
 
         self.display_image = self.image.copy()
         self.corners = []  # List of (x, y) tuples
         self.corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-        self.window_name = "Label Corners - Click 4 corners in order: TL, TR, BR, BL"
+        self.window_name = "Label Corners (Preprocessed) - Click 4 corners: TL, TR, BR, BL"
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse clicks."""
@@ -205,8 +210,9 @@ def create_yolo_dataset(input_dir, output_dir):
             image_dest = images_dir / image_file.name
             label_dest = labels_dir / (image_file.stem + ".txt")
 
-            # Copy image
-            shutil.copy(image_file, image_dest)
+            # Save preprocessed image (not original - training should match inference)
+            preprocessed = preprocess_for_corner_detection(str(image_file))
+            cv2.imwrite(str(image_dest), preprocessed)
 
             # Write label file
             with open(label_dest, 'w') as f:

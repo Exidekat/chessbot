@@ -18,9 +18,12 @@ from ultralytics import YOLO
 import random
 import shutil
 import yaml
+import cv2
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from utils.image_preprocessing import preprocess_for_corner_detection
 
 
 def create_train_val_split(dataset_dir, val_fraction=0.1):
@@ -79,19 +82,28 @@ def create_train_val_split(dataset_dir, val_fraction=0.1):
     val_img_dir.mkdir(parents=True, exist_ok=True)
     val_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-    # Symlink training files
+    # Preprocess and copy training files
+    # IMPORTANT: Apply grayscale + CLAHE preprocessing for consistency with inference
+    print("  Preprocessing training images (grayscale + CLAHE)...")
     for img_file in train_files:
         lbl_file = labels_dir / (img_file.stem + ".txt")
 
-        (train_img_dir / img_file.name).symlink_to(img_file.absolute())
+        # Preprocess image and save (not symlink - we need the preprocessed version)
+        preprocessed = preprocess_for_corner_detection(str(img_file))
+        cv2.imwrite(str(train_img_dir / img_file.name), preprocessed)
+
         if lbl_file.exists():
             (train_lbl_dir / lbl_file.name).symlink_to(lbl_file.absolute())
 
-    # Symlink validation files
+    # Preprocess and copy validation files
+    print("  Preprocessing validation images (grayscale + CLAHE)...")
     for img_file in val_files:
         lbl_file = labels_dir / (img_file.stem + ".txt")
 
-        (val_img_dir / img_file.name).symlink_to(img_file.absolute())
+        # Preprocess image and save
+        preprocessed = preprocess_for_corner_detection(str(img_file))
+        cv2.imwrite(str(val_img_dir / img_file.name), preprocessed)
+
         if lbl_file.exists():
             (val_lbl_dir / lbl_file.name).symlink_to(lbl_file.absolute())
 

@@ -13,6 +13,7 @@ from ultralytics import YOLO
 import chess
 from pathlib import Path
 from typing import Optional, Tuple, List
+from utils.image_preprocessing import preprocess_for_corner_detection
 
 
 class BoardDetector:
@@ -204,8 +205,20 @@ class BoardDetector:
         Raises:
             ValueError: If 4 distinct corners cannot be detected
         """
+        # Preprocess image for corner detection (grayscale + contrast normalization)
+        # This improves detection in dimly lit conditions
+        preprocessed = preprocess_for_corner_detection(image_path)
+
+        # Save preprocessed image to temp file for YOLO
+        temp_preprocessed_path = "data/temp_corner_preprocessed.png"
+        cv2.imwrite(temp_preprocessed_path, preprocessed)
+
+        if debug:
+            print(f"[DEBUG]   Preprocessing: grayscale + CLAHE contrast normalization")
+            print(f"[DEBUG]   Preprocessed image saved to {temp_preprocessed_path}")
+
         results = self.corner_model.predict(
-            source=image_path,
+            source=temp_preprocessed_path,
             conf=conf_threshold,
             verbose=False
         )
