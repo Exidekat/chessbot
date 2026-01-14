@@ -292,15 +292,21 @@ python scripts/collect_piece_training_photos.py --device /dev/video0 --count 30
 # Step 2: Label pieces in each photo (draw bounding boxes, assign classes)
 python scripts/label_pieces.py --input data/training/piece_photos
 
-# Step 3: Fine-tune the piece detection model on your labeled data (30-60 min on CPU)
+# Step 3: Fine-tune the piece detection model on your labeled data (30-60 min on GPU)
 python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml
 
-# Step 4: Backup original model and deploy fine-tuned model
+# Step 4: Backup original model and deploy fine-tuned model (use best_cls.pt for classification priority)
 mv data/best_transformed_detection.pt data/best_transformed_detection_original.pt
+cp data/training/runs/piece_finetune/weights/best_cls.pt data/best_transformed_detection.pt
+
+# Alternative: Use best.pt if detection (finding all pieces) is more important than classification
 cp data/training/runs/piece_finetune/weights/best.pt data/best_transformed_detection.pt
 
 # Step 5: Test fine-tuned piece detection model
 python scripts/best_move_demo.py --debug
+
+# Step 6 (optional): Analyze which pieces are misclassified
+python scripts/validate_piece_labels_with_yolo.py --data data/training/piece_dataset/
 
 ## Label Validation (Review and Correct Labels Before Training)
 
@@ -325,6 +331,34 @@ python scripts/validate_piece_labels.py --data data/training/piece_dataset/data.
 #   a = add mode (draw new bbox)
 #   ENTER = save
 #   ESC = cancel
+
+## YOLO Model Validation (Analyze Misclassifications After Training)
+
+# Show images where the model misclassifies pieces (errors only)
+python scripts/validate_piece_labels_with_yolo.py --data data/training/piece_dataset/
+
+# Use a specific model (best_cls.pt prioritizes classification accuracy)
+python scripts/validate_piece_labels_with_yolo.py --model data/training/runs/piece_finetune/weights/best_cls.pt
+
+# Show all images including ones with no errors
+python scripts/validate_piece_labels_with_yolo.py --data data/training/piece_dataset/ --all-images
+
+# Show all predictions including correct ones (green boxes)
+python scripts/validate_piece_labels_with_yolo.py --data data/training/piece_dataset/ --show-all
+
+# Custom confidence threshold (lower = more detections, higher = fewer false positives)
+python scripts/validate_piece_labels_with_yolo.py --data data/training/piece_dataset/ --conf 0.35
+
+# Controls:
+#   SPACE/n = next image
+#   b = go back
+#   q = quit
+#
+# Color Legend:
+#   RED = misclassification (wrong class predicted)
+#   ORANGE = missed detection (piece not found)
+#   PURPLE = false positive (predicted piece that doesn't exist)
+#   GREEN = correct prediction (only with --show-all)
 
 ## Visualization Tool
 
