@@ -7,17 +7,88 @@ on your specific chess piece set.
 NOTE: This is for PIECE detection only, not corner detection.
       For corner detection fine-tuning, use finetune_corners.py.
 
+CLASSIFICATION PRIORITY: This script saves models based on LOWEST cls_loss,
+prioritizing correct piece classification over bbox accuracy.
+
 Usage:
     python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml
 """
 
 import argparse
 import sys
+import shutil
 from pathlib import Path
 from ultralytics import YOLO
+from ultralytics.utils import LOGGER
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+class BestClsLossTracker:
+    """
+    Custom callback tracker to save model with lowest classification loss.
+
+    YOLO's default 'best.pt' is based on mAP (detection quality).
+    For chess piece classification, we prioritize lowest cls_loss
+    to ensure correct piece identification even at cost of bbox accuracy.
+    """
+
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir)
+        self.best_cls_loss = float('inf')
+        self.best_epoch = -1
+        self.best_model_path = self.output_dir / "piece_finetune" / "weights" / "best_cls.pt"
+        self.history = []  # Track (epoch, cls_loss, mAP50-95) for analysis
+
+    def on_fit_epoch_end(self, trainer):
+        """Called at end of each epoch - check if this is best cls_loss."""
+        epoch = trainer.epoch
+
+        # Get classification loss from trainer metrics
+        # trainer.loss_items contains [box_loss, cls_loss, dfl_loss]
+        if hasattr(trainer, 'loss_items') and trainer.loss_items is not None:
+            cls_loss = float(trainer.loss_items[1])  # Index 1 is cls_loss
+        else:
+            return
+
+        # Get mAP for logging
+        metrics = trainer.metrics
+        map50_95 = metrics.get('metrics/mAP50-95(B)', 0.0)
+
+        self.history.append((epoch, cls_loss, map50_95))
+
+        if cls_loss < self.best_cls_loss:
+            self.best_cls_loss = cls_loss
+            self.best_epoch = epoch
+
+            # Save current model as best_cls.pt
+            last_model = self.output_dir / "piece_finetune" / "weights" / "last.pt"
+            if last_model.exists():
+                self.best_model_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(last_model, self.best_model_path)
+                print(f"\n[BEST CLS] Epoch {epoch}: cls_loss={cls_loss:.4f} (mAP50-95={map50_95:.3f}) -> Saved best_cls.pt")
+
+    def on_train_end(self, trainer):
+        """Called when training ends - print summary."""
+        print("\n" + "=" * 60)
+        print("CLASSIFICATION LOSS TRACKING SUMMARY")
+        print("=" * 60)
+
+        if self.best_epoch >= 0:
+            print(f"Best cls_loss: {self.best_cls_loss:.4f} at epoch {self.best_epoch}")
+            print(f"Saved to: {self.best_model_path}")
+
+            # Find the epoch with best mAP for comparison
+            if self.history:
+                best_map_entry = max(self.history, key=lambda x: x[2])
+                print(f"\nComparison:")
+                print(f"  Best cls_loss: epoch {self.best_epoch}, cls={self.best_cls_loss:.4f}")
+                print(f"  Best mAP50-95: epoch {best_map_entry[0]}, mAP={best_map_entry[2]:.3f}, cls={best_map_entry[1]:.4f}")
+        else:
+            print("[Warning] No cls_loss tracking data available")
+
+        print("=" * 60)
 
 
 def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=1280):
@@ -46,6 +117,13 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
     print("Loading base model...")
     model = YOLO(base_model)
     print("[OK] Model loaded")
+    print()
+
+    # Register custom callback for cls_loss tracking
+    cls_tracker = BestClsLossTracker(output_dir)
+    model.add_callback("on_fit_epoch_end", cls_tracker.on_fit_epoch_end)
+    model.add_callback("on_train_end", cls_tracker.on_train_end)
+    print("[OK] Registered cls_loss tracker (saves best_cls.pt)")
     print()
 
     # Fine-tune
@@ -108,18 +186,30 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
     print("[OK] Fine-tuning complete!")
     print("=" * 60)
 
-    # Find best model
-    best_model_path = Path(output_dir) / "piece_finetune" / "weights" / "best.pt"
+    # Find best models
+    weights_dir = Path(output_dir) / "piece_finetune" / "weights"
+    best_map_path = weights_dir / "best.pt"      # YOLO's default (best mAP)
+    best_cls_path = weights_dir / "best_cls.pt"  # Our custom (best cls_loss)
 
-    if best_model_path.exists():
-        print(f"Best model: {best_model_path}")
-        print()
-        print("To use the fine-tuned model:")
-        print(f"  1. Backup original: mv data/best_transformed_detection.pt data/best_transformed_detection_original.pt")
-        print(f"  2. Copy fine-tuned: cp {best_model_path} data/best_transformed_detection.pt")
-        print(f"  3. Test: python scripts/best_move_demo.py --debug")
-    else:
-        print("[X] Warning: Could not find best model weights")
+    print("\nSaved models:")
+    if best_map_path.exists():
+        print(f"  best.pt     - Best mAP50-95 (detection quality)")
+    if best_cls_path.exists():
+        print(f"  best_cls.pt - Best cls_loss (classification accuracy) [RECOMMENDED]")
+
+    print()
+    print("To use the fine-tuned model (choose ONE):")
+    print()
+    print("  Option A - Best CLASSIFICATION (recommended for chess):")
+    print(f"    cp {best_cls_path} data/best_transformed_detection.pt")
+    print()
+    print("  Option B - Best DETECTION (if missing pieces is the issue):")
+    print(f"    cp {best_map_path} data/best_transformed_detection.pt")
+    print()
+    print("  Then test: python scripts/best_move_demo.py --debug")
+    print()
+    print("  To analyze misclassifications:")
+    print("    python scripts/validate_piece_labels_with_yolo.py --model best_cls.pt")
 
     print("=" * 60)
 
