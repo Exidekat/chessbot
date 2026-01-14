@@ -58,7 +58,7 @@ from utils.camera_helpers import (
     get_camera_index_from_device,
     capture_4k_downscale,
     get_default_global_camera,
-    get_default_gripper_camera,
+    get_default_gripper_camera_with_name,
 )
 from utils.keyboard_input import KeyboardInput
 from controls.robot_controller import (
@@ -1014,11 +1014,13 @@ def main():
         gripper_camera = args.gripper_camera
         print(f"[OK] Gripper camera: {gripper_camera} (specified)")
     else:
-        gripper_camera = get_default_gripper_camera()
-        if gripper_camera:
-            print(f"[OK] Gripper camera: {gripper_camera} (auto-detected eMeet C950)")
+        gripper_result = get_default_gripper_camera_with_name()
+        if gripper_result:
+            gripper_camera, gripper_name = gripper_result
+            print(f"[OK] Gripper camera: {gripper_camera} (auto-detected {gripper_name})")
         else:
-            print("[X] Gripper camera (eMeet C950) not found!")
+            print("[X] No gripper camera found!")
+            print("    Searched for: eMeet C950, USB2.0_CAM1")
             print("    Use --gripper-camera to specify manually")
             if robot_arm:
                 robot_arm.disconnect()

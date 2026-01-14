@@ -59,7 +59,9 @@ def get_available_cameras() -> List[Tuple[str, str]]:
             timeout=5
         )
 
-        if result.returncode == 0:
+        # Parse stdout even if return code is non-zero (v4l2-ctl can fail
+        # on some devices while still listing others successfully)
+        if result.stdout:
             lines = result.stdout.strip().split('\n')
             current_device_name = None
 
@@ -73,7 +75,9 @@ def get_available_cameras() -> List[Tuple[str, str]]:
                     if current_device_name:
                         cameras.append((device_path, current_device_name))
 
-            return cameras
+            # Return if we found any cameras
+            if cameras:
+                return cameras
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
@@ -96,6 +100,7 @@ def get_available_cameras() -> List[Tuple[str, str]]:
 # Hardware constants for auto-detection
 GLOBAL_CAMERA_PREFIX = "WBC-0E01"
 GRIPPER_CAMERA_PREFIX = "HD Webcam eMeet C950"
+GRIPPER_CAMERA_FALLBACK_PREFIX = "USB2.0_CAM1"
 
 
 def find_camera_by_name(name_prefix: str) -> Optional[str]:
@@ -135,19 +140,54 @@ def get_default_global_camera() -> Optional[str]:
     return find_camera_by_name(GLOBAL_CAMERA_PREFIX)
 
 
-def get_default_gripper_camera() -> Optional[str]:
+def get_default_gripper_camera_with_name() -> Optional[Tuple[str, str]]:
     """
-    Auto-detect gripper camera (eMeet C950).
+    Auto-detect gripper camera and return both device path and camera name.
+
+    Tries cameras in order of preference:
+    1. eMeet C950 (primary gripper camera)
+    2. USB2.0_CAM1 (fallback gripper camera on some bots)
 
     Returns:
-        Device path (e.g., "/dev/video0") or None if not found
+        Tuple of (device_path, camera_name) or None if no gripper camera found
+
+    Example:
+        >>> result = get_default_gripper_camera_with_name()
+        >>> if result:
+        >>>     device, name = result
+        >>>     print(f"[OK] Auto-detected gripper camera: {device} ({name})")
+    """
+    # Try primary gripper camera (eMeet C950)
+    device = find_camera_by_name(GRIPPER_CAMERA_PREFIX)
+    if device:
+        return (device, GRIPPER_CAMERA_PREFIX)
+
+    # Try fallback gripper camera (USB2.0_CAM1)
+    device = find_camera_by_name(GRIPPER_CAMERA_FALLBACK_PREFIX)
+    if device:
+        return (device, GRIPPER_CAMERA_FALLBACK_PREFIX)
+
+    return None
+
+
+def get_default_gripper_camera() -> Optional[str]:
+    """
+    Auto-detect gripper camera (returns device path only).
+
+    Tries cameras in order of preference:
+    1. eMeet C950 (primary gripper camera)
+    2. USB2.0_CAM1 (fallback gripper camera on some bots)
+
+    Returns:
+        Device path (e.g., "/dev/video0") or None if no gripper camera found
 
     Example:
         >>> device = get_default_gripper_camera()
         >>> if device:
         >>>     print(f"[OK] Auto-detected gripper camera: {device}")
     """
-    return find_camera_by_name(GRIPPER_CAMERA_PREFIX)
+    result = get_default_gripper_camera_with_name()
+    return result[0] if result else None
 
 
 def select_camera(cameras: List[Tuple[str, str]]) -> str:
