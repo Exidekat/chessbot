@@ -62,6 +62,7 @@ from utils.camera_helpers import (
     get_default_gripper_camera_with_name,
     get_available_cameras,
     select_camera,
+    capture_4k_downscale,
 )
 
 # Configure HuggingFace for offline/local usage
@@ -703,19 +704,31 @@ class EpisodeRecorder:
                     if key != 'ENTER':
                         continue
 
-                    # Capture board image
-                    board_image_path = "data/board_capture.png"
-                    frame = self.global_cam_capture.get_latest_frame()
+                    # Capture board image using 4K MJPEG -> 720p downscale
+                    # This matches the training data pipeline for consistent detection
+                    board_image_path = Path("data/board_capture.png")
 
-                    if frame is None:
+                    # Stop live capture to release camera for 4K capture
+                    print("[INFO] Stopping live capture for 4K board detection...")
+                    self.global_cam_capture.stop()
+                    time.sleep(0.5)  # Allow camera to fully release
+
+                    # Capture with 4K -> 720p downscale (matches training data)
+                    success = capture_4k_downscale(self.global_camera_device, board_image_path)
+
+                    # Restart live capture for episode recording
+                    print("[INFO] Restarting live capture...")
+                    self.global_cam_capture.start()
+                    time.sleep(1.0)  # Allow camera to reinitialize
+
+                    if not success:
                         print("[ERROR] Failed to capture board image")
                         continue
 
-                    cv2.imwrite(board_image_path, frame)
-                    print(f"[OK] Board image captured: {board_image_path}")
+                    print(f"[OK] Board image captured: {board_image_path} (4K -> 720p)")
 
                     # Detect and decompose move
-                    move_info = self._detect_and_decompose_move(board_image_path)
+                    move_info = self._detect_and_decompose_move(str(board_image_path))
 
                     if move_info is None:
                         print("[ERROR] Failed to process board, try again")

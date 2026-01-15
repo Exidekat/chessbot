@@ -60,6 +60,9 @@ from utils.camera_helpers import (
     get_default_global_camera,
     get_default_gripper_camera_with_name,
 )
+
+# Board detection uses 4K MJPEG -> 720p downscale for consistency with training data
+# Real-time VLA control uses native 720p MJPEG at 30fps for low latency
 from utils.keyboard_input import KeyboardInput
 from controls.robot_controller import (
     RobotController,
@@ -665,18 +668,18 @@ def execute_move(
     print("BOARD DETECTION & MOVE CALCULATION")
     print("=" * 60)
 
-    # Capture photo for board detection
-    print("Capturing board image...")
-    board_frame = capture_720p_frame(global_camera)
-    if board_frame is None:
-        print("[X] Failed to capture board image")
-        return MoveResult(success=False, restart_requested=False)
-
-    # Save for debugging
+    # Capture photo for board detection using 4K MJPEG -> 720p downscale
+    # This matches the training data pipeline for consistent detection
+    print("Capturing board image (4K -> 720p downscale)...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_path = Path("data") / f"vla_board_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(image_path), board_frame)
+
+    success = capture_4k_downscale(global_camera, image_path)
+    if not success:
+        print("[X] Failed to capture board image")
+        return MoveResult(success=False, restart_requested=False)
+
     print(f"[OK] Board image saved: {image_path}")
 
     # Detect board state

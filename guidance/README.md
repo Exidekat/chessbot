@@ -246,15 +246,17 @@ python scripts/download.py
 ### Detection Parameters
 
 **Corner Detection:**
-- Default confidence: 0.1
-- Min distance: 50.0 pixels
+- Default confidence: 0.005
+- Min distance: 30.0 pixels
 - Expects exactly 4 corners
+- **Preprocessing**: Grayscale + CLAHE contrast normalization (REQUIRED - training data uses this)
+- **Input**: 1280x720 images (from 4K MJPEG downscale for best quality)
 
 **Piece Detection:**
 - Base confidence: 0.35
 - Pawn threshold: 0.45 (higher to reduce misclassification)
 - Test-time augmentation: Enabled
-- Preprocessing: Enabled by default
+- Preprocessing: LAB color space, CLAHE, mild sharpening
 
 ## Performance Notes
 

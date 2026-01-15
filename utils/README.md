@@ -75,12 +75,18 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     get_camera_index_from_device,
-    capture_1080p_downscale
+    capture_4k_downscale,
+    get_default_global_camera,
+    get_default_gripper_camera_with_name,
 )
 
 # Find all cameras
 cameras = get_available_cameras()
 # Returns: [('/dev/video0', 'WBC-0E01: WBC-0E01'), ...]
+
+# Auto-detect cameras by name
+global_cam = get_default_global_camera()        # Finds WBC-0E01
+gripper_cam = get_default_gripper_camera_with_name()  # Finds eMeet C950
 
 # Interactive selection
 device = select_camera(cameras)
@@ -88,8 +94,8 @@ device = select_camera(cameras)
 # Parse device path
 index = get_camera_index_from_device("/dev/video0")  # Returns 0
 
-# Capture 1080p and downscale to 720p
-success = capture_1080p_downscale("/dev/video0", Path("board.png"))
+# Capture 4K MJPEG and downscale to 720p (best quality for board detection)
+success = capture_4k_downscale("/dev/video0", Path("board.png"))
 ```
 
 **Functions:**
@@ -99,7 +105,14 @@ success = capture_1080p_downscale("/dev/video0", Path("board.png"))
 | `get_available_cameras()` | Detect USB cameras via v4l2-ctl |
 | `select_camera(cameras)` | Interactive camera selection prompt |
 | `get_camera_index_from_device(path)` | Parse /dev/videoN to OpenCV index |
-| `capture_1080p_downscale(device, output)` | Capture 1080p MJPEG, downscale to 720p |
+| `capture_4k_downscale(device, output)` | Capture 4K MJPEG (3840x2160), downscale to 720p via LANCZOS4 |
+| `get_default_global_camera()` | Auto-detect WBC-0E01 camera by name |
+| `get_default_gripper_camera_with_name()` | Auto-detect eMeet C950 or USB2.0_CAM1 |
+
+**Capture Pipeline Notes:**
+- `capture_4k_downscale()` provides ~9:1 supersampling for superior quality, noise reduction, and anti-aliasing
+- Used for board detection (corner + piece detection) to match training data quality
+- For real-time VLA, use `LiveCameraCapture` from `cameras/` module instead (native 720p at 30fps)
 
 ### `keyboard_input.py`
 

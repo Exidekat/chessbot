@@ -213,9 +213,11 @@ capture.stop()
 ```
 
 **Features:**
-- Configures camera for native 720p MJPEG at 30fps
+- Configures camera for native 720p MJPEG at 30fps (low latency for real-time VLA)
 - Buffer size = 1 for minimal latency
 - Thread-safe frame access
+
+**Note:** This is for real-time VLA control loops. For board detection (corner/piece detection), use `capture_4k_downscale()` from `utils.camera_helpers` which captures at 4K and downscales to 720p for better quality.
 
 ### `virtual_camera.py`
 
@@ -262,14 +264,18 @@ cameras:
 
 ### Global Camera (WBC-0E01)
 - **Purpose**: Board state detection, overall monitoring
-- **Resolution**: 1280x720 (fixed for YOLO consistency)
+- **Output Resolution**: 1280x720 (fixed for YOLO consistency)
+- **Capture Modes**:
+  - **Board Detection**: 4K MJPEG (3840x2160) downscaled to 720p via LANCZOS4 for superior quality
+  - **Real-time VLA**: Native 720p MJPEG at 30fps for low latency
 - **Frame Rate**: 30 FPS MJPEG
 - **Mounting**: Overhead, bird's-eye view of full board
 - **Format**: BGR (OpenCV standard)
 
 ### Gripper Camera (eMeet C950)
 - **Purpose**: Close-up manipulation feedback, VLA input
-- **Resolution**: 224x224 (VLA input size)
+- **Capture Resolution**: 640x480 (native camera resolution)
+- **Output Resolution**: 224x224 (resized for VLA input - most cameras don't support 224x224 natively)
 - **Frame Rate**: 30 FPS
 - **Mounting**: On robot arm/gripper
 - **Format**: BGR (OpenCV standard)

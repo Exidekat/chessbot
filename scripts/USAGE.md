@@ -63,10 +63,10 @@ python scripts/capture_photo.py --device /dev/video0 --width 2592 --height 1944 
 
 ## Demo and Testing
 
-# Run full pipeline: capture 4K MJPEG -> 720p photo + detect board + calculate best move (auto-detects camera)
+# Run full pipeline: capture 4K MJPEG -> 720p downscale + detect board + calculate best move (auto-detects camera)
 python scripts/best_move_demo.py
 
-# Run full pipeline with debug visualizations enabled
+# Run full pipeline with debug visualizations enabled (saves corner/piece detection images)
 python scripts/best_move_demo.py --debug
 
 # Run full pipeline with specific global camera device (UPDATED ARG NAME)
@@ -121,6 +121,9 @@ python scripts/virtual_overlay_demo.py --global-camera /dev/video0 --rotation ri
 ## VLA Episode Collection (Training Data Recording)
 
 # Prerequisites: v4l2loopback loaded, tele_op.py running in Terminal 1
+# Camera pipeline: Board detection uses 4K->720p downscale, real-time recording uses native 720p at 30fps
+# Gripper captures at 640x480 and resizes to 224x224 for VLA input
+
 # Terminal 1: Run tele-op to control robot (required for episode collection)
 python scripts/tele_op.py
 
@@ -228,6 +231,9 @@ python scripts/vla_finetune.py --model pi0
 
 ## VLA Deployment (Multi-Model: PI0, SmolVLA)
 
+# Camera pipeline: Board detection uses 4K->720p downscale, VLA control uses native 720p at 30fps
+# Gripper captures at 640x480 and resizes to 224x224 for VLA input
+
 # Deploy PI0 base model for chess robot control (auto-detects cameras)
 python scripts/vla_deploy.py --model pi0 --no-robot
 
@@ -268,14 +274,17 @@ python scripts/generate_overlay.py --cache data/state_cache.json
 
 ## Corner Detection Fine-tuning (Fix Corner Detection Issues)
 
-# Step 1: Collect 20+ training photos of YOUR chessboard (vary angles, lighting, positions)
+# Step 1: Collect 20+ training photos of YOUR chessboard (uses 4K -> 720p downscale)
 python scripts/collect_corner_training_photos.py --device /dev/video0 --count 20
 
-# Step 2: Label the 4 corners in each photo (interactive clicking tool)
+# Step 2: Label the 4 corners in each photo (auto-preprocesses with grayscale + CLAHE)
 python scripts/label_corners.py --input data/training/board_photos
 
-# Step 3: Fine-tune the corner detection model on your labeled data (15-30 min on CPU)
+# Step 3: Fine-tune the corner detection model (uses full dataset for train/val by default)
 python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml
+
+# Fine-tune with custom parameters (lr=0.0001, freeze=10 backbone layers, patience=20)
+python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml --lr 0.0001 --freeze 10 --patience 20
 
 # Step 4: Backup original model and deploy fine-tuned model
 mv data/best_corners.pt data/best_corners_original.pt

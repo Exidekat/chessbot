@@ -24,11 +24,11 @@ ChessBot is a modular chess robot system with YOLO-based computer vision, multi-
 
 ### Demo and Testing
 ```bash
-# Run full pipeline: capture YUYV 720p + detect + calculate move
+# Run full pipeline: capture 4K MJPEG -> 720p downscale + detect + calculate move
 python scripts/best_move_demo.py --debug
 
 # Run with specific camera
-python scripts/best_move_demo.py --debug --device /dev/video0
+python scripts/best_move_demo.py --debug --global-camera /dev/video0
 
 # Generate overlay from state cache
 python scripts/generate_overlay.py
@@ -206,14 +206,15 @@ Download with `python download.py` on first run.
 ### Detection Pipeline
 
 1. **Corner Detection** (YOLO stage 1)
-   - Input: Raw board image
+   - Input: 1280x720 board image (from 4K MJPEG downscale)
+   - Preprocessing: Grayscale conversion + CLAHE contrast normalization (must match training data)
    - Output: 4 corners (TL, TR, BR, BL)
-   - Params: `corner_conf=0.1`, `min_corner_distance=50.0`
+   - Params: `corner_conf=0.005`, `min_corner_distance=30.0`
 
 2. **Perspective Transform**
    - Uses detected corners to warp board to orthogonal view
    - Adds 10% top margin for tall pieces (kings, queens)
-   - Preprocessing: LAB color space, CLAHE, mild sharpening
+   - Preprocessing for piece detection: LAB color space, CLAHE, mild sharpening
 
 3. **Piece Detection** (YOLO stage 2)
    - Input: Transformed board image
@@ -597,5 +598,10 @@ python {args for the script execution}
 
 This means we should have exactly 2 lines per script usage. Some scripts may have more than one usage.
 - Cached data, results, and intermediate files should be output to data/ or results/ by default. USAGE examples should reflect this standard.
-- For this project, we have two cameras that will not change resolution at any stage of the pipeline. The first camera is the Global Top camera, which we have set to 1280x720 resolution. We use the 1280x720 image captures from the Global Camera for all of our piece detection (and piece detection data collection, labelling, and finetuning) and all of our corner detection (and corner detection data collection, labelling, and finetuning) Note that for both of these models in our pipeline, images must be 1280x720 for consistency. Our second camera is a Robot Gripper camera, which we have set to 224x224.
-- Our global camera is the WBC-0E01 camera. Our gripper camera is the eMeet C950 camera.
+- For this project, we have two cameras with specific capture pipelines:
+  - **Global Camera (WBC-0E01)**: Output is always 1280x720. Two capture modes:
+    - **Board Detection**: 4K MJPEG capture (3840x2160) downscaled to 720p via LANCZOS4 interpolation. This provides ~9:1 supersampling with superior quality, noise reduction, and anti-aliasing. Used by `capture_4k_downscale()` in board detection scripts.
+    - **Real-time VLA**: Native 720p MJPEG at 30fps for low latency. Used by `LiveCameraCapture` class during episode recording and VLA inference control loops.
+  - **Gripper Camera (eMeet C950)**: Captures at 640x480, then resized to 224x224 for VLA input. Most cameras don't natively support 224x224.
+- Corner detection uses grayscale + CLAHE preprocessing. Training images must be preprocessed with `preprocess_for_corner_detection()` before labeling (handled automatically by `label_corners.py`).
+- All YOLO detection (corners and pieces) uses 1280x720 images for consistency with training data.

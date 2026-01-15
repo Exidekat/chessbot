@@ -235,8 +235,10 @@ paths:
 ## Hardware
 
 ### Cameras
-- **Global Camera**: WBC-0E01 USB camera (1280x720)
-- **Gripper Camera**: eMeet C950 USB camera (224x224)
+- **Global Camera**: WBC-0E01 USB camera
+  - Board detection: 4K MJPEG (3840x2160) downscaled to 720p for best quality
+  - Real-time VLA: Native 720p MJPEG at 30fps for low latency
+- **Gripper Camera**: eMeet C950 USB camera (640x480 capture, resized to 224x224 for VLA)
 
 ### Robot
 - **Arm**: SO-100 with 6x Feetech STS3215 smart servos

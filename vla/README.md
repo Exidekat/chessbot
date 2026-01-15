@@ -72,13 +72,18 @@ python scripts/collect_vla_episodes.py --output data/episodes/ \
 **LeRobot Dataset Schema:**
 ```python
 {
-    "observation.global_camera": (720, 1280, 3),   # BGR
-    "observation.gripper_camera": (360, 640, 3),  # BGR
-    "observation.joint_positions": (6,),          # radians
-    "action": (6,),                               # joint targets
-    "language_instruction": str                   # VLM prompt
+    "observation.images.global": (720, 1280, 3),  # BGR, with color-conditioned overlay
+    "observation.images.gripper": (224, 224, 3),  # BGR, resized from 640x480
+    "observation.state": (6,),                    # joint positions in radians
+    "action": (6,),                               # target joint positions
+    "task": str                                   # VLM prompt
 }
 ```
+
+**Camera Capture Pipeline:**
+- **Board Detection**: Uses 4K MJPEG -> 720p downscale via `capture_4k_downscale()` for consistent quality with training data
+- **Real-time Recording**: Uses native 720p MJPEG at 30fps via `LiveCameraCapture` for low latency
+- **Gripper Camera**: Captures at 640x480, resized to 224x224 for VLA input
 
 ### Episode Validation (`scripts/validate_vla_episodes.py`)
 
