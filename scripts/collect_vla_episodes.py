@@ -205,6 +205,9 @@ class EpisodeRecorder:
                 root=str(self.output_dir),
             )
             self.episode_count = self.dataset.num_episodes
+            # Ensure clean buffer state for recording new episodes
+            # (previous session may have left corrupted buffer if save failed)
+            self.dataset.episode_buffer = None
         else:
             # Handle existing directory - LeRobot.create() fails if directory exists
             if self.output_dir.exists():
@@ -640,6 +643,14 @@ class EpisodeRecorder:
             print(f"[SAVE] Writing episode {episode_index} to LeRobot dataset...")
 
             with self.save_lock:
+                # Safety check: Reset corrupted episode buffer if needed
+                # LeRobot's save_episode() pops 'size' before clearing the buffer,
+                # so if video encoding fails, the buffer is left corrupted (exists but missing 'size')
+                if (self.dataset.episode_buffer is not None and
+                    "size" not in self.dataset.episode_buffer):
+                    print("[WARN] Resetting corrupted episode buffer from previous failed save")
+                    self.dataset.episode_buffer = None
+
                 for frame_idx, frame_data in enumerate(frames):
                     # Convert BGR (OpenCV) to RGB for LeRobot video encoding
                     global_rgb = cv2.cvtColor(frame_data["global_frame"], cv2.COLOR_BGR2RGB)
