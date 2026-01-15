@@ -608,17 +608,17 @@ class BoardDetector:
         if used_detections is None:
             used_detections = set()
 
-        list_of_iou = []
+        list_of_overlap = []
 
         for idx, detection in enumerate(detections):
             # Skip if this detection was already assigned to another square
             if idx in used_detections:
-                list_of_iou.append(0.0)  # Force IoU to 0 for used detections
+                list_of_overlap.append(0.0)
                 continue
 
             box_x1, box_y1, box_x2, box_y2 = detection[0], detection[1], detection[2], detection[3]
 
-            # Use ONLY the bottom 25% of the bbox for IoU calculation
+            # Use ONLY the bottom 25% of the bbox for matching
             # This ensures tall pieces (queens, kings) are placed correctly
             # based on their base position, not their tall top portion
             bbox_height = box_y2 - box_y1
@@ -631,12 +631,24 @@ class BoardDetector:
                 [box_x1, box_y2]
             ])
 
-            list_of_iou.append(self.calculate_iou(box_bottom_quarter, square))
+            # Calculate: what fraction of the piece's base is inside this square?
+            # If >= 50%, the piece belongs to this square
+            poly_base = Polygon(box_bottom_quarter)
+            poly_square = Polygon(square)
 
-        if not list_of_iou or max(list_of_iou) <= 0.15:
+            if not poly_base.is_valid or poly_base.area == 0:
+                list_of_overlap.append(0.0)
+                continue
+
+            intersection_area = poly_base.intersection(poly_square).area
+            base_coverage = intersection_area / poly_base.area
+            list_of_overlap.append(base_coverage)
+
+        # Piece belongs to square if >50% of its base is inside
+        if not list_of_overlap or max(list_of_overlap) < 0.5:
             return ('empty', None)
 
-        num = list_of_iou.index(max(list_of_iou))
+        num = list_of_overlap.index(max(list_of_overlap))
         piece_class = int(boxes.cls[num].item())
         piece_notation = self.piece_map.get(piece_class, 'empty')
 
@@ -847,11 +859,10 @@ class BoardDetector:
                              x_coords: List[float], y_coords: List[float],
                              output_path: str = "data/chessboard_placements.png"):
         """
-        Visualize piece placement decision points on the grid.
+        Visualize the bottom 25% base rectangles used for piece-to-square matching.
 
-        Shows a dot at the "decision point" for each detection - the point used
-        to determine which square the piece belongs to. This is the center-x of
-        the bounding box and the center of the bottom 25% (y at 87.5% of bbox height).
+        Shows the actual region used for coverage calculation. A piece is assigned
+        to a square if >=50% of its base rectangle is inside that square.
 
         Args:
             image: Transformed board image
@@ -875,43 +886,45 @@ class BoardDetector:
         classes = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else boxes.cls
         confidences = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf
 
-        # Draw placement points for each detection
+        # Draw bottom 25% base rectangle for each detection
         for i, detection in enumerate(detections):
             x1, y1, x2, y2 = detection[:4]
 
-            # Calculate the "decision point" - center of bottom 25% of bbox
-            # This matches the IoU calculation in connect_square_to_detection
-            center_x = (x1 + x2) / 2
+            # Calculate the bottom 25% rectangle (piece base)
             bbox_height = y2 - y1
-            # Bottom 25% starts at 75% down, so center of bottom 25% is at 87.5%
-            decision_y = y1 + (bbox_height * 0.875)
+            bottom_25_start = y1 + (bbox_height * 0.75)
 
             # Get piece info
             cls = int(classes[i])
             piece = self.piece_map.get(cls, '?')
             conf = confidences[i]
 
-            # Color based on confidence (same as visualize_detections)
+            # Color based on confidence
             color = self.get_confidence_color(conf)
 
-            # Draw filled circle at decision point
-            cv2.circle(img_vis, (int(center_x), int(decision_y)), 8, color, -1)
-            # Draw outline for visibility
-            cv2.circle(img_vis, (int(center_x), int(decision_y)), 8, (0, 0, 0), 2)
+            # Draw semi-transparent filled rectangle for base area
+            overlay = img_vis.copy()
+            pt1 = (int(x1), int(bottom_25_start))
+            pt2 = (int(x2), int(y2))
+            cv2.rectangle(overlay, pt1, pt2, color, -1)
+            cv2.addWeighted(overlay, 0.4, img_vis, 0.6, 0, img_vis)
 
-            # Draw piece label near the dot
+            # Draw rectangle outline
+            cv2.rectangle(img_vis, pt1, pt2, color, 2)
+
+            # Draw piece label above the base rectangle
             label = piece
-            label_x = int(center_x) + 12
-            label_y = int(decision_y) + 5
+            label_x = int(x1) + 2
+            label_y = int(bottom_25_start) - 5
 
             # Draw label background
-            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(img_vis, (label_x - 2, label_y - label_h - 2),
                          (label_x + label_w + 2, label_y + 2), (0, 0, 0), -1)
 
             # Draw label text
             cv2.putText(img_vis, label, (label_x, label_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         cv2.imwrite(output_path, img_vis)
         print(f"  → Placement visualization saved to {output_path}")
@@ -1129,6 +1142,32 @@ class BoardDetector:
             print(f"[BoardDetector]   Matched {matched_pieces} pieces to squares")
             if len(detections) > matched_pieces:
                 print(f"[BoardDetector]   Warning: {len(detections) - matched_pieces} detections not assigned to any square")
+                # Debug: show unassigned detections
+                unassigned = [i for i in range(len(detections)) if i not in used_detections]
+                for det_idx in unassigned:
+                    det = detections[det_idx]
+                    x1, y1, x2, y2 = det[:4]
+                    bbox_height = y2 - y1
+                    bottom_25_start = y1 + (bbox_height * 0.75)
+                    cls = int(boxes.cls[det_idx].item())
+                    piece = self.piece_map.get(cls, '?')
+                    print(f"[DEBUG] Unassigned #{det_idx} ({piece}): base=({x1:.0f},{bottom_25_start:.0f})-({x2:.0f},{y2:.0f})")
+                    # Find best coverage with any square
+                    best_coverage = 0
+                    best_square = None
+                    box_bottom_quarter = np.array([[x1, bottom_25_start], [x2, bottom_25_start], [x2, y2], [x1, y2]])
+                    poly_base = Polygon(box_bottom_quarter)
+                    if poly_base.is_valid and poly_base.area > 0:
+                        for row_idx, row in enumerate(squares):
+                            for col_idx, sq in enumerate(row):
+                                poly_sq = Polygon(sq)
+                                coverage = poly_base.intersection(poly_sq).area / poly_base.area
+                                if coverage > best_coverage:
+                                    best_coverage = coverage
+                                    best_square = (row_idx, col_idx)
+                    if best_square:
+                        sq_name = chr(ord('a') + best_square[1]) + str(8 - best_square[0])
+                        print(f"[DEBUG]   Best coverage: {best_coverage:.1%} in {sq_name} (need >=50%)")
 
         # Step 7: Rotate board based on camera position
         if debug:
