@@ -232,8 +232,9 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
             freeze=freeze,  # Freeze backbone layers for fine-tuning
 
             # Lighting augmentation (critical for varying lighting conditions)
-            hsv_h=0.015,  # Slight hue variation (color temperature changes)
-            hsv_s=0.4,    # Moderate saturation variation
+            # NOTE: hsv_h and hsv_s disabled because training uses grayscale + CLAHE preprocessing
+            hsv_h=0.0,    # Disabled - no hue in grayscale images
+            hsv_s=0.0,    # Disabled - no saturation in grayscale images
             hsv_v=0.7,    # STRONG brightness/value variation (simulates darker/brighter lighting)
 
             # Additional augmentations

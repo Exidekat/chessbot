@@ -214,10 +214,10 @@ Download with `python download.py` on first run.
 2. **Perspective Transform**
    - Uses detected corners to warp board to orthogonal view
    - Adds 10% top margin for tall pieces (kings, queens)
-   - Preprocessing for piece detection: LAB color space, CLAHE, mild sharpening
 
 3. **Piece Detection** (YOLO stage 2)
    - Input: Transformed board image
+   - Preprocessing: Grayscale conversion + CLAHE contrast normalization (must match training data)
    - Output: Piece bounding boxes + class (0-11: b-bishop to W-Rook)
    - Params: `base_conf=0.35`, `pawn_threshold=0.45` (higher to reduce misclassification)
 
@@ -603,5 +603,8 @@ This means we should have exactly 2 lines per script usage. Some scripts may hav
     - **Board Detection**: 4K MJPEG capture (3840x2160) downscaled to 720p via LANCZOS4 interpolation. This provides ~9:1 supersampling with superior quality, noise reduction, and anti-aliasing. Used by `capture_4k_downscale()` in board detection scripts.
     - **Real-time VLA**: Native 720p MJPEG at 30fps for low latency. Used by `LiveCameraCapture` class during episode recording and VLA inference control loops.
   - **Gripper Camera (eMeet C950)**: Captures at 640x480, then resized to 224x224 for VLA input. Most cameras don't natively support 224x224.
-- Corner detection uses grayscale + CLAHE preprocessing. Training images must be preprocessed with `preprocess_for_corner_detection()` before labeling (handled automatically by `label_corners.py`).
+- Both corner detection and piece detection use grayscale + CLAHE preprocessing. Training images must be preprocessed before labeling:
+  - Corner detection: Use `preprocess_for_corner_detection()` (handled automatically by `label_corners.py`)
+  - Piece detection: Use `preprocess_for_piece_detection()` (handled automatically by `label_pieces.py`)
+  - Existing piece datasets can be converted with `scripts/convert_piece_dataset.py`
 - All YOLO detection (corners and pieces) uses 1280x720 images for consistency with training data.

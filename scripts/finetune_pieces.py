@@ -132,7 +132,8 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
     print("(Piece detection requires more epochs than corner detection)")
     print()
     print("UPDATED CONFIGURATION - Based on corner detection success:")
-    print("  - STRONG brightness augmentation (hsv_v=0.7, was 0.4)")
+    print("  - Grayscale + CLAHE preprocessing (no color augmentation)")
+    print("  - STRONG brightness augmentation (hsv_v=0.7)")
     print("  - Classification priority (cls=1.0, box=0.5)")
     print("  - Maximized augmentation (mosaic=1.0, mixup=0.2)")
     print("  - More rotation variation (degrees=15.0, was 5.0)")
@@ -166,9 +167,10 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
         dfl=1.0,    # Standard
 
         # Data augmentation - MAXIMIZED for small dataset
-        hsv_h=0.015,  # Hue augmentation
-        hsv_s=0.7,    # Saturation augmentation
-        hsv_v=0.7,    # FIXED: was 0.4 - STRONG brightness (corner success factor #1)
+        # NOTE: hsv_h and hsv_s disabled because training uses grayscale + CLAHE preprocessing
+        hsv_h=0.0,    # Disabled - no hue in grayscale images
+        hsv_s=0.0,    # Disabled - no saturation in grayscale images
+        hsv_v=0.7,    # STRONG brightness augmentation (corner success factor #1)
         degrees=15.0,  # INCREASED from 5.0 - more rotation variation
         translate=0.15,  # Increased from 0.1
         scale=0.3,    # Increased from 0.2

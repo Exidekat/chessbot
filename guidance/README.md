@@ -16,9 +16,9 @@ This approach provides explainable, debuggable chess vision that can train on sm
 
 #### `board_detector.py`
 Complete board state detection pipeline:
-- Corner detection with confidence filtering
+- Corner detection with confidence filtering + grayscale/CLAHE preprocessing
 - Perspective transform with top margin for tall pieces
-- Gentle preprocessing (LAB color space, CLAHE, mild sharpening)
+- Piece detection with grayscale + CLAHE preprocessing (matches training data)
 - Piece detection with class-specific thresholds (higher for pawns to reduce misclassification)
 - Grid calculation and piece-to-square matching
 - FEN generation
@@ -256,7 +256,8 @@ python scripts/download.py
 - Base confidence: 0.35
 - Pawn threshold: 0.45 (higher to reduce misclassification)
 - Test-time augmentation: Enabled
-- Preprocessing: LAB color space, CLAHE, mild sharpening
+- **Preprocessing**: Grayscale + CLAHE contrast normalization (REQUIRED - training data uses this)
+- **Input**: Transformed board image (perspective-corrected)
 
 ## Performance Notes
 

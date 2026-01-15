@@ -13,7 +13,7 @@ from ultralytics import YOLO
 import chess
 from pathlib import Path
 from typing import Optional, Tuple, List
-from utils.image_preprocessing import preprocess_for_corner_detection
+from utils.image_preprocessing import preprocess_for_corner_detection, preprocess_for_piece_detection
 
 
 class BoardDetector:
@@ -412,55 +412,29 @@ class BoardDetector:
 
     def preprocess_for_detection(self, image: Image.Image) -> Image.Image:
         """
-        Apply GENTLE preprocessing to enhance piece detection accuracy.
+        Apply grayscale + CLAHE preprocessing to enhance piece detection accuracy.
 
-        This pipeline addresses two main issues:
-        1. Missed detections - through mild contrast enhancement
-        2. Pawn misclassification - through subtle color normalization
+        This preprocessing improves piece detection by:
+        1. Converting to grayscale (removes color variation, focuses on shape)
+        2. Applying CLAHE for contrast normalization (enhances piece silhouettes)
+
+        NOTE: While pieces have color (white vs black), grayscale + CLAHE helps the
+        model focus on shape features which are more robust to lighting variations.
+
+        IMPORTANT: This preprocessing MUST match the training data preprocessing
+        (label_pieces.py applies the same preprocessing before labeling).
 
         Args:
             image: Input PIL Image (RGB)
 
         Returns:
-            Preprocessed PIL Image (RGB)
+            Preprocessed PIL Image (RGB - 3-channel grayscale for YOLO compatibility)
         """
-        # Convert PIL to numpy array
-        img_array = np.array(image)
-
-        # Step 1: Apply MILD CLAHE for gentle contrast enhancement
-        # Reduced clipLimit from 2.0 to 1.5 and larger tiles to be less aggressive
-        lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
-        l_channel = clahe.apply(l_channel)
-
-        # Step 2: SUBTLE color channel normalization
-        # Only normalize if there's significant variation (not always needed)
-        a_std = np.std(a_channel)
-        b_std = np.std(b_channel)
-
-        if a_std > 20:  # Only normalize if there's significant color variation
-            a_channel = cv2.normalize(a_channel, None, alpha=50, beta=205,
-                                       norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        if b_std > 20:
-            b_channel = cv2.normalize(b_channel, None, alpha=50, beta=205,
-                                       norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-
-        # Merge and convert back to RGB
-        lab_enhanced = cv2.merge([l_channel, a_channel, b_channel])
-        rgb_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-
-        # Step 3: VERY MILD sharpening (reduced kernel strength)
-        # Blend 70% original + 30% sharpened instead of full sharpening
-        kernel_sharpening = np.array([[0, -1, 0],
-                                      [-1, 5, -1],
-                                      [0, -1, 0]])
-        sharpened = cv2.filter2D(rgb_enhanced, -1, kernel_sharpening)
-        result = cv2.addWeighted(rgb_enhanced, 0.7, sharpened, 0.3, 0)
-
-        # Convert back to PIL Image (skip denoising - it was too aggressive)
-        return Image.fromarray(result, "RGB")
+        # Use the centralized preprocessing function for consistency
+        preprocessed = preprocess_for_piece_detection(image)
+        # Convert BGR (from preprocessing) to RGB for PIL
+        rgb = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb, "RGB")
 
     def detect_pieces(self, image_source, use_preprocessing: bool = False) -> Tuple[np.ndarray, object]:
         """
@@ -1061,14 +1035,15 @@ class BoardDetector:
         # Step 2: Detect pieces on ORIGINAL image (before transformation)
         if debug:
             print("[BoardDetector] Step 2: Detecting pieces on original image...")
-            print("[BoardDetector]   Preprocessing: DISABLED (using original training data)")
+            print("[BoardDetector]   Preprocessing: grayscale + CLAHE (matches training data)")
 
         # Load original image for detection
         original_image = Image.open(image_path)
         if original_image.mode != 'RGB':
             original_image = original_image.convert('RGB')
 
-        detections, boxes = self.detect_pieces(image_path, use_preprocessing=False)
+        # Apply preprocessing (grayscale + CLAHE) to match training data
+        detections, boxes = self.detect_pieces(original_image, use_preprocessing=True)
 
         # Store original detections and boxes for later use (e.g., graveyard piece highlighting)
         self.original_detections = detections

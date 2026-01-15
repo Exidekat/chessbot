@@ -298,8 +298,11 @@ python scripts/best_move_demo.py --debug
 # Step 1: Collect 30+ training photos with VARIED piece positions on board
 python scripts/collect_piece_training_photos.py --device /dev/video0 --count 30
 
-# Step 2: Label pieces in each photo (draw bounding boxes, assign classes)
+# Step 2: Label pieces in each photo (auto-preprocesses with grayscale + CLAHE to match inference)
 python scripts/label_pieces.py --input data/training/piece_photos
+
+# Step 2b (optional): Convert existing piece dataset to preprocessed format (if dataset was created before preprocessing was added)
+python scripts/convert_piece_dataset.py --input data/training/piece_dataset --output data/training/piece_dataset_preprocessed
 
 # Step 3: Fine-tune the piece detection model on your labeled data (30-60 min on GPU)
 python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml
