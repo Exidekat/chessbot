@@ -63,6 +63,7 @@ from utils.camera_helpers import (
     get_available_cameras,
     select_camera,
     capture_4k_downscale,
+    capture_720p_yuyv,
 )
 
 # Configure HuggingFace for offline/local usage
@@ -133,6 +134,7 @@ class EpisodeRecorder:
         engine_path: str = "stockfish",
         camera_rotation: str = "right",
         turn: str = "black",
+        use_yuyv: bool = False,
     ):
         """
         Initialize episode recorder.
@@ -156,6 +158,7 @@ class EpisodeRecorder:
         self.frame_interval = 1.0 / fps
         self.camera_rotation = camera_rotation
         self.turn = "w" if turn == "white" else "b"  # Normalize to single letter
+        self.use_yuyv = use_yuyv
 
         # Initialize components
         self.cache = StateCache("data/state_cache.json")
@@ -720,12 +723,17 @@ class EpisodeRecorder:
                     board_image_path = Path("data/board_capture.png")
 
                     # Stop live capture to release camera for 4K capture
-                    print("[INFO] Stopping live capture for 4K board detection...")
+                    print("[INFO] Stopping live capture for board detection...")
                     self.global_cam_capture.stop()
                     time.sleep(0.5)  # Allow camera to fully release
 
-                    # Capture with 4K -> 720p downscale (matches training data)
-                    success = capture_4k_downscale(self.global_camera_device, board_image_path)
+                    # Capture board image for detection
+                    if self.use_yuyv:
+                        success = capture_720p_yuyv(self.global_camera_device, board_image_path)
+                        capture_mode = "720p YUYV"
+                    else:
+                        success = capture_4k_downscale(self.global_camera_device, board_image_path)
+                        capture_mode = "4K -> 720p"
 
                     # Restart live capture for episode recording
                     print("[INFO] Restarting live capture...")
@@ -736,7 +744,7 @@ class EpisodeRecorder:
                         print("[ERROR] Failed to capture board image")
                         continue
 
-                    print(f"[OK] Board image captured: {board_image_path} (4K -> 720p)")
+                    print(f"[OK] Board image captured: {board_image_path} ({capture_mode})")
 
                     # Detect and decompose move
                     move_info = self._detect_and_decompose_move(str(board_image_path))
@@ -893,6 +901,12 @@ Examples:
         help="Whose turn to calculate move for (default: black)"
     )
 
+    parser.add_argument(
+        "--yuyv",
+        action="store_true",
+        help="Use native 720p YUYV capture for board detection (uncompressed, best quality, 10fps)"
+    )
+
     args = parser.parse_args()
 
     # Camera selection: specified > auto-detect by name > prompt
@@ -945,6 +959,7 @@ Examples:
         engine_path=args.engine,
         camera_rotation=args.rotation,
         turn=args.turn,
+        use_yuyv=args.yuyv,
     )
 
     # Run collection loop

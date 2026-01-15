@@ -29,9 +29,13 @@ from utils.camera_helpers import (
 )
 
 
-def capture_training_photos(device_path, output_dir, count=30):
+def capture_training_photos(device_path, output_dir, count=30, use_yuyv=False):
     """
-    Capture training photos interactively using 4K MJPEG -> 720p downscale.
+    Capture training photos interactively.
+
+    Supports two capture modes:
+    - Default: 4K MJPEG -> 720p downscale (supersampled, anti-aliased)
+    - YUYV: Native 720p YUYV uncompressed (best quality, no JPEG artifacts)
 
     This matches the exact capture pipeline used in deployment scripts
     (best_move_demo.py, collect_vla_episodes.py) to ensure training data
@@ -41,6 +45,7 @@ def capture_training_photos(device_path, output_dir, count=30):
         device_path: Camera device path
         output_dir: Directory to save photos
         count: Number of photos to capture
+        use_yuyv: If True, use native 720p YUYV instead of 4K MJPEG downscale
     """
     import gc
     import time
@@ -49,18 +54,39 @@ def capture_training_photos(device_path, output_dir, count=30):
 
     print(f"\n[TrainingCapture] Opening camera: {device_path}")
 
-    # Configure camera for 4K MJPEG - SAME AS DEPLOYMENT SCRIPTS
-    print(f"[TrainingCapture] Setting MJPEG 3840x2160 @ 30fps format...")
-    try:
-        subprocess.run([
-            "v4l2-ctl",
-            f"--device={device_path}",
-            "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
-            "--set-parm=30"
-        ], check=True, capture_output=True, text=True)
-        print(f"[TrainingCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
-    except subprocess.CalledProcessError as e:
-        print(f"[TrainingCapture] Warning: Could not set format: {e}")
+    # Configure camera based on capture mode
+    if use_yuyv:
+        # YUYV mode: Native 720p uncompressed (best quality)
+        print(f"[TrainingCapture] Setting YUYV 1280x720 @ 10fps format...")
+        try:
+            subprocess.run([
+                "v4l2-ctl",
+                f"--device={device_path}",
+                "--set-fmt-video=width=1280,height=720,pixelformat=YUYV",
+                "--set-parm=10"
+            ], check=True, capture_output=True, text=True)
+            print(f"[TrainingCapture] [OK] Format set to YUYV 1280x720 @ 10fps")
+        except subprocess.CalledProcessError as e:
+            print(f"[TrainingCapture] Warning: Could not set format: {e}")
+        capture_mode = "720p YUYV"
+        target_width, target_height, target_fps = 1280, 720, 10
+        fourcc = cv2.VideoWriter_fourcc(*'YUYV')
+    else:
+        # Default mode: 4K MJPEG -> 720p downscale
+        print(f"[TrainingCapture] Setting MJPEG 3840x2160 @ 30fps format...")
+        try:
+            subprocess.run([
+                "v4l2-ctl",
+                f"--device={device_path}",
+                "--set-fmt-video=width=3840,height=2160,pixelformat=MJPG",
+                "--set-parm=30"
+            ], check=True, capture_output=True, text=True)
+            print(f"[TrainingCapture] [OK] Format set to MJPEG 3840x2160 @ 30fps")
+        except subprocess.CalledProcessError as e:
+            print(f"[TrainingCapture] Warning: Could not set format: {e}")
+        capture_mode = "4K -> 720p"
+        target_width, target_height, target_fps = 3840, 2160, 30
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
 
     # Reset camera to consistent auto settings
     try:
@@ -80,11 +106,11 @@ def capture_training_photos(device_path, output_dir, count=30):
         print(f"[TrainingCapture] [X] Failed to open camera")
         return False
 
-    # Explicitly set 4K MJPEG in OpenCV
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    # Explicitly set resolution in OpenCV
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+    cap.set(cv2.CAP_PROP_FPS, target_fps)
+    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
 
     # Verify resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -92,8 +118,8 @@ def capture_training_photos(device_path, output_dir, count=30):
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     print(f"[TrainingCapture] Camera resolution: {width}x{height} @ {fps}fps")
 
-    if width != 3840 or height != 2160:
-        print(f"[TrainingCapture] Warning: Expected 3840x2160, got {width}x{height}")
+    if width != target_width or height != target_height:
+        print(f"[TrainingCapture] Warning: Expected {target_width}x{target_height}, got {width}x{height}")
         print(f"[TrainingCapture] Attempting to continue with available resolution")
 
     # Warm up camera (let autofocus/exposure settle)
@@ -106,7 +132,7 @@ def capture_training_photos(device_path, output_dir, count=30):
     print("PIECE DETECTION TRAINING PHOTO COLLECTION")
     print("=" * 60)
     print(f"Target: {count} photos")
-    print(f"Format: 4K MJPEG -> 720p downscale (matches deployment)")
+    print(f"Format: {capture_mode} (matches deployment)")
     print("\nInstructions:")
     print("  - Set up different board positions between each photo")
     print("  - Include ALL piece types in various positions:")
@@ -126,14 +152,19 @@ def capture_training_photos(device_path, output_dir, count=30):
     captured = 0
 
     while captured < count:
-        ret, frame_4k = cap.read()
+        ret, frame_raw = cap.read()
 
         if not ret:
             print("[TrainingCapture] [X] Failed to read frame")
             break
 
-        # Downscale to 720p using LANCZOS4 - SAME AS DEPLOYMENT SCRIPTS
-        frame_720p = cv2.resize(frame_4k, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
+        # Get 720p frame (downscale if needed)
+        if use_yuyv:
+            # YUYV is already 720p, no downscale needed
+            frame_720p = frame_raw
+        else:
+            # Downscale 4K to 720p using LANCZOS4
+            frame_720p = cv2.resize(frame_raw, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
 
         # Draw status overlay on display copy
         display_frame = frame_720p.copy()
@@ -142,7 +173,7 @@ def capture_training_photos(device_path, output_dir, count=30):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # Show format info
-        format_text = f"4K MJPEG -> 720p (matches deployment)"
+        format_text = f"{capture_mode} (matches deployment)"
         cv2.putText(display_frame, format_text, (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
@@ -165,7 +196,7 @@ def capture_training_photos(device_path, output_dir, count=30):
             cv2.imwrite(str(filepath), frame_720p)
             captured += 1
 
-            print(f"[OK] Captured {captured}/{count}: {filename} (720p from 4K)")
+            print(f"[OK] Captured {captured}/{count}: {filename} ({capture_mode})")
 
             # Print suggestion for next position
             if captured < count:
@@ -195,7 +226,7 @@ def capture_training_photos(device_path, output_dir, count=30):
     print("\n" + "=" * 60)
     print(f"[OK] Training photo collection complete!")
     print(f"Total photos: {captured}")
-    print(f"Format: 4K MJPEG -> 720p downscale (matches deployment)")
+    print(f"Format: {capture_mode} (matches deployment)")
     print(f"Saved to: {output_dir}")
     print("\nNext steps:")
     print(f"  1. Label pieces: python scripts/label_pieces.py --input {output_dir}")
@@ -226,6 +257,11 @@ def main():
         type=int,
         default=30,
         help="Number of photos to capture (default: 30)"
+    )
+    parser.add_argument(
+        "--yuyv",
+        action="store_true",
+        help="Use native 720p YUYV capture (uncompressed, best quality, 10fps)"
     )
 
     args = parser.parse_args()
@@ -269,7 +305,7 @@ def main():
     print()
 
     # Capture photos
-    success = capture_training_photos(device_path, output_dir, args.count)
+    success = capture_training_photos(device_path, output_dir, args.count, use_yuyv=args.yuyv)
 
     if success:
         return 0

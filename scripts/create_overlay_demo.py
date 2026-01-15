@@ -39,6 +39,7 @@ from utils.camera_helpers import (
     select_camera,
     get_camera_index_from_device,
     capture_4k_downscale,
+    capture_720p_yuyv,
     get_default_global_camera,
 )
 
@@ -184,6 +185,11 @@ def main():
         dest="turn",
         help="Calculate move for black"
     )
+    parser.add_argument(
+        "--yuyv",
+        action="store_true",
+        help="Use native 720p YUYV capture (uncompressed, best quality, 10fps)"
+    )
 
     args = parser.parse_args()
 
@@ -245,12 +251,15 @@ def main():
                 print("[WARN] WBC-0E01 not found, prompting for selection...")
                 device_path = select_camera(cameras)
 
-    # Capture photo using 4K MJPEG with downscaling to 720p
+    # Capture photo
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_path = Path("data") / f"chessboard_capture_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    success = capture_4k_downscale(device_path, image_path)
+    if args.yuyv:
+        success = capture_720p_yuyv(device_path, image_path)
+    else:
+        success = capture_4k_downscale(device_path, image_path)
     if not success:
         print("\n[X] Photo capture failed")
         return 1

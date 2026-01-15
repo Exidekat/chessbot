@@ -30,7 +30,7 @@ from utils.camera_helpers import (
 )
 
 
-def capture_photo(device_path, output_path, preview=True, width=None, height=None):
+def capture_photo(device_path, output_path, preview=True, width=None, height=None, use_yuyv=False):
     """
     Capture a photo from the specified camera.
 
@@ -40,21 +40,45 @@ def capture_photo(device_path, output_path, preview=True, width=None, height=Non
         preview: Whether to show preview window
         width: Optional resolution width
         height: Optional resolution height
+        use_yuyv: If True, use native 720p YUYV (uncompressed, best quality)
 
     Returns:
         bool: True if successful, False otherwise
     """
+    import subprocess
+
     camera_index = get_camera_index_from_device(device_path)
 
     print(f"\nOpening camera: {device_path} (index: {camera_index})")
+
+    # Configure camera via v4l2-ctl if using YUYV
+    if use_yuyv:
+        print(f"Setting YUYV 1280x720 @ 10fps format...")
+        try:
+            subprocess.run([
+                "v4l2-ctl",
+                f"--device={device_path}",
+                "--set-fmt-video=width=1280,height=720,pixelformat=YUYV",
+                "--set-parm=10"
+            ], check=True, capture_output=True, text=True)
+            print(f"[OK] Format set to YUYV 1280x720 @ 10fps")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Could not set YUYV format: {e}")
+
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
 
     if not cap.isOpened():
-        print(f"✗ Failed to open camera: {device_path}")
+        print(f"[X] Failed to open camera: {device_path}")
         return False
 
-    # Set resolution (defaults to 1920x1080 for good quality without USB bandwidth issues)
-    if width is not None and height is not None:
+    # Set resolution based on mode
+    if use_yuyv:
+        # YUYV mode: 720p uncompressed
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 10)
+    elif width is not None and height is not None:
         print(f"Setting resolution: {width}x{height}")
         # Use MJPEG for high resolutions, increase buffer size to avoid corruption
         if width >= 1920 or height >= 1080:
@@ -88,7 +112,7 @@ def capture_photo(device_path, output_path, preview=True, width=None, height=Non
             ret, frame = cap.read()
 
             if not ret:
-                print("✗ Failed to read frame from camera")
+                print("[X] Failed to read frame from camera")
                 cap.release()
                 cv2.destroyAllWindows()
                 return False
@@ -101,10 +125,10 @@ def capture_photo(device_path, output_path, preview=True, width=None, height=Non
             if key == ord(' '):
                 # Capture photo
                 cv2.imwrite(str(output_path), frame)
-                print(f"\n✓ Photo captured: {output_path}")
+                print(f"\n[OK] Photo captured: {output_path}")
                 break
             elif key == ord('q'):
-                print("\n✗ Cancelled by user")
+                print("\n[X] Cancelled by user")
                 cap.release()
                 cv2.destroyAllWindows()
                 return False
@@ -116,12 +140,12 @@ def capture_photo(device_path, output_path, preview=True, width=None, height=Non
         ret, frame = cap.read()
 
         if not ret:
-            print("✗ Failed to read frame from camera")
+            print("[X] Failed to read frame from camera")
             cap.release()
             return False
 
         cv2.imwrite(str(output_path), frame)
-        print(f"✓ Photo captured: {output_path}")
+        print(f"[OK] Photo captured: {output_path}")
 
     cap.release()
     return True
@@ -160,6 +184,11 @@ def main():
         type=int,
         default=1080,
         help="Camera resolution height (default: 1080)"
+    )
+    parser.add_argument(
+        "--yuyv",
+        action="store_true",
+        help="Use native 720p YUYV capture (uncompressed, best quality, 10fps)"
     )
 
     args = parser.parse_args()
@@ -219,16 +248,17 @@ def main():
         output_path,
         preview=not args.no_preview,
         width=args.width,
-        height=args.height
+        height=args.height,
+        use_yuyv=args.yuyv
     )
     print("=" * 60)
 
     if success:
-        print(f"\n✓ Photo saved to: {output_path.absolute()}")
+        print(f"\n[OK] Photo saved to: {output_path.absolute()}")
         print(f"  Size: {output_path.stat().st_size / 1024:.1f} KB")
         return 0
     else:
-        print("\n✗ Photo capture failed")
+        print("\n[X] Photo capture failed")
         return 1
 
 

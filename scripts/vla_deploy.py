@@ -57,6 +57,7 @@ from utils.camera_helpers import (
     select_camera,
     get_camera_index_from_device,
     capture_4k_downscale,
+    capture_720p_yuyv,
     get_default_global_camera,
     get_default_gripper_camera_with_name,
 )
@@ -643,7 +644,8 @@ def execute_move(
     camera_rotation: str,
     corner_conf: float,
     min_corner_dist: float,
-    time_limit: float
+    time_limit: float,
+    use_yuyv: bool = False
 ) -> MoveResult:
     """
     Execute a single chess move: detect board, calculate best move, execute all stages.
@@ -668,14 +670,19 @@ def execute_move(
     print("BOARD DETECTION & MOVE CALCULATION")
     print("=" * 60)
 
-    # Capture photo for board detection using 4K MJPEG -> 720p downscale
-    # This matches the training data pipeline for consistent detection
-    print("Capturing board image (4K -> 720p downscale)...")
+    # Capture photo for board detection
+    if use_yuyv:
+        print("Capturing board image (720p YUYV uncompressed)...")
+    else:
+        print("Capturing board image (4K -> 720p downscale)...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_path = Path("data") / f"vla_board_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    success = capture_4k_downscale(global_camera, image_path)
+    if use_yuyv:
+        success = capture_720p_yuyv(global_camera, image_path)
+    else:
+        success = capture_4k_downscale(global_camera, image_path)
     if not success:
         print("[X] Failed to capture board image")
         return MoveResult(success=False, restart_requested=False)
@@ -892,6 +899,11 @@ def main():
         type=float,
         default=50.0,
         help="Control frequency in Hz for chunk execution (default: 50.0)"
+    )
+    parser.add_argument(
+        "--yuyv",
+        action="store_true",
+        help="Use native 720p YUYV capture for board detection (uncompressed, best quality, 10fps)"
     )
 
     args = parser.parse_args()
@@ -1173,7 +1185,8 @@ def main():
                     camera_rotation=args.rotation,
                     corner_conf=args.corner_conf,
                     min_corner_dist=args.min_corner_dist,
-                    time_limit=args.time
+                    time_limit=args.time,
+                    use_yuyv=args.yuyv
                 )
 
                 if result.restart_requested:

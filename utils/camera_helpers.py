@@ -397,6 +397,129 @@ def capture_4k_downscale(device_path: str, output_path: Path) -> bool:
     return True
 
 
+def capture_720p_yuyv(device_path: str, output_path: Path) -> bool:
+    """
+    Capture native 720p YUYV (uncompressed) frame.
+
+    YUYV provides the best image quality because it's uncompressed - no JPEG
+    artifacts. This is superior to 4K MJPEG downscale for sharpness and detail.
+    Trade-off: Limited to ~10fps due to USB bandwidth constraints.
+
+    The function:
+    1. Configures camera to 720p YUYV @ 10fps via v4l2-ctl
+    2. Captures frames for 1 second
+    3. Selects last frame (ensures autofocus/exposure have settled)
+    4. Saves as PNG (no downscaling needed)
+
+    Args:
+        device_path: Camera device path (e.g., "/dev/video0")
+        output_path: Path to save the captured 720p image
+
+    Returns:
+        True if successful, False otherwise
+
+    Note:
+        This function releases the camera using garbage collection instead of
+        cap.release() to work around WBC-0E01 camera quirks (errno=19 issue).
+
+    Example:
+        >>> from pathlib import Path
+        >>> success = capture_720p_yuyv("/dev/video0", Path("board.png"))
+        >>> if success:
+        >>>     print("Captured successfully!")
+    """
+    camera_index = get_camera_index_from_device(device_path)
+
+    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
+
+    # Configure camera for YUYV 1280x720 (uncompressed)
+    print(f"[CameraCapture] Setting YUYV 1280x720 @ 10fps format (UNCOMPRESSED)...")
+    try:
+        subprocess.run([
+            "v4l2-ctl",
+            f"--device={device_path}",
+            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV",
+            "--set-parm=10"  # YUYV at 720p typically maxes at 10fps
+        ], check=True, capture_output=True, text=True)
+        print(f"[CameraCapture] [OK] Format set to YUYV 1280x720 @ 10fps")
+    except subprocess.CalledProcessError as e:
+        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
+        print(f"[CameraCapture] Continuing with OpenCV defaults...")
+
+    # Reset camera to consistent auto settings (in case previous runs changed them)
+    try:
+        subprocess.run([
+            "v4l2-ctl",
+            f"--device={device_path}",
+            "--set-ctrl=white_balance_automatic=1",
+            "--set-ctrl=focus_automatic_continuous=1",
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        pass  # Non-critical, continue with capture
+
+    # Open camera with V4L2 backend
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+
+    if not cap.isOpened():
+        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
+        return False
+
+    # Explicitly set resolution and FPS in OpenCV
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 10)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+
+    # Verify resolution and FPS
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
+
+    if width != 1280 or height != 720:
+        print(f"[CameraCapture] Warning: Expected 1280x720, got {width}x{height}")
+        print(f"[CameraCapture] Attempting to continue with available resolution")
+
+    # Capture frames for 1 second
+    print(f"[CameraCapture] Capturing YUYV frames for 1 second...")
+    frames = []
+    start_time = time.time()
+    frame_count = 0
+
+    while time.time() - start_time < 1.0:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[CameraCapture] [X] Failed to read frame {frame_count + 1}")
+            del cap
+            gc.collect()
+            return False
+        frames.append(frame)
+        frame_count += 1
+
+    print(f"[CameraCapture] [OK] Captured {len(frames)} YUYV frames")
+
+    # Release camera early (before processing)
+    del cap
+    gc.collect()
+    print("[CameraCapture] [OK] Camera released (GC)")
+
+    if not frames:
+        print(f"[CameraCapture] [X] No frames captured")
+        return False
+
+    # Use the last frame (ensures autofocus/exposure have settled)
+    last_idx = len(frames) - 1
+    best_frame = frames[last_idx]
+    print(f"[CameraCapture] Using frame {last_idx + 1}/{len(frames)} (last frame)")
+
+    # Save directly (no downscaling needed - already 720p)
+    cv2.imwrite(str(output_path), best_frame)
+    print(f"[CameraCapture] [OK] Photo saved: {output_path}")
+    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
+
+    return True
+
+
 if __name__ == "__main__":
     """Test camera detection and capture."""
     print("=" * 60)
