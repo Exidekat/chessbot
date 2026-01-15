@@ -30,6 +30,15 @@ except ImportError:
     sys.exit(1)
 
 
+# =============================================================================
+# DEFAULT CAPTURE MODE
+# =============================================================================
+# Set to True to use native 720p YUYV (uncompressed, best quality, 10fps)
+# Set to False to use 4K MJPEG -> 720p downscale (supersampled, 30fps)
+# This can be overridden per-script with --yuyv or --mjpeg flags
+DEFAULT_USE_YUYV = True
+
+
 def get_available_cameras() -> List[Tuple[str, str]]:
     """
     Detect all available USB cameras.

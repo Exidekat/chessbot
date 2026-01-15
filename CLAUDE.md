@@ -24,8 +24,11 @@ ChessBot is a modular chess robot system with YOLO-based computer vision, multi-
 
 ### Demo and Testing
 ```bash
-# Run full pipeline: capture 4K MJPEG -> 720p downscale + detect + calculate move
+# Run full pipeline: capture 720p YUYV (default) + detect + calculate move
 python scripts/best_move_demo.py --debug
+
+# Run with 4K MJPEG -> 720p downscale instead of YUYV
+python scripts/best_move_demo.py --debug --mjpeg
 
 # Run with specific camera
 python scripts/best_move_demo.py --debug --global-camera /dev/video0
@@ -206,7 +209,7 @@ Download with `python download.py` on first run.
 ### Detection Pipeline
 
 1. **Corner Detection** (YOLO stage 1)
-   - Input: 1280x720 board image (from 4K MJPEG downscale)
+   - Input: 1280x720 board image (from 720p YUYV by default, or 4K MJPEG downscale with --mjpeg)
    - Preprocessing: Grayscale conversion + CLAHE contrast normalization (must match training data)
    - Output: 4 corners (TL, TR, BR, BL)
    - Params: `corner_conf=0.005`, `min_corner_distance=30.0`
@@ -600,8 +603,10 @@ This means we should have exactly 2 lines per script usage. Some scripts may hav
 - Cached data, results, and intermediate files should be output to data/ or results/ by default. USAGE examples should reflect this standard.
 - For this project, we have two cameras with specific capture pipelines:
   - **Global Camera (WBC-0E01)**: Output is always 1280x720. Two capture modes:
-    - **Board Detection**: 4K MJPEG capture (3840x2160) downscaled to 720p via LANCZOS4 interpolation. This provides ~9:1 supersampling with superior quality, noise reduction, and anti-aliasing. Used by `capture_4k_downscale()` in board detection scripts.
+    - **720p YUYV (Default)**: Native 1280x720 uncompressed capture at 10fps. Best quality (no JPEG artifacts), used by default in all board detection scripts. Use `capture_720p_yuyv()` or pass no flags.
+    - **4K MJPEG Downscale**: 4K MJPEG capture (3840x2160) downscaled to 720p via LANCZOS4 interpolation. Provides ~9:1 supersampling with anti-aliasing. Use `capture_4k_downscale()` or pass `--mjpeg` flag.
     - **Real-time VLA**: Native 720p MJPEG at 30fps for low latency. Used by `LiveCameraCapture` class during episode recording and VLA inference control loops.
+  - **Default capture mode**: Controlled by `DEFAULT_USE_YUYV` in `utils/camera_helpers.py`. Currently set to `True` (YUYV default).
   - **Gripper Camera (eMeet C950)**: Captures at 640x480, then resized to 224x224 for VLA input. Most cameras don't natively support 224x224.
 - Both corner detection and piece detection use grayscale + CLAHE preprocessing. Training images must be preprocessed before labeling:
   - Corner detection: Use `preprocess_for_corner_detection()` (handled automatically by `label_corners.py`)

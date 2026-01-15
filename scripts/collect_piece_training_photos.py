@@ -26,6 +26,7 @@ from utils.camera_helpers import (
     get_default_global_camera,
     get_available_cameras,
     select_camera,
+    DEFAULT_USE_YUYV,
 )
 
 
@@ -261,10 +262,22 @@ def main():
     parser.add_argument(
         "--yuyv",
         action="store_true",
-        help="Use native 720p YUYV capture (uncompressed, best quality, 10fps)"
+        help="Force native 720p YUYV capture (uncompressed, best quality, 10fps). This is the default."
+    )
+    parser.add_argument(
+        "--mjpeg",
+        action="store_true",
+        help="Use 4K MJPEG -> 720p downscale (supersampled, 30fps) instead of default YUYV"
     )
 
     args = parser.parse_args()
+
+    # Determine capture mode: --mjpeg overrides to MJPEG, --yuyv forces YUYV, else use default
+    use_yuyv = DEFAULT_USE_YUYV
+    if args.mjpeg:
+        use_yuyv = False
+    elif args.yuyv:
+        use_yuyv = True
 
     # Camera selection: specified > auto-detect by name > prompt
     if args.device:
@@ -305,7 +318,9 @@ def main():
     print()
 
     # Capture photos
-    success = capture_training_photos(device_path, output_dir, args.count, use_yuyv=args.yuyv)
+    capture_mode_str = "720p YUYV" if use_yuyv else "4K MJPEG -> 720p"
+    print(f"Capture mode: {capture_mode_str}")
+    success = capture_training_photos(device_path, output_dir, args.count, use_yuyv=use_yuyv)
 
     if success:
         return 0

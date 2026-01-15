@@ -63,11 +63,14 @@ python scripts/capture_photo.py --device /dev/video0 --width 2592 --height 1944 
 
 ## Demo and Testing
 
-# Run full pipeline: capture 4K MJPEG -> 720p downscale + detect board + calculate best move (auto-detects camera)
+# Run full pipeline: capture 720p YUYV (default) + detect board + calculate best move (auto-detects camera)
 python scripts/best_move_demo.py
 
 # Run full pipeline with debug visualizations enabled (saves corner/piece detection images)
 python scripts/best_move_demo.py --debug
+
+# Run full pipeline with 4K MJPEG -> 720p downscale instead of default YUYV
+python scripts/best_move_demo.py --debug --mjpeg
 
 # Run full pipeline with specific global camera device (UPDATED ARG NAME)
 python scripts/best_move_demo.py --global-camera /dev/video0
@@ -121,8 +124,9 @@ python scripts/virtual_overlay_demo.py --global-camera /dev/video0 --rotation ri
 ## VLA Episode Collection (Training Data Recording)
 
 # Prerequisites: v4l2loopback loaded, tele_op.py running in Terminal 1
-# Camera pipeline: Board detection uses 4K->720p downscale, real-time recording uses native 720p at 30fps
+# Camera pipeline: Board detection uses 720p YUYV (default, best quality), real-time recording uses native 720p at 30fps
 # Gripper captures at 640x480 and resizes to 224x224 for VLA input
+# Use --mjpeg flag to use 4K->720p downscale instead of YUYV
 
 # Terminal 1: Run tele-op to control robot (required for episode collection)
 python scripts/tele_op.py
@@ -231,8 +235,9 @@ python scripts/vla_finetune.py --model pi0
 
 ## VLA Deployment (Multi-Model: PI0, SmolVLA)
 
-# Camera pipeline: Board detection uses 4K->720p downscale, VLA control uses native 720p at 30fps
+# Camera pipeline: Board detection uses 720p YUYV (default, best quality), VLA control uses native 720p at 30fps
 # Gripper captures at 640x480 and resizes to 224x224 for VLA input
+# Use --mjpeg flag to use 4K->720p downscale instead of YUYV
 
 # Deploy PI0 base model for chess robot control (auto-detects cameras)
 python scripts/vla_deploy.py --model pi0 --no-robot
@@ -274,7 +279,7 @@ python scripts/generate_overlay.py --cache data/state_cache.json
 
 ## Corner Detection Fine-tuning (Fix Corner Detection Issues)
 
-# Step 1: Collect 20+ training photos of YOUR chessboard (uses 4K -> 720p downscale)
+# Step 1: Collect 20+ training photos of YOUR chessboard (uses 720p YUYV by default)
 python scripts/collect_corner_training_photos.py --device /dev/video0 --count 20
 
 # Step 2: Label the 4 corners in each photo (auto-preprocesses with grayscale + CLAHE)

@@ -41,6 +41,7 @@ from utils.camera_helpers import (
     capture_4k_downscale,
     capture_720p_yuyv,
     get_default_global_camera,
+    DEFAULT_USE_YUYV,
 )
 
 
@@ -188,10 +189,22 @@ def main():
     parser.add_argument(
         "--yuyv",
         action="store_true",
-        help="Use native 720p YUYV capture (uncompressed, best quality, 10fps)"
+        help="Force native 720p YUYV capture (uncompressed, best quality, 10fps). This is the default."
+    )
+    parser.add_argument(
+        "--mjpeg",
+        action="store_true",
+        help="Use 4K MJPEG -> 720p downscale (supersampled, 30fps) instead of default YUYV"
     )
 
     args = parser.parse_args()
+
+    # Determine capture mode: --mjpeg overrides to MJPEG, --yuyv forces YUYV, else use default
+    use_yuyv = DEFAULT_USE_YUYV
+    if args.mjpeg:
+        use_yuyv = False
+    elif args.yuyv:
+        use_yuyv = True
 
     # Default to 'right' if no rotation specified (backward compatibility)
     if args.rotation is None:
@@ -215,7 +228,8 @@ def main():
 
     # Step 1: Camera selection and photo capture
     print("=" * 60)
-    print("STAGE 1: Camera Capture (4K MJPEG -> 720p Downscale)")
+    capture_mode_str = "720p YUYV Uncompressed" if use_yuyv else "4K MJPEG -> 720p Downscale"
+    print(f"STAGE 1: Camera Capture ({capture_mode_str})")
     print("=" * 60)
 
     # Determine which camera to use: specified > auto-detect by name > prompt
@@ -256,7 +270,7 @@ def main():
     image_path = Path("data") / f"chessboard_capture_{timestamp}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.yuyv:
+    if use_yuyv:
         success = capture_720p_yuyv(device_path, image_path)
     else:
         success = capture_4k_downscale(device_path, image_path)

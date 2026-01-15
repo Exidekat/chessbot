@@ -64,6 +64,7 @@ from utils.camera_helpers import (
     select_camera,
     capture_4k_downscale,
     capture_720p_yuyv,
+    DEFAULT_USE_YUYV,
 )
 
 # Configure HuggingFace for offline/local usage
@@ -904,10 +905,22 @@ Examples:
     parser.add_argument(
         "--yuyv",
         action="store_true",
-        help="Use native 720p YUYV capture for board detection (uncompressed, best quality, 10fps)"
+        help="Force native 720p YUYV capture for board detection (uncompressed, best quality, 10fps). This is the default."
+    )
+    parser.add_argument(
+        "--mjpeg",
+        action="store_true",
+        help="Use 4K MJPEG -> 720p downscale for board detection instead of default YUYV"
     )
 
     args = parser.parse_args()
+
+    # Determine capture mode: --mjpeg overrides to MJPEG, --yuyv forces YUYV, else use default
+    use_yuyv = DEFAULT_USE_YUYV
+    if args.mjpeg:
+        use_yuyv = False
+    elif args.yuyv:
+        use_yuyv = True
 
     # Camera selection: specified > auto-detect by name > prompt
     print("\n" + "=" * 60)
@@ -950,6 +963,9 @@ Examples:
             return 1
 
     # Create recorder
+    capture_mode_str = "720p YUYV" if use_yuyv else "4K MJPEG -> 720p"
+    print(f"[OK] Board capture mode: {capture_mode_str}")
+
     recorder = EpisodeRecorder(
         output_dir=args.output,
         global_camera_device=global_camera,
@@ -959,7 +975,7 @@ Examples:
         engine_path=args.engine,
         camera_rotation=args.rotation,
         turn=args.turn,
-        use_yuyv=args.yuyv,
+        use_yuyv=use_yuyv,
     )
 
     # Run collection loop
