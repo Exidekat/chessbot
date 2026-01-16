@@ -220,7 +220,8 @@ class BoardDetector:
         results = self.corner_model.predict(
             source=temp_preprocessed_path,
             conf=conf_threshold,
-            verbose=False
+            verbose=False,
+            imgsz=1280  # Match training resolution
         )
 
         boxes = results[0].boxes
