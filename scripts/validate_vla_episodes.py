@@ -100,41 +100,175 @@ class EpisodeValidator:
             print(f"[INFO] Loaded quality annotations for {len(self.episode_qualities)} episodes")
 
     def _load_lerobot_dataset(self):
-        """Load LeRobot format dataset."""
+        """Load LeRobot v3.0 format dataset by reading parquet files directly."""
         try:
-            # Local datasets need repo_id + root path
-            # repo_id format matches what collect_vla_episodes.py uses
-            repo_id = f"local/chess_vla_{self.dataset_path.name}"
-            self.dataset = LeRobotDataset(
-                repo_id=repo_id,
-                root=str(self.dataset_path),
-                download_videos=False,
-                video_backend="pyav"  # Use pyav instead of torchcodec (FFmpeg issues)
-            )
+            import pandas as pd
 
-            # LeRobot v0.4: episode info is in meta.episodes
-            fps = self.dataset.fps
-            ep_dataset = self.dataset.meta.episodes
+            # Read info.json for fps and metadata
+            info_path = self.dataset_path / "meta" / "info.json"
+            with open(info_path, 'r') as f:
+                info = json.load(f)
 
-            for i in range(len(ep_dataset)):
-                row = ep_dataset[i]
-                ep_idx = row["episode_index"]
-                frame_count = row["length"]
-                tasks = row["tasks"]
+            fps = info.get("fps", 15)
+            total_episodes = info.get("total_episodes", 0)
 
-                self.episodes.append({
-                    "index": int(ep_idx),
-                    "frame_count": frame_count,
-                    "fps": fps,
-                    "duration": frame_count / fps if fps > 0 else 0,
-                    "task": tasks[0] if tasks else "",
-                    "format": "lerobot"
-                })
+            # Read episodes from meta/episodes parquet files
+            episodes_dir = self.dataset_path / "meta" / "episodes"
+            episode_files = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
+
+            all_episodes = []
+            for ep_file in episode_files:
+                try:
+                    ep_df = pd.read_parquet(ep_file)
+                    for _, row in ep_df.iterrows():
+                        ep_idx = int(row["episode_index"])
+                        frame_count = int(row["length"])
+                        # 'tasks' column contains list of task strings directly
+                        tasks_list = row.get("tasks", [])
+                        if isinstance(tasks_list, (list, np.ndarray)) and len(tasks_list) > 0:
+                            task = str(tasks_list[0])
+                        else:
+                            task = ""
+
+                        all_episodes.append({
+                            "index": ep_idx,
+                            "frame_count": frame_count,
+                            "fps": fps,
+                            "duration": frame_count / fps if fps > 0 else 0,
+                            "task": task,
+                            "format": "lerobot",
+                            # Store chunk/file info for frame loading
+                            "data_chunk_index": int(row.get("data/chunk_index", 0)),
+                            "data_file_index": int(row.get("data/file_index", 0)),
+                            "dataset_from_index": int(row.get("dataset_from_index", 0)),
+                            "dataset_to_index": int(row.get("dataset_to_index", frame_count)),
+                            # Video info for global camera
+                            "videos/observation.images.global/chunk_index": int(row.get("videos/observation.images.global/chunk_index", 0)),
+                            "videos/observation.images.global/file_index": int(row.get("videos/observation.images.global/file_index", 0)),
+                            "videos/observation.images.global/from_timestamp": float(row.get("videos/observation.images.global/from_timestamp", 0)),
+                            "videos/observation.images.global/to_timestamp": float(row.get("videos/observation.images.global/to_timestamp", 0)),
+                            # Video info for gripper camera
+                            "videos/observation.images.gripper/chunk_index": int(row.get("videos/observation.images.gripper/chunk_index", 0)),
+                            "videos/observation.images.gripper/file_index": int(row.get("videos/observation.images.gripper/file_index", 0)),
+                            "videos/observation.images.gripper/from_timestamp": float(row.get("videos/observation.images.gripper/from_timestamp", 0)),
+                            "videos/observation.images.gripper/to_timestamp": float(row.get("videos/observation.images.gripper/to_timestamp", 0)),
+                        })
+                except Exception as e:
+                    print(f"[WARNING] Failed to read episode file {ep_file}: {e}")
+
+            # Sort by episode index
+            self.episodes = sorted(all_episodes, key=lambda x: x["index"])
+
+            # Store info for later use
+            self._lerobot_info = info
+
+            # Pre-load valid data parquet files (skip corrupted)
+            self._load_data_parquets()
 
         except Exception as e:
-            print(f"[ERROR] Failed to load LeRobot dataset: {e}")
+            print(f"[ERROR] Failed to load LeRobot v3.0 dataset: {e}")
+            import traceback
+            traceback.print_exc()
             print("[INFO] Falling back to raw file detection")
             self._load_raw_dataset()
+
+    def _load_data_parquets(self):
+        """Pre-load data parquet files, skipping corrupted ones."""
+        import pandas as pd
+
+        self._data_frames = {}  # (chunk_idx, file_idx) -> DataFrame
+        self._corrupted_files = set()
+
+        data_dir = self.dataset_path / "data"
+        data_files = sorted(data_dir.glob("chunk-*/file-*.parquet"))
+
+        for data_file in data_files:
+            # Parse chunk and file indices from path
+            parts = data_file.parts
+            chunk_idx = int(parts[-2].replace("chunk-", ""))
+            file_idx = int(parts[-1].replace("file-", "").replace(".parquet", ""))
+
+            try:
+                df = pd.read_parquet(data_file)
+                self._data_frames[(chunk_idx, file_idx)] = df
+            except Exception as e:
+                print(f"[WARNING] Corrupted parquet file {data_file}: {e}")
+                self._corrupted_files.add((chunk_idx, file_idx))
+
+    def _load_video_frames(self, episode: Dict, video_key: str, target_shape: Optional[tuple] = None) -> Optional[List[np.ndarray]]:
+        """
+        Load video frames for an episode from LeRobot v3.0 format using pyav.
+
+        Args:
+            episode: Episode metadata dict
+            video_key: Video key (e.g., "observation.images.global")
+            target_shape: Optional (H, W, C) shape to resize frames to
+
+        Returns:
+            List of video frames as numpy arrays (BGR), or None if unavailable
+        """
+        try:
+            import av
+
+            # Get video chunk/file info from episode metadata
+            chunk_key = f"videos/{video_key}/chunk_index"
+            file_key = f"videos/{video_key}/file_index"
+
+            chunk_idx = episode.get(chunk_key, episode.get("data_chunk_index", 0))
+            file_idx = episode.get(file_key, episode.get("data_file_index", 0))
+
+            # Construct video path
+            video_path = self.dataset_path / "videos" / video_key / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
+
+            if not video_path.exists():
+                return None
+
+            # Open video with pyav (supports AV1 codec)
+            container = av.open(str(video_path))
+            stream = container.streams.video[0]
+
+            # Get timestamp range for this episode
+            from_ts = episode.get(f"videos/{video_key}/from_timestamp", 0)
+            to_ts = episode.get(f"videos/{video_key}/to_timestamp", None)
+            fps = episode.get("fps", 15)
+
+            # Calculate frame range
+            from_frame = int(from_ts * fps)
+            to_frame = int(to_ts * fps) if to_ts is not None else None
+
+            frames = []
+            frame_idx = 0
+
+            for frame in container.decode(stream):
+                # Skip frames before our range
+                if frame_idx < from_frame:
+                    frame_idx += 1
+                    continue
+
+                # Stop if we've passed our range
+                if to_frame is not None and frame_idx >= to_frame:
+                    break
+
+                # Convert to numpy array (BGR)
+                img = frame.to_ndarray(format='bgr24')
+
+                # Resize to target shape if specified
+                if target_shape is not None and len(target_shape) >= 2:
+                    target_h, target_w = target_shape[0], target_shape[1]
+                    if img.shape[0] != target_h or img.shape[1] != target_w:
+                        img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+                frames.append(img)
+                frame_idx += 1
+
+            container.close()
+
+            return frames if frames else None
+
+        except Exception as e:
+            # Log error for debugging
+            print(f"[WARNING] Failed to load video {video_key}: {e}")
+            return None
 
     def _load_raw_dataset(self):
         """Load raw file format dataset."""
@@ -316,54 +450,67 @@ class EpisodeValidator:
                     "task": episode_task
                 })
 
-        elif self.use_lerobot and self.dataset is not None:
-            # Load from LeRobot dataset (v0.4 API)
+        elif self.use_lerobot and hasattr(self, '_data_frames'):
+            # Load from LeRobot v3.0 format (direct parquet reading)
             try:
-                # Calculate start index by summing lengths of previous episodes
-                start_idx = 0
-                for ep in self.episodes:
-                    if ep["index"] < episode_index:
-                        start_idx += ep["frame_count"]
-                    elif ep["index"] == episode_index:
-                        break
+                # Get episode's data location
+                chunk_idx = episode.get("data_chunk_index", 0)
+                file_idx = episode.get("data_file_index", 0)
+                from_idx = episode.get("dataset_from_index", 0)
+                to_idx = episode.get("dataset_to_index", episode["frame_count"])
 
-                # Load frames for this episode
-                for i in range(episode["frame_count"]):
-                    global_idx = start_idx + i
+                # Check if data file is corrupted
+                if (chunk_idx, file_idx) in self._corrupted_files:
+                    print(f"[WARNING] Episode {episode_index} data file is corrupted, skipping")
+                    return None
 
-                    # Get frame data from dataset
-                    sample = self.dataset[global_idx]
+                # Get the data frame
+                data_df = self._data_frames.get((chunk_idx, file_idx))
+                if data_df is None:
+                    print(f"[WARNING] Data file not found for episode {episode_index}")
+                    return None
 
-                    # Get task from sample or episode metadata
-                    task_val = sample.get("language_instruction", sample.get("task", episode_task))
+                # Filter rows for this episode
+                ep_data = data_df[data_df["episode_index"] == episode_index]
 
-                    # Handle tensor conversion for images
-                    global_cam = sample.get("observation.global_camera")
-                    gripper_cam = sample.get("observation.gripper_camera")
-                    joint_pos = sample.get("observation.joint_positions", [0.0] * 6)
+                # Try to load video frames if available
+                # Get expected shapes from dataset info (if available)
+                global_shape = None
+                gripper_shape = None
+                if hasattr(self, '_lerobot_info') and 'features' in self._lerobot_info:
+                    features = self._lerobot_info['features']
+                    if 'observation.images.global' in features:
+                        global_shape = tuple(features['observation.images.global'].get('shape', []))
+                    if 'observation.images.gripper' in features:
+                        gripper_shape = tuple(features['observation.images.gripper'].get('shape', []))
 
-                    # Convert tensors to numpy if needed
-                    if hasattr(global_cam, 'numpy'):
-                        global_cam = global_cam.permute(1, 2, 0).numpy()  # CHW -> HWC
-                        global_cam = (global_cam * 255).astype(np.uint8)
-                        global_cam = cv2.cvtColor(global_cam, cv2.COLOR_RGB2BGR)
-                    if hasattr(gripper_cam, 'numpy'):
-                        gripper_cam = gripper_cam.permute(1, 2, 0).numpy()
-                        gripper_cam = (gripper_cam * 255).astype(np.uint8)
-                        gripper_cam = cv2.cvtColor(gripper_cam, cv2.COLOR_RGB2BGR)
-                    if hasattr(joint_pos, 'numpy'):
-                        joint_pos = joint_pos.numpy()
+                global_video_frames = self._load_video_frames(episode, "observation.images.global", target_shape=global_shape)
+                gripper_video_frames = self._load_video_frames(episode, "observation.images.gripper", target_shape=gripper_shape)
+
+                for i, (_, row) in enumerate(ep_data.iterrows()):
+                    # Get observation state (joint positions)
+                    joint_pos = row.get("observation.state", [0.0] * 6)
+                    if hasattr(joint_pos, 'tolist'):
+                        joint_pos = joint_pos.tolist()
+
+                    # Get frames from video if available
+                    global_cam = global_video_frames[i] if global_video_frames and i < len(global_video_frames) else None
+                    gripper_cam = gripper_video_frames[i] if gripper_video_frames and i < len(gripper_video_frames) else None
+
+                    timestamp = row.get("timestamp", i / episode["fps"])
+                    if hasattr(timestamp, 'item'):
+                        timestamp = timestamp.item()
 
                     frames.append({
                         "global_frame": global_cam,
                         "gripper_frame": gripper_cam,
                         "joint_positions": joint_pos,
-                        "timestamp": i / episode["fps"],
-                        "task": task_val
+                        "timestamp": float(timestamp),
+                        "task": episode_task
                     })
 
             except Exception as e:
-                print(f"[ERROR] Failed to load LeRobot frames: {e}")
+                print(f"[ERROR] Failed to load LeRobot v3.0 frames: {e}")
                 import traceback
                 traceback.print_exc()
                 return None
