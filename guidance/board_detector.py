@@ -541,6 +541,98 @@ class BoardDetector:
 
         return filtered_detections, filtered_boxes
 
+    def apply_chess_rules(self, board_array: List[List[str]], confidence_array: List[List[float]], debug: bool = False) -> List[List[str]]:
+        """
+        Apply chess knowledge to correct implausible piece arrangements.
+
+        Chess piece limits per side:
+        - Max 1 king
+        - Max 2 queens, rooks, bishops, knights (original pieces)
+        - Max 8 pawns
+
+        When excess pieces detected, reclassify based on:
+        1. Confidence (lowest confidence pieces reclassified first)
+        2. Position heuristics (distance from pawn starting rank as tiebreaker)
+
+        Args:
+            board_array: 8x8 array of piece strings (e.g., 'b-rook', 'W-pawn', 'empty')
+            confidence_array: 8x8 array of detection confidences (0.0-1.0)
+            debug: Print debug information
+
+        Returns:
+            Corrected board array
+        """
+        # Piece limits per side (max count allowed)
+        PIECE_LIMITS = {
+            'king': 1,
+            'queen': 2,
+            'rook': 2,
+            'bishop': 2,
+            'knight': 2,
+            'pawn': 8
+        }
+
+        # Count pieces by type and color, track positions with confidence
+        piece_counts = {'b': {}, 'W': {}}
+        piece_positions = {'b': {}, 'W': {}}  # (row, col, confidence)
+
+        for row_idx, row in enumerate(board_array):
+            for col_idx, piece in enumerate(row):
+                if piece == 'empty' or '-' not in piece:
+                    continue
+                parts = piece.split('-')
+                if len(parts) != 2:
+                    continue
+                color = 'b' if piece[0] == 'b' else 'W'
+                ptype = parts[1]
+                conf = confidence_array[row_idx][col_idx]
+                piece_counts[color][ptype] = piece_counts[color].get(ptype, 0) + 1
+                if ptype not in piece_positions[color]:
+                    piece_positions[color][ptype] = []
+                piece_positions[color][ptype].append((row_idx, col_idx, conf))
+
+        if debug:
+            print(f"[BoardDetector]   Piece counts before correction:")
+            for color in ['b', 'W']:
+                color_name = "Black" if color == 'b' else "White"
+                for ptype, count in piece_counts[color].items():
+                    print(f"[BoardDetector]     {color_name} {ptype}: {count}")
+
+        corrections_made = []
+
+        # Fix excess pieces for each color
+        for color in ['b', 'W']:
+            # Pawn starting rank: black=row 1 (rank 7), white=row 6 (rank 2)
+            pawn_rank = 1 if color == 'b' else 6
+
+            for ptype, max_count in PIECE_LIMITS.items():
+                current_count = piece_counts[color].get(ptype, 0)
+
+                if current_count > max_count:
+                    excess = current_count - max_count
+                    positions = piece_positions[color].get(ptype, [])
+
+                    # Sort by confidence (lowest first), then by distance from pawn rank
+                    # This ensures we reclassify the least confident detections first
+                    positions_sorted = sorted(positions,
+                        key=lambda pos: (pos[2], -abs(pos[0] - pawn_rank)))
+
+                    # Reclassify excess pieces as pawns (most common misclassification)
+                    for i in range(excess):
+                        if i < len(positions_sorted):
+                            row, col, conf = positions_sorted[i]
+                            old_piece = board_array[row][col]
+                            board_array[row][col] = f"{color}-pawn"
+                            square_name = chr(ord('a') + col) + str(8 - row)
+                            corrections_made.append(f"{old_piece} -> {color}-pawn at {square_name} (conf={conf:.2f})")
+
+        if debug and corrections_made:
+            print(f"[BoardDetector]   Chess rules applied {len(corrections_made)} correction(s):")
+            for correction in corrections_made:
+                print(f"[BoardDetector]     {correction}")
+
+        return board_array
+
     def calculate_grid(self, image: Image.Image) -> Tuple[List[float], List[float]]:
         """
         Calculate the 8x8 grid on the transformed board.
@@ -682,6 +774,30 @@ class BoardDetector:
 
         return squares
 
+    def _rotate_2d_array(self, arr: List[List], camera_position: str) -> List[List]:
+        """
+        Rotate any 2D array based on camera position.
+
+        Args:
+            arr: 8x8 2D array
+            camera_position: Camera position ('top', 'right', 'bottom', 'left')
+
+        Returns:
+            Rotated 8x8 array
+        """
+        if camera_position == "top":
+            return arr
+        elif camera_position == "right":
+            transposed = [[arr[row][col] for row in range(8)] for col in range(8)]
+            return [row[::-1] for row in transposed]
+        elif camera_position == "bottom":
+            return [row[::-1] for row in arr[::-1]]
+        elif camera_position == "left":
+            reversed_rows = [row[::-1] for row in arr]
+            return [[reversed_rows[row][col] for row in range(8)] for col in range(8)]
+        else:
+            return arr
+
     def rotate_board_for_camera_position(self, board_array: List[List[str]]) -> List[List[str]]:
         """
         Rotate board array based on camera position to get correct orientation.
@@ -698,28 +814,7 @@ class BoardDetector:
         Returns:
             Rotated 8x8 array
         """
-        if self.camera_position == "top":
-            # No rotation needed
-            return board_array
-
-        elif self.camera_position == "right":
-            # 90° clockwise: transpose then reverse each row
-            transposed = [[board_array[row][col] for row in range(8)] for col in range(8)]
-            return [row[::-1] for row in transposed]
-
-        elif self.camera_position == "bottom":
-            # 180°: reverse all rows, then reverse each row
-            return [row[::-1] for row in board_array[::-1]]
-
-        elif self.camera_position == "left":
-            # 90° counter-clockwise (270° clockwise): reverse each row then transpose
-            reversed_rows = [row[::-1] for row in board_array]
-            return [[reversed_rows[row][col] for row in range(8)] for col in range(8)]
-
-        else:
-            # Unknown position - no rotation
-            print(f"[WARNING] Unknown camera position '{self.camera_position}', no rotation applied")
-            return board_array
+        return self._rotate_2d_array(board_array, self.camera_position)
 
     def board_to_fen(self, board_array: List[List[str]]) -> str:
         """
@@ -1121,23 +1216,31 @@ class BoardDetector:
             print("[BoardDetector] Step 6: Matching pieces to squares...")
 
         board_array = []
+        confidence_array = []  # Track confidence for chess rules
         matched_pieces = 0
         used_detections = set()  # Track which detections have been assigned
 
         for row_idx, row in enumerate(squares):
             row_pieces = []
+            row_confidences = []
             for col_idx, square in enumerate(row):
                 piece, detection_idx = self.connect_square_to_detection(
                     detections, boxes, square, used_detections
                 )
                 row_pieces.append(piece)
+                # Track confidence for this square
                 if piece != 'empty' and detection_idx is not None:
+                    conf = float(boxes.conf[detection_idx].cpu().numpy())
+                    row_confidences.append(conf)
                     used_detections.add(detection_idx)  # Mark as used
                     matched_pieces += 1
                     if debug:
                         square_name = chr(ord('a') + col_idx) + str(8 - row_idx)
-                        print(f"[BoardDetector]     {square_name}: {piece} (detection #{detection_idx})")
+                        print(f"[BoardDetector]     {square_name}: {piece} (detection #{detection_idx}, conf={conf:.2f})")
+                else:
+                    row_confidences.append(0.0)
             board_array.append(row_pieces)
+            confidence_array.append(row_confidences)
 
         if debug:
             print(f"[BoardDetector]   Matched {matched_pieces} pieces to squares")
@@ -1175,13 +1278,21 @@ class BoardDetector:
             print(f"[BoardDetector] Step 7: Rotating board for camera position '{self.camera_position}'...")
 
         board_array = self.rotate_board_for_camera_position(board_array)
+        # Apply same rotation to confidence array
+        confidence_array = self._rotate_2d_array(confidence_array, self.camera_position)
 
         if debug:
             print("[BoardDetector]   Board rotated to correct orientation")
 
-        # Step 8: Convert to FEN
+        # Step 8: Apply chess rules to fix implausible arrangements
         if debug:
-            print("[BoardDetector] Step 8: Converting to FEN...")
+            print("[BoardDetector] Step 8: Applying chess rules...")
+
+        board_array = self.apply_chess_rules(board_array, confidence_array, debug=debug)
+
+        # Step 9: Convert to FEN
+        if debug:
+            print("[BoardDetector] Step 9: Converting to FEN...")
 
         fen_position = self.board_to_fen(board_array)
         full_fen = f"{fen_position} {turn} KQkq - 0 1"
