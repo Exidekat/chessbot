@@ -72,6 +72,11 @@ import os
 os.environ["HF_HUB_OFFLINE"] = "1"  # Disable HuggingFace Hub access
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+# SVT-AV1 encoder logging (set before LeRobot import)
+# Will be updated based on --debug flag in main()
+# 0=quiet, 1=error, 2=warning, 3=info, 4=debug
+os.environ["SVT_LOG"] = "0"  # Default: quiet (no encoder spam)
+
 # Import LeRobot (required dependency)
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -478,7 +483,14 @@ class EpisodeRecorder:
         except Exception as e:
             print(f"[ERROR] Overlay streaming failed: {e}")
 
-    def _record_stage(self, stage: Dict, stage_index: int, total_stages: int) -> Optional[List[Dict]]:
+    def _record_stage(
+        self,
+        stage: Dict,
+        stage_index: int,
+        total_stages: int,
+        board: chess.Board,
+        move: chess.Move
+    ) -> Optional[List[Dict]]:
         """
         Record one stage at 15 FPS until user presses ENTER.
 
@@ -486,6 +498,8 @@ class EpisodeRecorder:
             stage: Stage dictionary from decompose_move()
             stage_index: Current stage index (0-based)
             total_stages: Total number of stages
+            board: Current chess board state (before move)
+            move: The move being executed
 
         Returns:
             List of frame dictionaries or None if recording fails
@@ -495,7 +509,22 @@ class EpisodeRecorder:
         print(f"{'='*60}")
         print(f"Description: {stage['description']}")
         print(f"VLM Prompt: {stage['vlm_prompt']}")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}")
+
+        # Display board before and after move
+        print("\nCurrent Board Position:")
+        print("=" * 40)
+        print(board)
+        print("=" * 40)
+
+        # Show board after move
+        board_after = board.copy()
+        board_after.push(move)
+        print(f"\nBoard after {move.uci()} ({board.san(move)}):")
+        print("-" * 40)
+        print(board_after)
+        print("-" * 40)
+        print()
 
         # Generate and stream overlay
         print("[INFO] Streaming overlay to virtual camera...")
@@ -761,7 +790,13 @@ class EpisodeRecorder:
                     for stage_idx, stage in enumerate(move_info["stages"]):
                         # Retry loop for each stage
                         while True:
-                            frames = self._record_stage(stage, stage_idx, len(move_info["stages"]))
+                            frames = self._record_stage(
+                                stage,
+                                stage_idx,
+                                len(move_info["stages"]),
+                                move_info["board"],
+                                move_info["move"]
+                            )
 
                             if frames is None:
                                 print("[WARNING] Stage recording failed")
@@ -912,8 +947,17 @@ Examples:
         action="store_true",
         help="Use 4K MJPEG -> 720p downscale for board detection instead of default YUYV"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode (verbose SVT-AV1 encoder output)"
+    )
 
     args = parser.parse_args()
+
+    # Set SVT-AV1 logging level based on debug flag
+    if args.debug:
+        os.environ["SVT_LOG"] = "3"  # info level
 
     # Determine capture mode: --mjpeg overrides to MJPEG, --yuyv forces YUYV, else use default
     use_yuyv = DEFAULT_USE_YUYV
