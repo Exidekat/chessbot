@@ -6,22 +6,34 @@ Reviews one image at a time with all bounding boxes shown.
 
 Features:
 - Review all labels per image at once (much faster than per-instance)
-- Edit mode: click to select, change class, add/delete boxes
+- Edit mode with same controls as label_pieces.py (TAB + p/r/n/b/q/k)
 - Progress tracking with resume capability
-- Generate validation report
+- Add missing labels (pieces off-board, etc.)
 
 Usage:
     # Validate all images in dataset
     python scripts/validate_piece_labels.py --data data/training/piece_dataset/
     python scripts/validate_piece_labels.py --data data/training/piece_dataset/data.yaml
 
-Controls:
+Main Controls:
     y/SPACE = all labels correct, move to next image
-    e = enter edit mode (fix incorrect labels)
+    e = enter edit mode (fix/add labels)
     s = skip image (review later)
-    u = go back to previous image
+    b = go back to previous image
     q = quit and save progress
     h = show help
+
+Edit Mode Controls (same as label_pieces.py):
+    TAB = toggle between WHITE/BLACK mode
+    p/r/n/b/q/k = select piece type (pawn/rook/knight/bishop/queen/king)
+    Click box = select existing box
+    Drag = draw new bounding box
+    d = delete selected box
+    u = undo last added box
+    [ = save current, go to PREVIOUS image (stays in edit mode)
+    ] = save current, go to NEXT image (stays in edit mode)
+    ENTER = save and exit edit mode
+    ESC = cancel without saving
 """
 
 import argparse
@@ -210,7 +222,7 @@ class LabelValidator:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         # Controls
-        controls = "y/SPACE=correct | e=edit | s=skip | u=back | q=quit | h=help"
+        controls = "y/SPACE=correct | e=edit | s=skip | b=back | q=quit | h=help"
         cv2.putText(status_bar, controls, (10, 75),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
@@ -228,8 +240,19 @@ class LabelValidator:
         """
         Edit mode for correcting labels.
 
+        Uses same controls as label_pieces.py:
+        - TAB: Toggle between WHITE/BLACK mode
+        - p/r/n/b/q/k: Select piece type
+        - Click: Select existing box OR draw new box (drag)
+        - d: Delete selected box
+        - u: Undo last added box
+        - ENTER: Save and exit
+        - ESC: Cancel without saving
+        - [ : Save and go to previous image
+        - ] : Save and go to next image
+
         Returns:
-            True if changes were saved, False otherwise
+            str: "saved", "cancelled", "next", or "prev"
         """
         img = cv2.imread(str(image_info['image_path']))
         if img is None:
@@ -240,9 +263,40 @@ class LabelValidator:
 
         selected_idx = None
         modified = False
-        draw_mode = False
         draw_start = None
-        first_digit = None
+
+        # Same controls as label_pieces.py
+        white_mode = True  # Toggle between white (True) and black (False)
+        current_class = 9  # Default to white pawn
+
+        # Piece shortcuts (same as label_pieces.py)
+        shortcuts = {
+            'b': 'bishop',
+            'k': 'king',
+            'n': 'knight',
+            'p': 'pawn',
+            'q': 'queen',
+            'r': 'rook'
+        }
+
+        # Mapping from piece type + color to class ID
+        piece_to_class = {
+            ('bishop', False): 0,   # b-bishop
+            ('king', False): 1,     # b-king
+            ('knight', False): 2,   # b-knight
+            ('pawn', False): 3,     # b-pawn
+            ('queen', False): 4,    # b-queen
+            ('rook', False): 5,     # b-rook
+            ('bishop', True): 6,    # W-bishop
+            ('king', True): 7,      # W-king
+            ('knight', True): 8,    # W-knight
+            ('pawn', True): 9,      # W-pawn
+            ('queen', True): 10,    # W-queen
+            ('rook', True): 11      # W-rook
+        }
+
+        # Reverse mapping: class_id -> piece_type
+        class_to_piece = {v: k[0] for k, v in piece_to_class.items()}
 
         def draw_edit_display():
             display = img.copy()
@@ -272,16 +326,10 @@ class LabelValidator:
             status_height = 100
             status_bar = np.zeros((status_height, display.shape[1], 3), dtype=np.uint8)
 
-            if draw_mode:
-                mode_text = "DRAW MODE - Click and drag to add bbox"
-                mode_color = (0, 165, 255)
-            elif first_digit is not None:
-                mode_text = f"Enter second digit (0-9) for class {first_digit}X"
-                mode_color = (255, 165, 0)
-            else:
-                mode_text = "EDIT MODE - Click to select, then change class or delete"
-                mode_color = (0, 255, 0)
-
+            # Mode and class display (same style as label_pieces.py)
+            color_text = "WHITE" if white_mode else "BLACK"
+            mode_text = f"Mode: {color_text} | Class: {PIECE_CLASSES[current_class]} | Labels: {len(labels)}"
+            mode_color = (255, 0, 0) if white_mode else (0, 0, 255)  # Blue for white, red for black
             cv2.putText(status_bar, mode_text, (10, 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
 
@@ -290,17 +338,19 @@ class LabelValidator:
                 cv2.putText(status_bar, f"Selected: [{selected_idx}] {sel_class}", (10, 50),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            controls = "Click=select | 0-9,0-9=class | d=delete | a=add | ENTER=save | ESC=cancel"
+            # Controls (same as label_pieces.py + navigation)
+            controls = "TAB=color | p/r/n/b/q/k=piece | d=del | u=undo | [/]=prev/next | ENTER=save | ESC=cancel"
             cv2.putText(status_bar, controls, (10, 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
-            # Class reference
-            ref_x = display.shape[1] - 180
-            for cls_id in range(12):
-                y_pos = 15 + (cls_id % 6) * 14
-                x_pos = ref_x if cls_id < 6 else ref_x + 90
-                cv2.putText(status_bar, f"{cls_id:02d}:{PIECE_CLASSES[cls_id][:6]}", (x_pos, y_pos),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            # Piece reference on right side
+            ref_x = display.shape[1] - 100
+            cv2.putText(status_bar, "p=pawn", (ref_x, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.putText(status_bar, "r=rook", (ref_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.putText(status_bar, "n=knight", (ref_x, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.putText(status_bar, "b=bishop", (ref_x, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.putText(status_bar, "q=queen", (ref_x, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            cv2.putText(status_bar, "k=king", (ref_x, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
 
             return np.vstack([display, status_bar])
 
@@ -323,11 +373,14 @@ class LabelValidator:
             mouse_state['y'] = y
 
             if event == cv2.EVENT_LBUTTONDOWN:
-                if draw_mode:
+                # Check if clicking on existing box first
+                clicked_idx = find_bbox_at_point(x, y)
+                if clicked_idx is not None:
+                    selected_idx = clicked_idx
+                else:
+                    # Start drawing new box
                     draw_start = (x, y)
                     mouse_state['drawing'] = True
-                else:
-                    selected_idx = find_bbox_at_point(x, y)
 
             elif event == cv2.EVENT_LBUTTONUP:
                 if mouse_state['drawing'] and draw_start:
@@ -338,20 +391,26 @@ class LabelValidator:
                     w = abs(x2 - x1) / img_w
                     h = abs(y2 - y1) / img_h
 
+                    # Only add if box has reasonable size
                     if w > 0.01 and h > 0.01:
-                        labels.append({'class_id': 9, 'bbox': [xc, yc, w, h]})
+                        labels.append({'class_id': current_class, 'bbox': [xc, yc, w, h]})
                         selected_idx = len(labels) - 1
                         modified = True
+                        print(f"  Added: {PIECE_CLASSES[current_class]}")
 
                     draw_start = None
                     mouse_state['drawing'] = False
 
         cv2.setMouseCallback(self.window_name, mouse_callback)
 
+        print(f"\n  Edit mode: TAB=toggle color, p/r/n/b/q/k=piece type")
+        print(f"  Draw boxes, d=delete, u=undo, [/]=prev/next, ENTER=save")
+
         while True:
             display = draw_edit_display()
 
-            if draw_mode and draw_start and mouse_state['drawing']:
+            # Draw box being created
+            if draw_start and mouse_state['drawing']:
                 x1, y1 = draw_start
                 cv2.rectangle(display[:img_h], (x1, y1),
                             (mouse_state['x'], mouse_state['y']), (255, 0, 255), 2)
@@ -359,42 +418,79 @@ class LabelValidator:
             cv2.imshow(self.window_name, display)
             key = cv2.waitKey(50) & 0xFF
 
-            if key == 27:  # ESC
-                break
+            if key == 27:  # ESC - cancel
+                print("  [Cancelled]")
+                cv2.setMouseCallback(self.window_name, lambda *args: None)
+                return "cancelled"
 
-            elif key == 13:  # Enter
+            elif key == 13:  # Enter - save and exit
                 if modified:
                     self._save_labels(image_info['label_path'], labels)
-                    print(f"[Saved] {len(labels)} labels")
-                    cv2.setMouseCallback(self.window_name, lambda *args: None)
-                    return True
-                break
+                    print(f"  [Saved] {len(labels)} labels")
+                cv2.setMouseCallback(self.window_name, lambda *args: None)
+                return "saved" if modified else "cancelled"
 
-            elif key == ord('a'):
-                draw_mode = not draw_mode
-                if not draw_mode:
-                    draw_start = None
+            # Navigation: [ = previous image, ] = next image
+            elif key == ord('['):
+                if modified:
+                    self._save_labels(image_info['label_path'], labels)
+                    print(f"  [Saved] {len(labels)} labels")
+                cv2.setMouseCallback(self.window_name, lambda *args: None)
+                return "prev"
 
-            elif key == ord('d'):
+            elif key == ord(']'):
+                if modified:
+                    self._save_labels(image_info['label_path'], labels)
+                    print(f"  [Saved] {len(labels)} labels")
+                cv2.setMouseCallback(self.window_name, lambda *args: None)
+                return "next"
+
+            # TAB - toggle color mode (same as label_pieces.py)
+            elif key == 9:  # TAB key
+                white_mode = not white_mode
+                # Update current class to match new color
+                piece_type = class_to_piece.get(current_class)
+                if piece_type:
+                    current_class = piece_to_class[(piece_type, white_mode)]
+                color_text = "WHITE" if white_mode else "BLACK"
+                print(f"  Switched to {color_text} mode -> {PIECE_CLASSES[current_class]}")
+
+            # Piece type shortcuts (same as label_pieces.py)
+            elif key != 255:
+                try:
+                    key_char = chr(key).lower()
+                    if key_char in shortcuts:
+                        piece_type = shortcuts[key_char]
+                        current_class = piece_to_class[(piece_type, white_mode)]
+                        print(f"  Selected: {PIECE_CLASSES[current_class]}")
+
+                        # If a box is selected, change its class
+                        if selected_idx is not None and selected_idx < len(labels):
+                            labels[selected_idx]['class_id'] = current_class
+                            modified = True
+                            print(f"  Changed [{selected_idx}] -> {PIECE_CLASSES[current_class]}")
+                        continue
+                except ValueError:
+                    pass
+
+            # Delete selected box
+            if key == ord('d'):
                 if selected_idx is not None and selected_idx < len(labels):
-                    del labels[selected_idx]
+                    removed = labels.pop(selected_idx)
+                    print(f"  Removed: [{selected_idx}] {PIECE_CLASSES.get(removed['class_id'], '?')}")
                     selected_idx = None
                     modified = True
 
-            elif ord('0') <= key <= ord('9'):
-                digit = key - ord('0')
-                if first_digit is None:
-                    first_digit = digit
-                else:
-                    new_class = first_digit * 10 + digit
-                    if 0 <= new_class <= 11 and selected_idx is not None:
-                        labels[selected_idx]['class_id'] = new_class
-                        modified = True
-                        print(f"[Class] -> {PIECE_CLASSES[new_class]}")
-                    first_digit = None
+            # Undo last added box
+            elif key == ord('u'):
+                if labels:
+                    removed = labels.pop()
+                    print(f"  Undo: {PIECE_CLASSES.get(removed['class_id'], '?')}")
+                    selected_idx = None
+                    modified = True
 
         cv2.setMouseCallback(self.window_name, lambda *args: None)
-        return modified
+        return "cancelled"
 
     def show_help(self):
         """Show help overlay."""
@@ -404,17 +500,21 @@ class LabelValidator:
             "y / SPACE  - All labels CORRECT, next image",
             "e          - EDIT mode (fix labels)",
             "s          - SKIP this image",
-            "u          - Go BACK to previous image",
+            "b          - Go BACK to previous image",
             "q          - QUIT and save progress",
             "h          - Show this help",
             "",
-            "EDIT MODE:",
-            "  Click      - Select a bounding box",
-            "  0-9, 0-9   - Change class (two digits)",
+            "EDIT MODE (same as label_pieces.py):",
+            "  TAB        - Toggle WHITE/BLACK mode",
+            "  p/r/n/b/q/k - Select piece type",
+            "  Click box  - Select existing box",
+            "  Drag       - Draw new bounding box",
             "  d          - Delete selected box",
-            "  a          - Add mode (draw new box)",
-            "  ENTER      - Save changes",
-            "  ESC        - Cancel",
+            "  u          - Undo last added box",
+            "  [          - Save and go to PREVIOUS image",
+            "  ]          - Save and go to NEXT image",
+            "  ENTER      - Save and exit edit mode",
+            "  ESC        - Cancel without saving",
             "",
             "RED boxes  = Black pieces (b-)",
             "BLUE boxes = White pieces (W-)",
@@ -463,9 +563,29 @@ class LabelValidator:
                 self.current_idx += 1
 
             elif key == ord('e'):
-                if self.edit_image(image_info):
-                    self.validation_state[image_info['name']] = 'edited'
-                # Refresh display after edit
+                # Enter edit mode loop - stay in edit mode until ENTER or ESC
+                while True:
+                    result = self.edit_image(image_info)
+                    if result == "saved":
+                        self.validation_state[image_info['name']] = 'edited'
+                        break  # Exit edit mode
+                    elif result == "next":
+                        self.validation_state[image_info['name']] = 'edited'
+                        if self.current_idx < len(self.images) - 1:
+                            self.current_idx += 1
+                            image_info = self.images[self.current_idx]
+                            print(f"[Next] Image {self.current_idx + 1}/{len(self.images)}")
+                        # Stay in edit mode loop
+                    elif result == "prev":
+                        self.validation_state[image_info['name']] = 'edited'
+                        if self.current_idx > 0:
+                            self.current_idx -= 1
+                            image_info = self.images[self.current_idx]
+                            print(f"[Prev] Image {self.current_idx + 1}/{len(self.images)}")
+                        # Stay in edit mode loop
+                    else:  # "cancelled"
+                        break  # Exit edit mode
+                # Refresh display after exiting edit mode
                 continue
 
             elif key == ord('s'):
@@ -473,7 +593,7 @@ class LabelValidator:
                 print(f"[Skip] {image_info['name']}")
                 self.current_idx += 1
 
-            elif key == ord('u'):
+            elif key == ord('b'):
                 if self.current_idx > 0:
                     self.current_idx -= 1
                     print(f"[Back] Image {self.current_idx + 1}")

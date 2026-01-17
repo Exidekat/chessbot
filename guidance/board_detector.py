@@ -563,28 +563,39 @@ class BoardDetector:
             Corrected board array
         """
         # Piece limits per side (max count allowed)
+        # Using FEN piece types: k=king, q=queen, r=rook, b=bishop, n=knight, p=pawn
         PIECE_LIMITS = {
-            'king': 1,
-            'queen': 2,
-            'rook': 2,
-            'bishop': 2,
-            'knight': 2,
-            'pawn': 8
+            'k': 1,
+            'q': 2,
+            'r': 2,
+            'b': 2,
+            'n': 2,
+            'p': 8
+        }
+
+        # FEN piece names for debug output
+        PIECE_NAMES = {
+            'k': 'king', 'q': 'queen', 'r': 'rook',
+            'b': 'bishop', 'n': 'knight', 'p': 'pawn'
         }
 
         # Count pieces by type and color, track positions with confidence
-        piece_counts = {'b': {}, 'W': {}}
-        piece_positions = {'b': {}, 'W': {}}  # (row, col, confidence)
+        # Color: 'black' for lowercase FEN, 'white' for uppercase FEN
+        piece_counts = {'black': {}, 'white': {}}
+        piece_positions = {'black': {}, 'white': {}}  # (row, col, confidence)
 
         for row_idx, row in enumerate(board_array):
             for col_idx, piece in enumerate(row):
-                if piece == 'empty' or '-' not in piece:
+                if piece == 'empty' or len(piece) != 1:
                     continue
-                parts = piece.split('-')
-                if len(parts) != 2:
-                    continue
-                color = 'b' if piece[0] == 'b' else 'W'
-                ptype = parts[1]
+                # FEN notation: lowercase = black, uppercase = white
+                if piece.islower():
+                    color = 'black'
+                    ptype = piece  # Already lowercase
+                else:
+                    color = 'white'
+                    ptype = piece.lower()  # Normalize to lowercase for lookup
+
                 conf = confidence_array[row_idx][col_idx]
                 piece_counts[color][ptype] = piece_counts[color].get(ptype, 0) + 1
                 if ptype not in piece_positions[color]:
@@ -593,17 +604,19 @@ class BoardDetector:
 
         if debug:
             print(f"[BoardDetector]   Piece counts before correction:")
-            for color in ['b', 'W']:
-                color_name = "Black" if color == 'b' else "White"
+            for color in ['black', 'white']:
                 for ptype, count in piece_counts[color].items():
-                    print(f"[BoardDetector]     {color_name} {ptype}: {count}")
+                    pname = PIECE_NAMES.get(ptype, ptype)
+                    print(f"[BoardDetector]     {color.capitalize()} {pname}: {count}")
 
         corrections_made = []
 
         # Fix excess pieces for each color
-        for color in ['b', 'W']:
+        for color in ['black', 'white']:
             # Pawn starting rank: black=row 1 (rank 7), white=row 6 (rank 2)
-            pawn_rank = 1 if color == 'b' else 6
+            pawn_rank = 1 if color == 'black' else 6
+            # FEN pawn character for this color
+            pawn_char = 'p' if color == 'black' else 'P'
 
             for ptype, max_count in PIECE_LIMITS.items():
                 current_count = piece_counts[color].get(ptype, 0)
@@ -622,9 +635,10 @@ class BoardDetector:
                         if i < len(positions_sorted):
                             row, col, conf = positions_sorted[i]
                             old_piece = board_array[row][col]
-                            board_array[row][col] = f"{color}-pawn"
+                            board_array[row][col] = pawn_char
                             square_name = chr(ord('a') + col) + str(8 - row)
-                            corrections_made.append(f"{old_piece} -> {color}-pawn at {square_name} (conf={conf:.2f})")
+                            old_name = PIECE_NAMES.get(ptype, ptype)
+                            corrections_made.append(f"{color} {old_name} -> pawn at {square_name} (conf={conf:.2f})")
 
         if debug and corrections_made:
             print(f"[BoardDetector]   Chess rules applied {len(corrections_made)} correction(s):")
