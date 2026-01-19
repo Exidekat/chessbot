@@ -19,7 +19,7 @@ ChessBot provides a complete software stack for autonomous chess-playing robots:
 
 ```bash
 # Clone repository with submodules
-git clone --recurse-submodules <repository-url>
+git clone --recurse-submodules https://github.com/Exidekat/chessbot
 cd chessbot
 
 # Install dependencies (to ltx conda environment)
