@@ -97,7 +97,7 @@ class RobotController:
     JOINT_0_SMOOTHING_ALPHA = 1.0   # Low-pass filter (only 5% new target) (disabled)
     JOINT_0_SPEED_LIMIT = 1000        # steps/sec
     JOINT_0_ACCEL = 0              # acceleration limit
-    JOINT_0_TORQUE = 50            # 5% max torque
+    JOINT_0_TORQUE = 200            # 20% max torque
 
     # Joint 1 (Shoulder) - prone to oscillation, fights gravity
     JOINT_1_DEADBAND = 0.0           # no deadband (gravity-fighting)
