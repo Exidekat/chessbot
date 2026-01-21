@@ -90,6 +90,7 @@ class ChessEpisodeDataset(Dataset):
         normalizer: Optional[ActionNormalizer] = None,  # For quantile normalization
         normalize_actions: bool = True,  # Apply normalization to actions
         global_tile_mode: str = "multi_tile",  # "multi_tile" (default) or "letterbox"
+        video_backend: str = "pyav",  # "pyav" (CPU, stable) or "torchcodec" (GPU, requires compatible FFmpeg)
     ):
         """
         Initialize chess episode dataset.
@@ -112,6 +113,9 @@ class ChessEpisodeDataset(Dataset):
             global_tile_mode: How to handle global camera:
                 - "multi_tile" (default): Split into left/right tiles with 5% overlap
                 - "letterbox": Single frame with black bar padding
+            video_backend: Video decoding backend:
+                - "pyav" (default): CPU decoding (stable, compatible)
+                - "torchcodec": GPU-accelerated decoding (requires FFmpeg 5/6/7)
         """
         self.dataset_path = Path(dataset_path)
         self.split = split
@@ -122,6 +126,11 @@ class ChessEpisodeDataset(Dataset):
         self.use_gripper_camera = use_gripper_camera
         self.normalize_actions = normalize_actions
         self.global_tile_mode = global_tile_mode
+        self.video_backend = video_backend
+
+        # Pre-compute ImageNet normalization tensors (avoid creating in __getitem__)
+        self._norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        self._norm_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
         # Setup normalizer
         if normalizer is not None:
@@ -141,16 +150,28 @@ class ChessEpisodeDataset(Dataset):
         if not LEROBOT_AVAILABLE:
             raise ImportError("LeRobot is required. Install with: pip install lerobot")
 
-        # Load LeRobot dataset
-        # Note: repo_id is a logical identifier, root is the actual local path
-        # When root is provided, LeRobot loads from local disk without HuggingFace Hub access
-        # Use pyav backend for video decoding (torchcodec has FFmpeg compatibility issues)
+        # Load LeRobot dataset with GPU-accelerated video decoding
+        # torchcodec uses NVIDIA NVDEC for faster decoding, falls back to pyav if unavailable
         print(f"Loading LeRobot dataset from: {dataset_path}")
-        self.lerobot_dataset = LeRobotDataset(
-            repo_id="local/chess_episodes",  # Logical ID (not used when root is provided)
-            root=self.dataset_path,  # Actual local path
-            video_backend="pyav",  # Use pyav instead of torchcodec for better FFmpeg compatibility
-        )
+        try:
+            self.lerobot_dataset = LeRobotDataset(
+                repo_id="local/chess_episodes",
+                root=self.dataset_path,
+                video_backend=video_backend,
+            )
+            print(f"[OK] Using {video_backend} video backend")
+        except Exception as e:
+            if video_backend == "torchcodec":
+                print(f"[WARN] torchcodec failed: {e}")
+                print(f"[INFO] Falling back to pyav backend")
+                self.lerobot_dataset = LeRobotDataset(
+                    repo_id="local/chess_episodes",
+                    root=self.dataset_path,
+                    video_backend="pyav",
+                )
+                self.video_backend = "pyav"
+            else:
+                raise
 
         # Get dataset info
         self.total_frames = len(self.lerobot_dataset)
@@ -231,7 +252,12 @@ class ChessEpisodeDataset(Dataset):
         print(f"[{split}] Using {len(self.indices)} frames from {n_split} episodes")
 
     def _default_transform(self) -> T.Compose:
-        """Default image preprocessing for π₀.₅."""
+        """
+        Default image preprocessing (fallback for PIL images only).
+
+        Note: LeRobot returns torch tensors, so this path is rarely used.
+        The main path in _process_image() handles tensors directly for better performance.
+        """
         return T.Compose([
             T.ToPILImage(),
             T.Resize(self.image_size),
@@ -274,12 +300,9 @@ class ChessEpisodeDataset(Dataset):
             right_tile.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
         ).squeeze(0)
 
-        # ImageNet normalization
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
-
-        left_norm = (left_resized - mean) / std
-        right_norm = (right_resized - mean) / std
+        # ImageNet normalization (use pre-computed tensors)
+        left_norm = (left_resized - self._norm_mean) / self._norm_std
+        right_norm = (right_resized - self._norm_mean) / self._norm_std
 
         return left_norm, right_norm
 
@@ -469,10 +492,8 @@ class ChessEpisodeDataset(Dataset):
             else:
                 img = img_resized
 
-        # ImageNet normalization
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
-        return (img - mean) / std
+        # ImageNet normalization (use pre-computed tensors)
+        return (img - self._norm_mean) / self._norm_std
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -521,6 +542,7 @@ def create_dataloaders(
     normalizer: Optional[ActionNormalizer] = None,
     normalize_actions: bool = True,
     global_tile_mode: str = "multi_tile",
+    video_backend: str = "pyav",
 ) -> Tuple[DataLoader, DataLoader, Optional[ActionNormalizer]]:
     """
     Create train and validation dataloaders.
@@ -538,6 +560,9 @@ def create_dataloaders(
         global_tile_mode: How to handle global camera:
             - "multi_tile" (default): Split into left/right tiles (3.5x resolution)
             - "letterbox": Single frame with black bar padding
+        video_backend: Video decoding backend:
+            - "torchcodec" (default): GPU-accelerated decoding
+            - "pyav": CPU decoding (more compatible)
 
     Returns:
         Tuple of (train_loader, val_loader, normalizer)
@@ -558,6 +583,7 @@ def create_dataloaders(
                 state_dim=state_dim,
                 normalize_actions=False,  # Don't normalize for stats computation
                 global_tile_mode=global_tile_mode,
+                video_backend=video_backend,
             )
             normalizer = ActionNormalizer()
             normalizer.compute_stats(temp_dataset)
@@ -572,6 +598,7 @@ def create_dataloaders(
         normalizer=normalizer,
         normalize_actions=normalize_actions,
         global_tile_mode=global_tile_mode,
+        video_backend=video_backend,
     )
 
     val_dataset = ChessEpisodeDataset(
@@ -583,6 +610,7 @@ def create_dataloaders(
         normalizer=normalizer,
         normalize_actions=normalize_actions,
         global_tile_mode=global_tile_mode,
+        video_backend=video_backend,
     )
 
     train_loader = DataLoader(
@@ -593,6 +621,8 @@ def create_dataloaders(
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=4,  # Prefetch 4 batches per worker to overlap data loading with GPU
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
     )
 
     val_loader = DataLoader(
@@ -603,6 +633,8 @@ def create_dataloaders(
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=False,
+        prefetch_factor=4,
+        persistent_workers=True if num_workers > 0 else False,
     )
 
     return train_loader, val_loader, normalizer
