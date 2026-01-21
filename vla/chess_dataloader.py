@@ -89,6 +89,7 @@ class ChessEpisodeDataset(Dataset):
         use_gripper_camera: bool = True,
         normalizer: Optional[ActionNormalizer] = None,  # For quantile normalization
         normalize_actions: bool = True,  # Apply normalization to actions
+        global_tile_mode: str = "multi_tile",  # "multi_tile" (default) or "letterbox"
     ):
         """
         Initialize chess episode dataset.
@@ -108,6 +109,9 @@ class ChessEpisodeDataset(Dataset):
             normalizer: ActionNormalizer instance for quantile normalization.
                        If None, loads from dataset_path/norm_stats.json if exists.
             normalize_actions: Whether to apply normalization to actions
+            global_tile_mode: How to handle global camera:
+                - "multi_tile" (default): Split into left/right tiles with 5% overlap
+                - "letterbox": Single frame with black bar padding
         """
         self.dataset_path = Path(dataset_path)
         self.split = split
@@ -117,6 +121,7 @@ class ChessEpisodeDataset(Dataset):
         self.use_global_camera = use_global_camera
         self.use_gripper_camera = use_gripper_camera
         self.normalize_actions = normalize_actions
+        self.global_tile_mode = global_tile_mode
 
         # Setup normalizer
         if normalizer is not None:
@@ -237,6 +242,47 @@ class ChessEpisodeDataset(Dataset):
             )
         ])
 
+    def _process_global_multi_tile(self, img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Split global frame into left and right tiles with 5% overlap.
+
+        This provides 3.5x more effective resolution than letterboxing:
+        - Letterbox: 1280x720 -> 256x144 content = 36,864 pixels
+        - Multi-tile: 2 x (640x720 -> 256x256) = 131,072 pixels
+
+        Args:
+            img: Input tensor (C, H, W) normalized to [0, 1]
+
+        Returns:
+            Tuple of (left_tile, right_tile), each (C, target_h, target_w) with ImageNet normalization
+        """
+        h, w = img.shape[1], img.shape[2]
+        mid = w // 2
+        overlap = int(w * 0.05)  # 5% overlap = 64 pixels for 1280 width
+
+        # Split with overlap (ensures board center is in both tiles)
+        left_tile = img[:, :, :mid + overlap]
+        right_tile = img[:, :, mid - overlap:]
+
+        target_h, target_w = self.image_size
+
+        # Resize each tile to target size
+        left_resized = torch.nn.functional.interpolate(
+            left_tile.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
+        ).squeeze(0)
+        right_resized = torch.nn.functional.interpolate(
+            right_tile.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
+        ).squeeze(0)
+
+        # ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
+
+        left_norm = (left_resized - mean) / std
+        right_norm = (right_resized - mean) / std
+
+        return left_norm, right_norm
+
     def __len__(self) -> int:
         return len(self.indices)
 
@@ -266,11 +312,31 @@ class ChessEpisodeDataset(Dataset):
         model_gripper_key = self.model_camera_keys['gripper']
 
         # Process global camera -> maps to model-specific key
-        # Global: letterbox resize (preserves full frame with black bars)
         if self.use_global_camera and dataset_global_key in sample:
             global_img = sample[dataset_global_key]
-            global_img = self._process_image(global_img, is_global=True)
-            result[model_global_key] = global_img
+
+            # Convert to tensor format for processing
+            if isinstance(global_img, torch.Tensor):
+                if global_img.dim() == 3 and global_img.shape[0] != 3:
+                    global_img = global_img.permute(2, 0, 1)
+                global_img = global_img.float() / 255.0 if global_img.max() > 1.0 else global_img.float()
+            elif isinstance(global_img, np.ndarray):
+                global_img = torch.from_numpy(global_img).permute(2, 0, 1).float() / 255.0
+
+            if self.global_tile_mode == "multi_tile":
+                # Multi-tile: Split into left/right tiles (3.5x more resolution)
+                # Left tile -> model's 'global' slot, Right tile -> model's 'unused' slot
+                left_tile, right_tile = self._process_global_multi_tile(global_img)
+                result[model_global_key] = left_tile
+                if 'unused' in self.model_camera_keys:
+                    result[self.model_camera_keys['unused']] = right_tile
+            else:
+                # Letterbox: Single frame with black bar padding
+                global_processed = self._process_image(global_img, is_global=True)
+                result[model_global_key] = global_processed
+                # Add zeros for unused third camera slot
+                if 'unused' in self.model_camera_keys:
+                    result[self.model_camera_keys['unused']] = torch.zeros(3, self.image_size[0], self.image_size[1])
 
         # Process gripper camera -> maps to model-specific key
         # Gripper: height-first resize + center crop (camera-agnostic)
@@ -278,12 +344,6 @@ class ChessEpisodeDataset(Dataset):
             gripper_img = sample[dataset_gripper_key]
             gripper_img = self._process_image(gripper_img, is_global=False)
             result[model_gripper_key] = gripper_img
-
-        # Add dummy third camera - zeros for unused slot
-        # This maintains compatibility with the 3-camera pretrained architecture
-        if 'unused' in self.model_camera_keys:
-            unused_key = self.model_camera_keys['unused']
-            result[unused_key] = torch.zeros(3, self.image_size[0], self.image_size[1])
 
         # Process joint positions (observation.state in our dataset)
         # PI0 expects 32-dim state (padded), SmolVLA expects 6-dim state
@@ -460,6 +520,7 @@ def create_dataloaders(
     state_dim: int = 32,
     normalizer: Optional[ActionNormalizer] = None,
     normalize_actions: bool = True,
+    global_tile_mode: str = "multi_tile",
 ) -> Tuple[DataLoader, DataLoader, Optional[ActionNormalizer]]:
     """
     Create train and validation dataloaders.
@@ -474,6 +535,9 @@ def create_dataloaders(
         state_dim: State vector dimension (32 for PI0, 6 for SmolVLA)
         normalizer: ActionNormalizer for quantile normalization (auto-loads if None)
         normalize_actions: Whether to apply normalization to actions
+        global_tile_mode: How to handle global camera:
+            - "multi_tile" (default): Split into left/right tiles (3.5x resolution)
+            - "letterbox": Single frame with black bar padding
 
     Returns:
         Tuple of (train_loader, val_loader, normalizer)
@@ -493,6 +557,7 @@ def create_dataloaders(
                 model_camera_keys=model_camera_keys,
                 state_dim=state_dim,
                 normalize_actions=False,  # Don't normalize for stats computation
+                global_tile_mode=global_tile_mode,
             )
             normalizer = ActionNormalizer()
             normalizer.compute_stats(temp_dataset)
@@ -506,6 +571,7 @@ def create_dataloaders(
         state_dim=state_dim,
         normalizer=normalizer,
         normalize_actions=normalize_actions,
+        global_tile_mode=global_tile_mode,
     )
 
     val_dataset = ChessEpisodeDataset(
@@ -516,6 +582,7 @@ def create_dataloaders(
         state_dim=state_dim,
         normalizer=normalizer,
         normalize_actions=normalize_actions,
+        global_tile_mode=global_tile_mode,
     )
 
     train_loader = DataLoader(

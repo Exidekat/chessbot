@@ -194,23 +194,24 @@ class SmolVLAModel(VLAModelMixin):
         global_frame: np.ndarray,
         gripper_frame: np.ndarray,
         robot_state: Optional[np.ndarray] = None,
+        tile_mode: str = "multi_tile",
     ) -> Dict[str, torch.Tensor]:
         """
         Preprocess raw observations for SmolVLA model input.
-
-        Uses letterbox padding for global (preserves full frame) and
-        height-first resize + center crop for gripper (camera-agnostic).
 
         Args:
             global_frame: Global camera frame (BGR, any resolution)
             gripper_frame: Gripper camera frame (BGR, any resolution)
             robot_state: Robot joint positions (6D for SO-100), or None
+            tile_mode: How to handle global camera:
+                - "multi_tile" (default): Split into left/right tiles (3.5x resolution)
+                - "letterbox": Single frame with black bar padding
 
         Returns:
             Dictionary with preprocessed tensors:
-                - observation.images.camera1: Global camera (1, 3, 256, 256)
+                - observation.images.camera1: Global left tile or letterboxed (1, 3, 256, 256)
                 - observation.images.camera2: Gripper camera (1, 3, 256, 256)
-                - observation.images.camera3: Zeros (1, 3, 256, 256)
+                - observation.images.camera3: Global right tile or zeros (1, 3, 256, 256)
                 - observation.state: State vector (1, 6)
         """
         img_size = self.DEFAULT_IMAGE_SIZE[0]  # 256
@@ -221,19 +222,45 @@ class SmolVLAModel(VLAModelMixin):
         if len(gripper_frame.shape) == 3 and gripper_frame.shape[0] == 3:
             gripper_frame = np.transpose(gripper_frame, (1, 2, 0))
 
-        # GLOBAL: Letterbox resize (preserve full frame, add padding)
-        # e.g., 1280x720 -> 256x256 with black bars (top/bottom)
-        gh, gw = global_frame.shape[:2]
-        scale = min(img_size / gh, img_size / gw)
-        new_h, new_w = int(gh * scale), int(gw * scale)
+        # Process global camera based on tile_mode
+        if tile_mode == "multi_tile":
+            # MULTI-TILE: Split global into left/right with 5% overlap (3.5x resolution)
+            h, w = global_frame.shape[:2]
+            mid = w // 2
+            overlap = int(w * 0.05)  # 5% overlap = 64 pixels for 1280 width
 
-        global_resized = cv2.resize(global_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            left_tile = global_frame[:, :mid + overlap]
+            right_tile = global_frame[:, mid - overlap:]
 
-        # Create padded output (black padding)
-        global_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-        pad_top = (img_size - new_h) // 2
-        pad_left = (img_size - new_w) // 2
-        global_padded[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = global_resized
+            # Resize each tile to img_size x img_size
+            left_resized = cv2.resize(left_tile, (img_size, img_size), interpolation=cv2.INTER_AREA)
+            right_resized = cv2.resize(right_tile, (img_size, img_size), interpolation=cv2.INTER_AREA)
+
+            # Convert BGR to RGB
+            left_rgb = cv2.cvtColor(left_resized, cv2.COLOR_BGR2RGB)
+            right_rgb = cv2.cvtColor(right_resized, cv2.COLOR_BGR2RGB)
+
+            # Convert to tensors
+            left_tensor = self._preprocess_image(left_rgb)
+            right_tensor = self._preprocess_image(right_rgb)
+        else:
+            # LETTERBOX: Single frame with black bar padding
+            gh, gw = global_frame.shape[:2]
+            scale = min(img_size / gh, img_size / gw)
+            new_h, new_w = int(gh * scale), int(gw * scale)
+
+            global_resized = cv2.resize(global_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Create padded output (black padding)
+            global_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+            pad_top = (img_size - new_h) // 2
+            pad_left = (img_size - new_w) // 2
+            global_padded[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = global_resized
+
+            # Convert BGR to RGB
+            global_rgb = cv2.cvtColor(global_padded, cv2.COLOR_BGR2RGB)
+            left_tensor = self._preprocess_image(global_rgb)
+            right_tensor = torch.zeros(1, 3, img_size, img_size, device=self.device)
 
         # GRIPPER: Resize to Xx256 (height=256), then center crop width
         # Handles any input resolution (camera-agnostic)
@@ -254,7 +281,6 @@ class SmolVLAModel(VLAModelMixin):
             gripper_resized = gripper_padded
 
         # Convert BGR to RGB
-        global_rgb = cv2.cvtColor(global_padded, cv2.COLOR_BGR2RGB)
         gripper_rgb = cv2.cvtColor(gripper_resized, cv2.COLOR_BGR2RGB)
 
         # Prepare state vector (6D for SmolVLA)
@@ -265,19 +291,15 @@ class SmolVLAModel(VLAModelMixin):
             state_6d[5] = 0.5  # Gripper at 50% open
 
         # Convert to tensors with normalization
-        global_tensor = self._preprocess_image(global_rgb)
         gripper_tensor = self._preprocess_image(gripper_rgb)
-
-        # Camera3 is unused (zeros)
-        camera3_tensor = torch.zeros(1, 3, img_size, img_size, device=self.device)
 
         # State tensor (6D for SmolVLA, not 32D)
         state_tensor = torch.from_numpy(state_6d).float().unsqueeze(0).to(self.device)
 
         return {
-            self.CAMERA_KEYS['global']: global_tensor,     # observation.images.camera1
-            self.CAMERA_KEYS['gripper']: gripper_tensor,   # observation.images.camera2
-            self.CAMERA_KEYS['unused']: camera3_tensor,    # observation.images.camera3
+            self.CAMERA_KEYS['global']: left_tensor,      # observation.images.camera1 (left tile or letterbox)
+            self.CAMERA_KEYS['gripper']: gripper_tensor,  # observation.images.camera2
+            self.CAMERA_KEYS['unused']: right_tensor,     # observation.images.camera3 (right tile or zeros)
             "observation.state": state_tensor,
         }
 

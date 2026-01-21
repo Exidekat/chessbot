@@ -232,6 +232,7 @@ class VLAWrapper:
         norm_stats_path: Optional[str] = None,
         chunk_execution: bool = False,
         control_freq: float = 50.0,
+        tile_mode: str = "multi_tile",
     ):
         """
         Initialize VLA model.
@@ -245,6 +246,7 @@ class VLAWrapper:
             norm_stats_path: Path to norm_stats.json for action denormalization
             chunk_execution: If True, execute full 50-step action chunks
             control_freq: Control frequency in Hz (default 50 Hz for chunk execution)
+            tile_mode: Global camera tiling mode ("multi_tile" or "letterbox")
         """
         self.model_name = model_name
         self.device = device
@@ -254,6 +256,7 @@ class VLAWrapper:
         self.chunk_execution = chunk_execution
         self.control_freq = control_freq
         self.control_dt = 1.0 / control_freq
+        self.tile_mode = tile_mode
 
         # Initialize real-time spike filter for observation.state
         # Uses same threshold as training data preprocessing for consistency
@@ -339,7 +342,8 @@ class VLAWrapper:
             observation=self.model_wrapper.preprocess_observation(
                 global_frame=global_frame,
                 gripper_frame=gripper_frame,
-                robot_state=current_state
+                robot_state=current_state,
+                tile_mode=self.tile_mode,
             ),
             language_prompt=language_prompt,
             current_state=current_state
@@ -905,6 +909,13 @@ def main():
         action="store_true",
         help="Use native 720p YUYV capture for board detection (uncompressed, best quality, 10fps)"
     )
+    parser.add_argument(
+        "--tile-mode",
+        type=str,
+        default=None,
+        choices=["multi_tile", "letterbox"],
+        help="Global camera tiling mode (auto-detects from checkpoint if not set)"
+    )
 
     args = parser.parse_args()
 
@@ -918,6 +929,24 @@ def main():
         if default_ckpt and Path(default_ckpt).exists():
             args.checkpoint = default_ckpt
             print(f"[INFO] Using default checkpoint: {default_ckpt}")
+
+    # Auto-detect tile_mode from checkpoint if not specified
+    if args.checkpoint and Path(args.checkpoint).exists():
+        try:
+            ckpt = torch.load(args.checkpoint, map_location="cpu")
+            saved_tile_mode = ckpt.get("tile_mode", "letterbox")  # fallback for old checkpoints
+            if args.tile_mode and args.tile_mode != saved_tile_mode:
+                print(f"[WARN] Checkpoint was trained with tile_mode={saved_tile_mode}, "
+                      f"but --tile-mode {args.tile_mode} was specified.")
+                print(f"       Using checkpoint's tile_mode={saved_tile_mode} for consistency.")
+            tile_mode = saved_tile_mode
+            del ckpt
+        except Exception as e:
+            print(f"[WARN] Could not read tile_mode from checkpoint: {e}")
+            tile_mode = args.tile_mode or "multi_tile"
+    else:
+        tile_mode = args.tile_mode or "multi_tile"  # default for base model
+    print(f"[INFO] Tile mode: {tile_mode}")
 
     # Normalize turn argument to single letter for internal use
     turn_letter = "w" if args.turn == "white" else "b"
@@ -1098,6 +1127,7 @@ def main():
         norm_stats_path=args.norm_stats,
         chunk_execution=args.chunk_execution,
         control_freq=args.control_freq,
+        tile_mode=tile_mode,
     )
 
     # CRITICAL: Validate normalizer when robot is connected

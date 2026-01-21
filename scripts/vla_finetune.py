@@ -307,6 +307,7 @@ def save_checkpoint(
     loss: float,
     config: BaseTrainingConfig,
     path: Path,
+    tile_mode: str = "multi_tile",
 ):
     """Save training checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -319,6 +320,7 @@ def save_checkpoint(
         "config": config.to_dict(),
         "model_name": config.model_name,
         "full_finetuning": not (config.freeze_vision_encoder or config.freeze_language_encoder),
+        "tile_mode": tile_mode,  # Save for deployment consistency
     }
 
     torch.save(checkpoint, path)
@@ -673,6 +675,9 @@ Examples:
                         help="Early stopping patience (epochs without improvement, default: 10)")
     parser.add_argument("--find-lr", action="store_true",
                         help="Run learning rate finder before training")
+    parser.add_argument("--tile-mode", type=str, default="multi_tile",
+                        choices=["multi_tile", "letterbox"],
+                        help="Global camera tiling mode (default: multi_tile)")
 
     args = parser.parse_args()
 
@@ -810,9 +815,11 @@ Examples:
         image_size=config.image_size,  # Model-specific: 224 for PI0, 256 for SmolVLA
         model_camera_keys=config.camera_keys,  # Model-specific camera key mapping
         state_dim=config.state_dim,  # Model-specific: 32 for PI0, 6 for SmolVLA
+        global_tile_mode=args.tile_mode,  # multi_tile (default) or letterbox
     )
 
     print(f"\nImage size: {config.image_size}")
+    print(f"Tile mode: {args.tile_mode}")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 
@@ -950,7 +957,8 @@ Examples:
         if (epoch + 1) % config.save_every_n_epochs == 0:
             save_checkpoint(
                 model, optimizer, epoch + 1, val_metrics["val_loss"], config,
-                checkpoint_dir / f"epoch_{epoch + 1:04d}.pt"
+                checkpoint_dir / f"epoch_{epoch + 1:04d}.pt",
+                tile_mode=args.tile_mode,
             )
 
         # Save best model and track improvement
@@ -959,7 +967,8 @@ Examples:
             epochs_without_improvement = 0
             save_checkpoint(
                 model, optimizer, epoch + 1, val_metrics["val_loss"], config,
-                checkpoint_dir / "best.pt"
+                checkpoint_dir / "best.pt",
+                tile_mode=args.tile_mode,
             )
             print(f"  [BEST] New best val loss: {best_val_loss:.6f}")
         else:
@@ -976,7 +985,8 @@ Examples:
     if val_metrics is not None:
         save_checkpoint(
             model, optimizer, final_epoch, val_metrics["val_loss"], config,
-            checkpoint_dir / "final.pt"
+            checkpoint_dir / "final.pt",
+            tile_mode=args.tile_mode,
         )
     else:
         print("\n[WARN] No training epochs completed - skipping final checkpoint")
