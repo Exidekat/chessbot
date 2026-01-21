@@ -8,7 +8,7 @@ Reads robot joint positions from state_cache.json (written by tele_op.py).
 Output Format:
     LeRobot v3.0 dataset with:
     - observation.images.global: 1280x720 global camera video
-    - observation.images.gripper: 224x224 gripper camera video
+    - observation.images.gripper: Native resolution gripper camera video (camera-agnostic)
     - observation.state: 6-DOF joint positions (radians)
     - action: 6-DOF target joint positions
 
@@ -101,10 +101,12 @@ DATASET_FEATURES = {
         "shape": (720, 1280, 3),  # H, W, C
         "names": ["height", "width", "channels"]
     },
-    # Gripper camera (224x224)
+    # Gripper camera (native resolution - camera-agnostic)
+    # LeRobot dynamically infers actual shape from first frame when use_videos=True
+    # Common resolutions: 640x480, 1280x720, 1920x1080
     "observation.images.gripper": {
         "dtype": "video",
-        "shape": (224, 224, 3),  # H, W, C
+        "shape": (480, 640, 3),  # H, W, C - placeholder, actual shape from camera
         "names": ["height", "width", "channels"]
     },
     # Robot state (6 DOF joint positions in radians)
@@ -265,8 +267,9 @@ class EpisodeRecorder:
             gripper_index = get_camera_index_from_device(self.gripper_camera_device)
             self.gripper_cam = cv2.VideoCapture(gripper_index)
 
-            # Configure gripper camera (capture at 640x480, resize to 224x224 later)
-            # Most cameras don't support 224x224 natively, so we capture higher and resize
+            # Configure gripper camera - capture at native resolution (camera-agnostic)
+            # Resizing is deferred to training/deploy pipelines for flexibility
+            # Request common resolution; camera will use closest supported
             self.gripper_cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.gripper_cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.gripper_cam.set(cv2.CAP_PROP_FPS, 30)
@@ -277,8 +280,8 @@ class EpisodeRecorder:
                 print(f"[ERROR] Failed to capture from gripper camera")
                 return False
 
-            # Verify we'll resize to 224x224 for VLA input
-            print(f"[OK] Gripper camera ready: {test_gripper.shape} (will resize to 224x224)")
+            # Log actual capture resolution (no resize in collection)
+            print(f"[OK] Gripper camera ready: {test_gripper.shape} (native resolution)")
 
             # Initialize virtual camera output (for streaming overlays)
             print(f"[INFO] Starting virtual camera output: {self.virtual_camera_device}")
@@ -573,13 +576,10 @@ class EpisodeRecorder:
                     continue
 
                 if not ret or gripper_frame is None:
-                    print("[WARNING] No gripper frame, using black placeholder")
-                    gripper_frame = np.zeros((224, 224, 3), dtype=np.uint8)
-                else:
-                    # Resize gripper frame to 224x224 for VLA input
-                    # Camera captures at 640x480, VLA expects 224x224
-                    if gripper_frame.shape[:2] != (224, 224):
-                        gripper_frame = cv2.resize(gripper_frame, (224, 224), interpolation=cv2.INTER_AREA)
+                    print("[WARNING] No gripper frame, skipping")
+                    continue
+                # NO RESIZE - keep at native camera resolution (camera-agnostic)
+                # Resizing is deferred to training/deploy pipelines
 
                 if joint_positions is None or len(joint_positions) != 6:
                     print("[WARNING] Invalid joint positions, using zeros")

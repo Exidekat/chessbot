@@ -198,6 +198,9 @@ class SmolVLAModel(VLAModelMixin):
         """
         Preprocess raw observations for SmolVLA model input.
 
+        Uses letterbox padding for global (preserves full frame) and
+        height-first resize + center crop for gripper (camera-agnostic).
+
         Args:
             global_frame: Global camera frame (BGR, any resolution)
             gripper_frame: Gripper camera frame (BGR, any resolution)
@@ -218,12 +221,40 @@ class SmolVLAModel(VLAModelMixin):
         if len(gripper_frame.shape) == 3 and gripper_frame.shape[0] == 3:
             gripper_frame = np.transpose(gripper_frame, (1, 2, 0))
 
-        # Resize to 256x256 (SmolVLA image size)
-        global_resized = cv2.resize(global_frame, (img_size, img_size))
-        gripper_resized = cv2.resize(gripper_frame, (img_size, img_size))
+        # GLOBAL: Letterbox resize (preserve full frame, add padding)
+        # e.g., 1280x720 -> 256x256 with black bars (top/bottom)
+        gh, gw = global_frame.shape[:2]
+        scale = min(img_size / gh, img_size / gw)
+        new_h, new_w = int(gh * scale), int(gw * scale)
+
+        global_resized = cv2.resize(global_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Create padded output (black padding)
+        global_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+        pad_top = (img_size - new_h) // 2
+        pad_left = (img_size - new_w) // 2
+        global_padded[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = global_resized
+
+        # GRIPPER: Resize to Xx256 (height=256), then center crop width
+        # Handles any input resolution (camera-agnostic)
+        gh, gw = gripper_frame.shape[:2]
+        scale = img_size / gh
+        new_w = int(gw * scale)
+        gripper_resized = cv2.resize(gripper_frame, (new_w, img_size), interpolation=cv2.INTER_AREA)
+
+        # Center crop width to img_size
+        if new_w > img_size:
+            left = (new_w - img_size) // 2
+            gripper_resized = gripper_resized[:, left:left+img_size]
+        elif new_w < img_size:
+            # Pad if width is smaller (rare)
+            gripper_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+            left = (img_size - new_w) // 2
+            gripper_padded[:, left:left+new_w] = gripper_resized
+            gripper_resized = gripper_padded
 
         # Convert BGR to RGB
-        global_rgb = cv2.cvtColor(global_resized, cv2.COLOR_BGR2RGB)
+        global_rgb = cv2.cvtColor(global_padded, cv2.COLOR_BGR2RGB)
         gripper_rgb = cv2.cvtColor(gripper_resized, cv2.COLOR_BGR2RGB)
 
         # Prepare state vector (6D for SmolVLA)

@@ -266,16 +266,17 @@ class ChessEpisodeDataset(Dataset):
         model_gripper_key = self.model_camera_keys['gripper']
 
         # Process global camera -> maps to model-specific key
-        # All images resized to self.image_size (PI0: 224x224, SmolVLA: 256x256)
+        # Global: letterbox resize (preserves full frame with black bars)
         if self.use_global_camera and dataset_global_key in sample:
             global_img = sample[dataset_global_key]
-            global_img = self._process_image(global_img)
+            global_img = self._process_image(global_img, is_global=True)
             result[model_global_key] = global_img
 
         # Process gripper camera -> maps to model-specific key
+        # Gripper: height-first resize + center crop (camera-agnostic)
         if self.use_gripper_camera and dataset_gripper_key in sample:
             gripper_img = sample[dataset_gripper_key]
-            gripper_img = self._process_image(gripper_img)
+            gripper_img = self._process_image(gripper_img, is_global=False)
             result[model_gripper_key] = gripper_img
 
         # Add dummy third camera - zeros for unused slot
@@ -338,26 +339,80 @@ class ChessEpisodeDataset(Dataset):
 
         return result
 
-    def _process_image(self, img) -> torch.Tensor:
-        """Process image to normalized tensor."""
+    def _process_image(self, img, is_global: bool = False) -> torch.Tensor:
+        """
+        Process image with aspect-ratio-aware resizing.
+
+        Args:
+            img: Input image (tensor, numpy, or PIL)
+            is_global: If True, use letterbox padding to preserve full frame
+                      If False (gripper), resize height first then center crop width
+        """
+        # Convert to tensor if needed
         if isinstance(img, torch.Tensor):
-            # Already tensor (C, H, W) or (H, W, C)
             if img.dim() == 3 and img.shape[0] != 3:
                 # (H, W, C) -> (C, H, W)
                 img = img.permute(2, 0, 1)
             img = img.float() / 255.0 if img.max() > 1.0 else img
-            # Resize to model input size
-            img = torch.nn.functional.interpolate(
-                img.unsqueeze(0), size=self.image_size, mode='bilinear', align_corners=False
-            ).squeeze(0)
-            # ImageNet normalization
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            img = (img - mean) / std
+        elif isinstance(img, np.ndarray):
+            # Numpy array (H, W, C) -> (C, H, W)
+            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         else:
-            # Numpy array or PIL Image
-            img = self.transform(img)
-        return img
+            # PIL Image - use default transform (already handles resize)
+            return self.transform(img)
+
+        h, w = img.shape[1], img.shape[2]
+        target_h, target_w = self.image_size
+
+        if is_global:
+            # GLOBAL CAMERA: Letterbox resize (preserve full frame, add padding)
+            # e.g., 1280x720 -> 256x256 with black bars (top/bottom)
+            scale = min(target_h / h, target_w / w)
+            new_h, new_w = int(h * scale), int(w * scale)
+
+            # Resize maintaining aspect ratio
+            img_resized = torch.nn.functional.interpolate(
+                img.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False
+            ).squeeze(0)
+
+            # Create padded output (black bars)
+            padded = torch.zeros(3, target_h, target_w, device=img.device)
+
+            # Center the image
+            pad_top = (target_h - new_h) // 2
+            pad_left = (target_w - new_w) // 2
+            padded[:, pad_top:pad_top+new_h, pad_left:pad_left+new_w] = img_resized
+
+            img = padded
+        else:
+            # GRIPPER CAMERA: Resize to Xx256 (height=target_h), then center crop width
+            # Handles any input resolution (camera-agnostic)
+            # Important visuals are centered, so center crop is safe
+
+            # Step 1: Resize so height = target_h, width scales proportionally
+            scale = target_h / h
+            new_w = int(w * scale)
+            img_resized = torch.nn.functional.interpolate(
+                img.unsqueeze(0), size=(target_h, new_w), mode='bilinear', align_corners=False
+            ).squeeze(0)
+
+            # Step 2: Center crop width to target_w
+            if new_w > target_w:
+                left = (new_w - target_w) // 2
+                img = img_resized[:, :, left:left+target_w]
+            elif new_w < target_w:
+                # Width is smaller than target - pad with black (rare case)
+                padded = torch.zeros(3, target_h, target_w, device=img.device)
+                left = (target_w - new_w) // 2
+                padded[:, :, left:left+new_w] = img_resized
+                img = padded
+            else:
+                img = img_resized
+
+        # ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
+        return (img - mean) / std
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:

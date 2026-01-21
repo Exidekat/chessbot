@@ -190,6 +190,9 @@ class PI0Model(VLAModelMixin):
         """
         Preprocess raw observations for PI0 model input.
 
+        Uses letterbox padding for global (preserves full frame) and
+        height-first resize + center crop for gripper (camera-agnostic).
+
         Args:
             global_frame: Global camera frame (BGR, any resolution)
             gripper_frame: Gripper camera frame (BGR, any resolution)
@@ -202,21 +205,51 @@ class PI0Model(VLAModelMixin):
                 - observation.images.right_wrist_0_rgb: Zeros (1, 3, 224, 224)
                 - observation.state: Padded state (1, 32)
         """
+        img_size = 224  # PI0 uses 224x224
+
         # Ensure frames are in (H, W, C) format
         if len(global_frame.shape) == 3 and global_frame.shape[0] == 3:
             global_frame = np.transpose(global_frame, (1, 2, 0))
         if len(gripper_frame.shape) == 3 and gripper_frame.shape[0] == 3:
             gripper_frame = np.transpose(gripper_frame, (1, 2, 0))
 
-        # Resize to 224x224
-        global_resized = cv2.resize(global_frame, (224, 224))
-        gripper_resized = cv2.resize(gripper_frame, (224, 224))
+        # GLOBAL: Letterbox resize (preserve full frame, add padding)
+        # e.g., 1280x720 -> 224x224 with black bars (top/bottom)
+        gh, gw = global_frame.shape[:2]
+        scale = min(img_size / gh, img_size / gw)
+        new_h, new_w = int(gh * scale), int(gw * scale)
+
+        global_resized = cv2.resize(global_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Create padded output (black padding)
+        global_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+        pad_top = (img_size - new_h) // 2
+        pad_left = (img_size - new_w) // 2
+        global_padded[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = global_resized
+
+        # GRIPPER: Resize to Xx224 (height=224), then center crop width
+        # Handles any input resolution (camera-agnostic)
+        gh, gw = gripper_frame.shape[:2]
+        scale = img_size / gh
+        new_w = int(gw * scale)
+        gripper_resized = cv2.resize(gripper_frame, (new_w, img_size), interpolation=cv2.INTER_AREA)
+
+        # Center crop width to img_size
+        if new_w > img_size:
+            left = (new_w - img_size) // 2
+            gripper_resized = gripper_resized[:, left:left+img_size]
+        elif new_w < img_size:
+            # Pad if width is smaller (rare)
+            gripper_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+            left = (img_size - new_w) // 2
+            gripper_padded[:, left:left+new_w] = gripper_resized
+            gripper_resized = gripper_padded
 
         # Convert BGR to RGB
-        global_rgb = cv2.cvtColor(global_resized, cv2.COLOR_BGR2RGB)
+        global_rgb = cv2.cvtColor(global_padded, cv2.COLOR_BGR2RGB)
         gripper_rgb = cv2.cvtColor(gripper_resized, cv2.COLOR_BGR2RGB)
 
-        # Prepare state vector (pad to 32D)
+        # Prepare state vector (pad to 32D for PI0)
         if robot_state is not None:
             state_6d = robot_state.astype(np.float32)
         else:
@@ -231,7 +264,7 @@ class PI0Model(VLAModelMixin):
         gripper_tensor = self._preprocess_image(gripper_rgb)
 
         # Right wrist is unused (zeros)
-        right_wrist_tensor = torch.zeros(1, 3, 224, 224, device=self.device)
+        right_wrist_tensor = torch.zeros(1, 3, img_size, img_size, device=self.device)
 
         # State tensor
         state_tensor = torch.from_numpy(state_32d).float().unsqueeze(0).to(self.device)
