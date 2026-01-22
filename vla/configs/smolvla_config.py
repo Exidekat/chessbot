@@ -29,6 +29,9 @@ class SmolVLATrainingConfig(BaseTrainingConfig):
     # SmolVLA-specific defaults (can be overridden)
     _learning_rate: float = 1e-4  # SmolVLA optimal LR (higher than PI0)
 
+    # SmolVLA can handle larger batches (500M params vs PI0's 3B)
+    batch_size: int = 16
+
     # SmolVLA has higher gradient clip norm by default
     max_grad_norm: float = 10.0  # SmolVLA uses 10.0 vs PI0's 1.0
 

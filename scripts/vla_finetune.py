@@ -818,7 +818,10 @@ Examples:
         global_tile_mode=args.tile_mode,  # multi_tile (default) or letterbox
     )
 
-    print(f"\nImage size: {config.image_size}")
+    # Log dataset format (video vs PNG)
+    dataset_format = "video" if train_loader.dataset.uses_video else "PNG images"
+    print(f"\nDataset format: {dataset_format}")
+    print(f"Image size: {config.image_size}")
     print(f"Tile mode: {args.tile_mode}")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")

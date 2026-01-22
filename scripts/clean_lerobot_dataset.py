@@ -247,6 +247,76 @@ def extract_frames_to_video(
     return output_video.exists()
 
 
+def extract_frames_to_png(
+    input_video: Path,
+    output_dir: Path,
+    keep_frames: List[int],
+    episode_idx: int,
+) -> bool:
+    """
+    Extract specific frames from video to PNG files.
+
+    This provides fast random access during training by eliminating video
+    decoding overhead. Results in ~10-20x larger storage but significantly
+    faster data loading (no keyframe seeking).
+
+    Output format matches LeRobot's DEFAULT_IMAGE_PATH:
+        images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png
+
+    Args:
+        input_video: Source video path
+        output_dir: Base output directory for images (e.g., images/observation.images.global)
+        keep_frames: List of original frame indices to extract (0-indexed)
+        episode_idx: Episode index for output directory structure
+
+    Returns:
+        True if successful
+    """
+    if not keep_frames:
+        return False
+
+    # Create episode-specific output directory
+    # LeRobot format: episode-XXXXXX (with hyphen, not underscore)
+    episode_dir = output_dir / f"episode-{episode_idx:06d}"
+    episode_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract all frames at once using ffmpeg's select filter (more efficient)
+    # Build select expression for the frames we want
+    select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
+
+    # Use a temporary approach: extract to temp files with ffmpeg frame numbers,
+    # then rename to our sequential numbering
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # Extract selected frames to temp directory
+        # ffmpeg will output frame_0001.png, frame_0002.png, etc. for selected frames
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(input_video),
+            "-vf", f"select='{select_expr}'",
+            "-vsync", "vfr",  # Variable frame rate to handle select filter
+            str(tmpdir / "frame_%06d.png")
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[WARN] FFmpeg PNG extraction error: {result.stderr}")
+            return False
+
+        # Rename extracted frames to sequential numbering (0-indexed)
+        # LeRobot format: frame-XXXXXX.png (with hyphen, not underscore)
+        extracted_frames = sorted(tmpdir.glob("frame_*.png"))
+        if len(extracted_frames) != len(keep_frames):
+            print(f"[WARN] Expected {len(keep_frames)} frames, got {len(extracted_frames)}")
+
+        for new_idx, src_path in enumerate(extracted_frames):
+            dst_path = episode_dir / f"frame-{new_idx:06d}.png"
+            shutil.move(str(src_path), str(dst_path))
+
+    return episode_dir.exists() and len(list(episode_dir.glob("*.png"))) > 0
+
+
 def clean_episode(
     episode_df: pd.DataFrame,
     mode: FilterMode = FilterMode.MAGNITUDE,
@@ -334,6 +404,7 @@ def clean_dataset(
     unwrap_threshold: float = 3.0,
     smooth_actions: bool = False,
     smooth_sigma: float = 1.0,
+    output_format: str = "png",
     verbose: bool = True,
 ) -> Dict:
     """
@@ -351,6 +422,9 @@ def clean_dataset(
         unwrap_threshold: Jump threshold for unwrapping
         smooth_actions: Whether to apply Gaussian smoothing
         smooth_sigma: Smoothing sigma
+        output_format: Output format - 'video' (AV1 re-encode) or 'png' (frame extraction)
+                      PNG format provides ~10-20x faster training (no video decoding)
+                      at the cost of ~10-20x more storage
         verbose: Print progress
 
     Returns:
@@ -380,6 +454,7 @@ def clean_dataset(
             print(f"    Position tolerance: {tolerance}")
         print(f"    Angle unwrapping: {unwrap_angles}")
         print(f"    Action smoothing: {smooth_actions}")
+        print(f"    Output format: {output_format}")
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -439,6 +514,19 @@ def clean_dataset(
             # Recompute timestamps based on new frame indices
             cleaned_df["timestamp"] = cleaned_df["frame_index"] / fps
 
+            # For PNG output, add image path columns
+            # HuggingFace datasets.Image() expects dict with 'path' key
+            # Paths are relative to the working directory where training will run
+            if output_format == "png":
+                for cam_key in ["observation.images.global", "observation.images.gripper"]:
+                    # Build paths for each frame in the cleaned episode
+                    # Include full path from working directory for HuggingFace datasets compatibility
+                    paths = []
+                    for frame_idx in range(len(cleaned_df)):
+                        path = f"{output_path}/images/{cam_key}/episode-{ep_idx:06d}/frame-{frame_idx:06d}.png"
+                        paths.append({"path": path, "bytes": None})
+                    cleaned_df[cam_key] = paths
+
             global_new_index += len(cleaned_df)
 
             all_cleaned_dfs.append(cleaned_df)
@@ -494,84 +582,140 @@ def clean_dataset(
 
         file_idx += 1
 
-    # Process videos
+    # Determine which episodes are in which video file (needed for both formats)
+    # This requires reading the meta/episodes parquet
+    episodes_meta_dir = input_dir / "meta" / "episodes" / "chunk-000"
+
+    ep_to_video = {}  # episode_idx -> video_file_idx
+    video_to_eps = {}  # video_file_idx -> list of episode_idx
+
+    for meta_file in sorted(episodes_meta_dir.glob("file-*.parquet")):
+        file_idx_str = meta_file.stem.split("-")[-1]
+        file_idx_int = int(file_idx_str)
+
+        ep_meta = pq.read_table(meta_file).to_pandas()
+        for ep_idx in ep_meta["episode_index"].unique():
+            ep_to_video[ep_idx] = file_idx_int
+            if file_idx_int not in video_to_eps:
+                video_to_eps[file_idx_int] = []
+            video_to_eps[file_idx_int].append(ep_idx)
+
+    # Process videos/images based on output format
     for video_key in ["observation.images.global", "observation.images.gripper"]:
         video_in_dir = input_dir / "videos" / video_key / "chunk-000"
-        video_out_dir = output_dir / "videos" / video_key / "chunk-000"
-        video_out_dir.mkdir(parents=True, exist_ok=True)
 
         if not video_in_dir.exists():
             continue
 
-        if verbose:
-            print(f"[*] Processing videos: {video_key}")
+        if output_format == "png":
+            # PNG output: Extract frames to images/ directory
+            image_out_dir = output_dir / "images" / video_key
+            image_out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Group episodes by source video file
-        video_files = sorted(video_in_dir.glob("file-*.mp4"))
+            if verbose:
+                print(f"[*] Extracting PNG frames: {video_key}")
 
-        # Determine which episodes are in which video file
-        # This requires reading the meta/episodes parquet
-        episodes_meta_dir = input_dir / "meta" / "episodes" / "chunk-000"
+            # Group episodes by source video file
+            video_files = sorted(video_in_dir.glob("file-*.mp4"))
 
-        ep_to_video = {}  # episode_idx -> video_file_idx
-        video_to_eps = {}  # video_file_idx -> list of episode_idx
+            # Process each input video file
+            for vid_file_idx, video_file in enumerate(video_files):
+                if vid_file_idx not in video_to_eps:
+                    continue
 
-        for meta_file in sorted(episodes_meta_dir.glob("file-*.parquet")):
-            file_idx_str = meta_file.stem.split("-")[-1]
-            file_idx_int = int(file_idx_str)
+                eps_in_video = video_to_eps[vid_file_idx]
 
-            ep_meta = pq.read_table(meta_file).to_pandas()
-            for ep_idx in ep_meta["episode_index"].unique():
-                ep_to_video[ep_idx] = file_idx_int
-                if file_idx_int not in video_to_eps:
-                    video_to_eps[file_idx_int] = []
-                video_to_eps[file_idx_int].append(ep_idx)
+                # Process each episode in this video separately
+                frame_offset = 0
 
-        # Process each input video file
-        for vid_file_idx, video_file in enumerate(video_files):
-            if vid_file_idx not in video_to_eps:
-                continue
+                for ep_idx in sorted(eps_in_video):
+                    if ep_idx not in episode_frame_maps:
+                        # Still need to track offset
+                        orig_length = episode_orig_lengths.get(ep_idx, 0)
+                        frame_offset += orig_length
+                        continue
 
-            eps_in_video = video_to_eps[vid_file_idx]
-
-            # Collect all frames to keep across episodes in this video
-            # Note: frames are sequential across episodes in the video
-            all_keep_frames = []
-            frame_offset = 0
-
-            for ep_idx in sorted(eps_in_video):
-                if ep_idx in episode_frame_maps:
-                    # Offset by previous episodes' frames
                     ep_frames = episode_frame_maps[ep_idx]
-                    all_keep_frames.extend([f + frame_offset for f in ep_frames])
+                    if not ep_frames:
+                        orig_length = episode_orig_lengths.get(ep_idx, 0)
+                        frame_offset += orig_length
+                        continue
 
-                    # Use original episode length for offset (not max of kept frames)
+                    # Calculate absolute frame indices in the video
+                    abs_frames = [f + frame_offset for f in ep_frames]
+
+                    if verbose:
+                        print(f"    Episode {ep_idx}: extracting {len(abs_frames)} frames to PNG...")
+
+                    success = extract_frames_to_png(
+                        video_file, image_out_dir, abs_frames, ep_idx
+                    )
+
+                    if success and verbose:
+                        print(f"    [OK] Created: episode_{ep_idx:06d}/")
+                    elif not success:
+                        print(f"    [WARN] Failed to extract episode {ep_idx}")
+
+                    # Update offset for next episode
                     orig_length = episode_orig_lengths.get(ep_idx, 0)
                     frame_offset += orig_length
 
-            if not all_keep_frames:
-                continue
-
-            out_video = video_out_dir / f"file-{vid_file_idx:03d}.mp4"
+        else:
+            # Video output: Re-encode to videos/ directory (original behavior)
+            video_out_dir = output_dir / "videos" / video_key / "chunk-000"
+            video_out_dir.mkdir(parents=True, exist_ok=True)
 
             if verbose:
-                print(f"    {video_file.name}: extracting {len(all_keep_frames)} frames...")
+                print(f"[*] Processing videos: {video_key}")
 
-            # Get codec from info
-            codec = "av1"  # Default
-            for feat_key, feat_val in info.get("features", {}).items():
-                if video_key in feat_key and "info" in feat_val:
-                    codec = feat_val["info"].get("video.codec", "av1")
-                    break
+            # Group episodes by source video file
+            video_files = sorted(video_in_dir.glob("file-*.mp4"))
 
-            success = extract_frames_to_video(
-                video_file, out_video, all_keep_frames, fps=fps, codec=codec
-            )
+            # Process each input video file
+            for vid_file_idx, video_file in enumerate(video_files):
+                if vid_file_idx not in video_to_eps:
+                    continue
 
-            if success and verbose:
-                print(f"    [OK] Created: {out_video.name}")
-            elif not success:
-                print(f"    [WARN] Failed to create: {out_video.name}")
+                eps_in_video = video_to_eps[vid_file_idx]
+
+                # Collect all frames to keep across episodes in this video
+                # Note: frames are sequential across episodes in the video
+                all_keep_frames = []
+                frame_offset = 0
+
+                for ep_idx in sorted(eps_in_video):
+                    if ep_idx in episode_frame_maps:
+                        # Offset by previous episodes' frames
+                        ep_frames = episode_frame_maps[ep_idx]
+                        all_keep_frames.extend([f + frame_offset for f in ep_frames])
+
+                        # Use original episode length for offset (not max of kept frames)
+                        orig_length = episode_orig_lengths.get(ep_idx, 0)
+                        frame_offset += orig_length
+
+                if not all_keep_frames:
+                    continue
+
+                out_video = video_out_dir / f"file-{vid_file_idx:03d}.mp4"
+
+                if verbose:
+                    print(f"    {video_file.name}: extracting {len(all_keep_frames)} frames...")
+
+                # Get codec from info
+                codec = "av1"  # Default
+                for feat_key, feat_val in info.get("features", {}).items():
+                    if video_key in feat_key and "info" in feat_val:
+                        codec = feat_val["info"].get("video.codec", "av1")
+                        break
+
+                success = extract_frames_to_video(
+                    video_file, out_video, all_keep_frames, fps=fps, codec=codec
+                )
+
+                if success and verbose:
+                    print(f"    [OK] Created: {out_video.name}")
+                elif not success:
+                    print(f"    [WARN] Failed to create: {out_video.name}")
 
     # Copy and update metadata
     out_meta_dir = output_dir / "meta"
@@ -582,6 +726,23 @@ def clean_dataset(
     new_info["total_frames"] = stats["cleaned_frames"]
     # Update splits
     new_info["splits"] = {"train": f"0:{info['total_episodes']}"}
+
+    # Update dtype for image features based on output format
+    if output_format == "png":
+        # Change dtype from "video" to "image" for camera features
+        for key in new_info.get("features", {}):
+            if "images" in key:
+                new_info["features"][key]["dtype"] = "image"
+                # Remove video-specific info (codec, fps, etc.)
+                if "info" in new_info["features"][key]:
+                    del new_info["features"][key]["info"]
+        # Remove video_path template (LeRobot uses DEFAULT_IMAGE_PATH for images)
+        if "video_path" in new_info:
+            del new_info["video_path"]
+        # Update size info (no video files)
+        new_info["video_files_size_in_mb"] = 0
+        if verbose:
+            print(f"[*] Updated feature dtype to 'image' for PNG output")
 
     with open(out_meta_dir / "info.json", "w") as f:
         json.dump(new_info, f, indent=4)
@@ -649,12 +810,18 @@ def clean_dataset(
             "dataset_to_index": dataset_from + new_length,
         }
 
-        # Add video metadata for each video key
+        # Add video/image metadata for each camera key
         for vid_key in ["observation.images.global", "observation.images.gripper"]:
-            record[f"videos/{vid_key}/chunk_index"] = 0
-            record[f"videos/{vid_key}/file_index"] = vid_file_idx
-            record[f"videos/{vid_key}/from_timestamp"] = from_ts
-            record[f"videos/{vid_key}/to_timestamp"] = to_ts
+            if output_format == "png":
+                # Image-based metadata: no timestamp info, just chunk/file indices
+                record[f"images/{vid_key}/chunk_index"] = 0
+                record[f"images/{vid_key}/episode_index"] = ep_idx
+            else:
+                # Video-based metadata: includes timestamps
+                record[f"videos/{vid_key}/chunk_index"] = 0
+                record[f"videos/{vid_key}/file_index"] = vid_file_idx
+                record[f"videos/{vid_key}/from_timestamp"] = from_ts
+                record[f"videos/{vid_key}/to_timestamp"] = to_ts
 
         # Copy over stats columns from original if present
         for col in orig_row:
@@ -740,8 +907,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Default: action magnitude filtering with angle unwrapping
+    # Default: PNG frame extraction (fast training, larger storage)
     python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes
+
+    # Use video format instead (compact, slower training)
+    python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes --no-png
 
     # With action smoothing
     python scripts/clean_lerobot_dataset.py --smooth-actions --smooth-sigma 1.0
@@ -822,6 +992,18 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
     )
 
     parser.add_argument(
+        "--output-format",
+        type=str,
+        choices=["video", "png"],
+        default="png",
+        help="Output format: 'video' (AV1 re-encode) or 'png' (frame extraction, default)"
+    )
+    parser.add_argument(
+        "--no-png",
+        action="store_true",
+        help="Disable PNG frame extraction, use video format instead (shortcut for --output-format video)"
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Analyze without creating output"
@@ -837,6 +1019,10 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
     # Handle --no-unwrap-angles flag
     if args.no_unwrap_angles:
         args.unwrap_angles = False
+
+    # Handle --no-png flag (shortcut for --output-format video)
+    if args.no_png:
+        args.output_format = "video"
 
     if args.dry_run:
         print("[DRY RUN] Analyzing dataset without creating output...")
@@ -907,6 +1093,7 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         unwrap_threshold=args.unwrap_threshold,
         smooth_actions=args.smooth_actions,
         smooth_sigma=args.smooth_sigma,
+        output_format=args.output_format,
         verbose=not args.quiet,
     )
 

@@ -31,7 +31,7 @@ class BaseTrainingConfig(ABC):
     # Dataset (common)
     dataset_path: str = "data/episodes"
     val_split: float = 0.1  # 10% validation holdout
-    num_workers: int = 8  # Increased for video decode parallelism
+    num_workers: int = 16  # High worker count needed for video decode parallelism
 
     # Training (common structure, values may be overridden)
     batch_size: int = 4  # Reduced for 24GB VRAM with PI0 (~3B params)

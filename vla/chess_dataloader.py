@@ -11,6 +11,7 @@ Key features:
 - Multi-model support (PI0, SmolVLA)
 """
 
+import json
 import math
 import os
 import sys
@@ -90,10 +91,14 @@ class ChessEpisodeDataset(Dataset):
         normalizer: Optional[ActionNormalizer] = None,  # For quantile normalization
         normalize_actions: bool = True,  # Apply normalization to actions
         global_tile_mode: str = "multi_tile",  # "multi_tile" (default) or "letterbox"
-        video_backend: str = "pyav",  # "pyav" (CPU, stable) or "torchcodec" (GPU, requires compatible FFmpeg)
+        video_backend: str = "torchcodec",  # "torchcodec" (GPU-accelerated) or "pyav" (CPU fallback)
     ):
         """
         Initialize chess episode dataset.
+
+        Automatically detects dataset format (video vs PNG) from meta/info.json:
+        - If features have dtype="video": Uses video_backend for decoding (slower)
+        - If features have dtype="image": Loads PNG frames directly (10-20x faster)
 
         Args:
             dataset_path: Path to LeRobot dataset directory
@@ -113,9 +118,10 @@ class ChessEpisodeDataset(Dataset):
             global_tile_mode: How to handle global camera:
                 - "multi_tile" (default): Split into left/right tiles with 5% overlap
                 - "letterbox": Single frame with black bar padding
-            video_backend: Video decoding backend:
-                - "pyav" (default): CPU decoding (stable, compatible)
-                - "torchcodec": GPU-accelerated decoding (requires FFmpeg 5/6/7)
+            video_backend: Video decoding backend (only used for video-based datasets):
+                - "torchcodec" (default): GPU-accelerated decoding (requires FFmpeg 5+)
+                - "pyav": CPU decoding (fallback, more compatible)
+                Note: Ignored for PNG image-based datasets (auto-detected from info.json)
         """
         self.dataset_path = Path(dataset_path)
         self.split = split
@@ -150,28 +156,59 @@ class ChessEpisodeDataset(Dataset):
         if not LEROBOT_AVAILABLE:
             raise ImportError("LeRobot is required. Install with: pip install lerobot")
 
-        # Load LeRobot dataset with GPU-accelerated video decoding
-        # torchcodec uses NVIDIA NVDEC for faster decoding, falls back to pyav if unavailable
+        # Detect dataset format from info.json (video vs image-based)
+        # This determines whether we need a video backend or can use direct image loading
+        info_path = self.dataset_path / "meta" / "info.json"
+        self.uses_video = True  # Default to video for backward compatibility
+
+        if info_path.exists():
+            try:
+                with open(info_path) as f:
+                    info = json.load(f)
+                # Check if any camera feature uses video or image dtype
+                self.uses_video = any(
+                    feat.get("dtype") == "video"
+                    for key, feat in info.get("features", {}).items()
+                    if "images" in key
+                )
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"[WARN] Could not read info.json: {e}")
+                print(f"       Assuming video-based dataset")
+
+        # Load LeRobot dataset with appropriate backend
         print(f"Loading LeRobot dataset from: {dataset_path}")
-        try:
-            self.lerobot_dataset = LeRobotDataset(
-                repo_id="local/chess_episodes",
-                root=self.dataset_path,
-                video_backend=video_backend,
-            )
-            print(f"[OK] Using {video_backend} video backend")
-        except Exception as e:
-            if video_backend == "torchcodec":
-                print(f"[WARN] torchcodec failed: {e}")
-                print(f"[INFO] Falling back to pyav backend")
+
+        if self.uses_video:
+            # Video-based dataset: use GPU-accelerated video decoding
+            # torchcodec uses NVIDIA NVDEC for faster decoding, falls back to pyav if unavailable
+            try:
                 self.lerobot_dataset = LeRobotDataset(
                     repo_id="local/chess_episodes",
                     root=self.dataset_path,
-                    video_backend="pyav",
+                    video_backend=video_backend,
                 )
-                self.video_backend = "pyav"
-            else:
-                raise
+                print(f"[OK] Using {video_backend} video backend")
+            except Exception as e:
+                if video_backend == "torchcodec":
+                    print(f"[WARN] torchcodec failed: {e}")
+                    print(f"[INFO] Falling back to pyav backend")
+                    self.lerobot_dataset = LeRobotDataset(
+                        repo_id="local/chess_episodes",
+                        root=self.dataset_path,
+                        video_backend="pyav",
+                    )
+                    self.video_backend = "pyav"
+                else:
+                    raise
+        else:
+            # Image-based dataset (PNG frames): no video backend needed
+            # This is ~10-20x faster for random access as it avoids video decoding
+            self.lerobot_dataset = LeRobotDataset(
+                repo_id="local/chess_episodes",
+                root=self.dataset_path,
+            )
+            self.video_backend = None
+            print(f"[OK] Using PNG image backend (no video decoding)")
 
         # Get dataset info
         self.total_frames = len(self.lerobot_dataset)
@@ -338,35 +375,41 @@ class ChessEpisodeDataset(Dataset):
         if self.use_global_camera and dataset_global_key in sample:
             global_img = sample[dataset_global_key]
 
-            # Convert to tensor format for processing
-            if isinstance(global_img, torch.Tensor):
-                if global_img.dim() == 3 and global_img.shape[0] != 3:
-                    global_img = global_img.permute(2, 0, 1)
-                global_img = global_img.float() / 255.0 if global_img.max() > 1.0 else global_img.float()
-            elif isinstance(global_img, np.ndarray):
-                global_img = torch.from_numpy(global_img).permute(2, 0, 1).float() / 255.0
-
-            if self.global_tile_mode == "multi_tile":
-                # Multi-tile: Split into left/right tiles (3.5x more resolution)
-                # Left tile -> model's 'global' slot, Right tile -> model's 'unused' slot
-                left_tile, right_tile = self._process_global_multi_tile(global_img)
-                result[model_global_key] = left_tile
-                if 'unused' in self.model_camera_keys:
-                    result[self.model_camera_keys['unused']] = right_tile
+            # Skip if image is None (can happen with some dataset formats)
+            if global_img is None:
+                print(f"[WARN] Global image is None for index {idx}, skipping")
             else:
-                # Letterbox: Single frame with black bar padding
-                global_processed = self._process_image(global_img, is_global=True)
-                result[model_global_key] = global_processed
-                # Add zeros for unused third camera slot
-                if 'unused' in self.model_camera_keys:
-                    result[self.model_camera_keys['unused']] = torch.zeros(3, self.image_size[0], self.image_size[1])
+                # Convert to tensor format for processing
+                if isinstance(global_img, torch.Tensor):
+                    if global_img.dim() == 3 and global_img.shape[0] != 3:
+                        global_img = global_img.permute(2, 0, 1)
+                    global_img = global_img.float() / 255.0 if global_img.max() > 1.0 else global_img.float()
+                elif isinstance(global_img, np.ndarray):
+                    global_img = torch.from_numpy(global_img).permute(2, 0, 1).float() / 255.0
+
+                if self.global_tile_mode == "multi_tile":
+                    # Multi-tile: Split into left/right tiles (3.5x more resolution)
+                    # Left tile -> model's 'global' slot, Right tile -> model's 'unused' slot
+                    left_tile, right_tile = self._process_global_multi_tile(global_img)
+                    result[model_global_key] = left_tile
+                    if 'unused' in self.model_camera_keys:
+                        result[self.model_camera_keys['unused']] = right_tile
+                else:
+                    # Letterbox: Single frame with black bar padding
+                    global_processed = self._process_image(global_img, is_global=True)
+                    result[model_global_key] = global_processed
+                    # Add zeros for unused third camera slot
+                    if 'unused' in self.model_camera_keys:
+                        result[self.model_camera_keys['unused']] = torch.zeros(3, self.image_size[0], self.image_size[1])
 
         # Process gripper camera -> maps to model-specific key
         # Gripper: height-first resize + center crop (camera-agnostic)
         if self.use_gripper_camera and dataset_gripper_key in sample:
             gripper_img = sample[dataset_gripper_key]
-            gripper_img = self._process_image(gripper_img, is_global=False)
-            result[model_gripper_key] = gripper_img
+            # Skip if image is None (can happen with some dataset formats)
+            if gripper_img is not None:
+                gripper_img = self._process_image(gripper_img, is_global=False)
+                result[model_gripper_key] = gripper_img
 
         # Process joint positions (observation.state in our dataset)
         # PI0 expects 32-dim state (padded), SmolVLA expects 6-dim state
@@ -542,10 +585,14 @@ def create_dataloaders(
     normalizer: Optional[ActionNormalizer] = None,
     normalize_actions: bool = True,
     global_tile_mode: str = "multi_tile",
-    video_backend: str = "pyav",
+    video_backend: str = "torchcodec",
 ) -> Tuple[DataLoader, DataLoader, Optional[ActionNormalizer]]:
     """
     Create train and validation dataloaders.
+
+    Automatically detects dataset format (video vs PNG) from meta/info.json:
+    - Video-based datasets: Use video_backend for decoding
+    - PNG image datasets: Direct image loading (10-20x faster, no video decoding)
 
     Args:
         dataset_path: Path to LeRobot dataset
@@ -560,9 +607,10 @@ def create_dataloaders(
         global_tile_mode: How to handle global camera:
             - "multi_tile" (default): Split into left/right tiles (3.5x resolution)
             - "letterbox": Single frame with black bar padding
-        video_backend: Video decoding backend:
+        video_backend: Video decoding backend (only used for video-based datasets):
             - "torchcodec" (default): GPU-accelerated decoding
             - "pyav": CPU decoding (more compatible)
+            Note: Ignored for PNG image-based datasets (auto-detected)
 
     Returns:
         Tuple of (train_loader, val_loader, normalizer)
@@ -621,7 +669,7 @@ def create_dataloaders(
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=4,  # Prefetch 4 batches per worker to overlap data loading with GPU
+        prefetch_factor=8 if num_workers > 0 else None,  # Prefetch 8 batches per worker for video decode
         persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
     )
 
@@ -633,7 +681,7 @@ def create_dataloaders(
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=False,
-        prefetch_factor=4,
+        prefetch_factor=8 if num_workers > 0 else None,
         persistent_workers=True if num_workers > 0 else False,
     )
 
