@@ -7,6 +7,12 @@ which pieces are misclassified. This helps identify:
 2. Pieces the model struggles to classify correctly
 3. Patterns in misclassification (e.g., pawns vs rooks)
 
+Edit Mode:
+    Press 'e' to enter edit mode, then click on misclassified pieces or
+    false positives to accept the model's prediction. This is useful when
+    the model correctly identifies pieces that were mislabeled in the
+    training data.
+
 Usage:
     # Use best_cls.pt (lowest cls_loss - recommended)
     python scripts/validate_piece_labels_with_yolo.py --data data/training/piece_dataset/
@@ -58,6 +64,15 @@ def load_labels(label_path):
                     'bbox': [float(p) for p in parts[1:]]  # x_center, y_center, width, height (normalized)
                 })
     return labels
+
+
+def save_labels(label_path, labels):
+    """Save YOLO format labels to file."""
+    with open(label_path, 'w') as f:
+        for label in labels:
+            class_id = label['class_id']
+            bbox = label['bbox']
+            f.write(f"{class_id} {bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n")
 
 
 def calculate_iou(box1, box2):
@@ -179,6 +194,12 @@ class YOLOValidator:
 
         self.window_name = "YOLO Validation"
 
+        # Edit mode state
+        self.edit_mode = False
+        self.clickable_boxes = []  # List of (x1, y1, x2, y2, edit_type, data)
+        self.current_results = None
+        self.edits_made = 0
+
     def _load_images(self):
         """Load list of images with label files."""
         images = []
@@ -193,6 +214,62 @@ class YOLOValidator:
                     })
                     break
         return images
+
+    def _mouse_callback(self, event, x, y, flags, param):
+        """Handle mouse clicks in edit mode."""
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        if not self.edit_mode:
+            return
+
+        # Check if click is inside any clickable box
+        for box_x1, box_y1, box_x2, box_y2, edit_type, data in self.clickable_boxes:
+            if box_x1 <= x <= box_x2 and box_y1 <= y <= box_y2:
+                self._apply_edit(edit_type, data)
+                return
+
+    def _apply_edit(self, edit_type, data):
+        """
+        Apply an edit based on click.
+
+        For misclassifications: change the GT label class to match model prediction
+        For false positives: add a new label with model's predicted class
+        """
+        if self.current_results is None:
+            return
+
+        label_path = self.current_results['image_info']['label_path']
+        labels = load_labels(label_path)
+
+        if edit_type == 'misclassification':
+            gt, pred, iou = data
+            # Find the matching label and update its class
+            for label in labels:
+                if label['bbox'] == gt['bbox'] and label['class_id'] == gt['class_id']:
+                    old_name = PIECE_CLASSES.get(label['class_id'], f"cls{label['class_id']}")
+                    new_name = PIECE_CLASSES.get(pred['class_id'], f"cls{pred['class_id']}")
+                    label['class_id'] = pred['class_id']
+                    print(f"  [EDIT] Changed {old_name} -> {new_name}")
+                    break
+
+        elif edit_type == 'false_positive':
+            pred = data
+            # Add a new label for this detection
+            new_label = {
+                'class_id': pred['class_id'],
+                'bbox': pred['bbox']
+            }
+            labels.append(new_label)
+            new_name = PIECE_CLASSES.get(pred['class_id'], f"cls{pred['class_id']}")
+            print(f"  [EDIT] Added new label: {new_name}")
+
+        # Save updated labels
+        save_labels(label_path, labels)
+        self.edits_made += 1
+
+        # Mark that we need to refresh the display
+        self._needs_refresh = True
 
     def run_inference(self, image_path):
         """Run YOLO inference on image."""
@@ -265,6 +342,9 @@ class YOLOValidator:
 
         img_h, img_w = img.shape[:2]
 
+        # Clear clickable boxes for this image
+        self.clickable_boxes = []
+
         # Draw misclassifications in RED
         for gt, pred, iou in results['misclassifications']:
             x_c, y_c, w, h = gt['bbox']
@@ -273,8 +353,9 @@ class YOLOValidator:
             x2 = int((x_c + w/2) * img_w)
             y2 = int((y_c + h/2) * img_h)
 
-            # Red box for misclassification
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            # Red box for misclassification (thicker border in edit mode)
+            thickness = 4 if self.edit_mode else 3
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), thickness)
 
             # Label: GT -> Pred
             gt_name = PIECE_CLASSES.get(gt['class_id'], f"cls{gt['class_id']}")[:6]
@@ -282,6 +363,9 @@ class YOLOValidator:
             label = f"{gt_name}->{pred_name}"
             cv2.putText(img, label, (x1, y1 - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Track clickable box for edit mode
+            self.clickable_boxes.append((x1, y1, x2, y2, 'misclassification', (gt, pred, iou)))
 
         # Draw missed detections in ORANGE
         for gt in results['missed']:
@@ -304,10 +388,15 @@ class YOLOValidator:
             x2 = int((x_c + w/2) * img_w)
             y2 = int((y_c + h/2) * img_h)
 
-            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            # Thicker border in edit mode
+            thickness = 3 if self.edit_mode else 2
+            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), thickness)
             pred_name = PIECE_CLASSES.get(pred['class_id'], f"cls{pred['class_id']}")
             cv2.putText(img, f"FP:{pred_name}", (x1, y2 + 15),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 2)
+
+            # Track clickable box for edit mode
+            self.clickable_boxes.append((x1, y1, x2, y2, 'false_positive', pred))
 
         # Draw correct predictions in GREEN (if show_all)
         if show_all:
@@ -339,14 +428,22 @@ class YOLOValidator:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         # Legend
-        legend = "RED=misclass | ORANGE=missed | PURPLE=false_pos | GREEN=correct"
+        legend = "RED=misclass (GT->Pred) | ORANGE=missed | PURPLE=false_pos (model found) | GREEN=correct"
         cv2.putText(status_bar, legend, (10, 75),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
-        # Controls
-        controls = "SPACE=next | b=back | q=quit | s=skip to errors"
-        cv2.putText(status_bar, controls, (10, 95),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        # Controls - different based on edit mode
+        if self.edit_mode:
+            controls = "EDIT MODE: click to accept model prediction | e=exit edit | q=quit"
+            cv2.putText(status_bar, controls, (10, 95),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            # Edit mode indicator
+            cv2.putText(status_bar, f"[EDIT MODE] Edits: {self.edits_made}", (img_w - 200, 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        else:
+            controls = "SPACE=next | b=back | e=edit mode | q=quit"
+            cv2.putText(status_bar, controls, (10, 95),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         return np.vstack([img, status_bar])
 
@@ -406,28 +503,56 @@ class YOLOValidator:
 
         # Interactive display
         print("\nStarting interactive review...")
-        print("Controls: SPACE=next, b=back, q=quit")
+        print("Controls: SPACE=next, b=back, e=edit mode, q=quit")
 
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.window_name, self._mouse_callback)
         idx = 0
+        self._needs_refresh = False
 
         while 0 <= idx < len(display_results):
             results = display_results[idx]
+            self.current_results = results
             display = self.draw_validation_image(results, show_all=show_all)
 
             if display is not None:
                 cv2.imshow(self.window_name, display)
 
-            key = cv2.waitKey(0) & 0xFF
+            key = cv2.waitKey(100) & 0xFF  # 100ms for responsive edit mode
 
-            if key == ord('q'):
+            # Check if we need to refresh after an edit
+            if self._needs_refresh:
+                self._needs_refresh = False
+                # Re-validate this image to reflect the edit
+                results = self.validate_image(results['image_info'])
+                display_results[idx] = results
+                self.current_results = results
+                display = self.draw_validation_image(results, show_all=show_all)
+                if display is not None:
+                    cv2.imshow(self.window_name, display)
+                continue
+
+            if key == 255:  # No key pressed (timeout)
+                continue
+            elif key == ord('q'):
                 break
             elif key == ord(' ') or key == ord('n'):
                 idx += 1
             elif key == ord('b'):
                 idx = max(0, idx - 1)
+            elif key == ord('e'):
+                self.edit_mode = not self.edit_mode
+                mode_str = "ON" if self.edit_mode else "OFF"
+                print(f"  Edit mode: {mode_str}")
+                # Redraw to show edit mode indicator
+                display = self.draw_validation_image(results, show_all=show_all)
+                if display is not None:
+                    cv2.imshow(self.window_name, display)
 
         cv2.destroyAllWindows()
+
+        if self.edits_made > 0:
+            print(f"\n[OK] Made {self.edits_made} edits to label files.")
 
     def _print_summary(self):
         """Print validation summary statistics."""
