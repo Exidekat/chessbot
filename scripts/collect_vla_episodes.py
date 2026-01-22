@@ -35,11 +35,14 @@ Usage:
 import argparse
 import json
 import queue
+import shutil
+import tempfile
 import threading
 import time
 import cv2
 import chess
 import numpy as np
+import pyarrow.parquet as pq
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import sys
@@ -203,8 +206,91 @@ class EpisodeRecorder:
         print(f"     FPS: {self.fps}")
         print(f"     Format: LeRobot v3.0")
 
+    def _recover_corrupted_dataset(self) -> bool:
+        """
+        Scan for and remove corrupted parquet files before loading dataset.
+
+        This runs before LeRobotDataset() is called to prevent load failures
+        from corrupted parquet files (caused by OOM kills during save).
+
+        Returns:
+            True if recovery was performed, False if dataset was clean
+        """
+        data_dir = self.output_dir / "data"
+        meta_episodes_dir = self.output_dir / "meta" / "episodes"
+
+        if not data_dir.exists():
+            return False
+
+        corrupted_files = []
+        valid_frame_count = 0
+        valid_episode_indices = set()
+
+        # Scan data parquet files
+        for parquet_file in sorted(data_dir.rglob("*.parquet")):
+            try:
+                table = pq.read_table(str(parquet_file))
+                valid_frame_count += len(table)
+                # Track which episodes are valid
+                if "episode_index" in table.column_names:
+                    for idx in table.column("episode_index").to_pylist():
+                        valid_episode_indices.add(idx)
+            except Exception as e:
+                print(f"[RECOVERY] Corrupted data file: {parquet_file.name}")
+                corrupted_files.append(parquet_file)
+
+        # Scan episode metadata parquet files
+        if meta_episodes_dir.exists():
+            for parquet_file in sorted(meta_episodes_dir.rglob("*.parquet")):
+                try:
+                    pq.read_table(str(parquet_file))
+                except Exception:
+                    print(f"[RECOVERY] Corrupted metadata file: {parquet_file.name}")
+                    corrupted_files.append(parquet_file)
+
+        if not corrupted_files:
+            return False
+
+        # Remove corrupted files
+        print(f"\n[RECOVERY] Found {len(corrupted_files)} corrupted parquet file(s)")
+        for f in corrupted_files:
+            print(f"  Removing: {f}")
+            f.unlink()
+
+        # Update info.json with corrected counts
+        info_path = self.output_dir / "meta" / "info.json"
+        if info_path.exists():
+            try:
+                with open(info_path, 'r') as f:
+                    info = json.load(f)
+
+                old_episodes = info.get("total_episodes", 0)
+                old_frames = info.get("total_frames", 0)
+
+                info["total_episodes"] = len(valid_episode_indices)
+                info["total_frames"] = valid_frame_count
+
+                # Update splits if present
+                if "splits" in info:
+                    info["splits"] = {"train": f"[0:{len(valid_episode_indices)}]"}
+
+                with open(info_path, 'w') as f:
+                    json.dump(info, f, indent=2)
+
+                print(f"  Updated info.json: {old_episodes} → {len(valid_episode_indices)} episodes, "
+                      f"{old_frames} → {valid_frame_count} frames")
+            except Exception as e:
+                print(f"[RECOVERY] Warning: Could not update info.json: {e}")
+
+        print(f"[RECOVERY] Dataset repaired. Continuing with load...\n")
+        return True
+
     def _initialize_dataset(self):
         """Initialize or load LeRobot dataset."""
+        # First, recover any corrupted parquet files from previous OOM crashes
+        if self.output_dir.exists():
+            self._recover_corrupted_dataset()
+
         # LeRobot v3.0 uses meta/info.json
         lerobot_meta = self.output_dir / "meta" / "info.json"
         repo_id = f"local/chess_vla_{self.output_dir.name}"
@@ -357,8 +443,8 @@ class EpisodeRecorder:
                 continue
 
             try:
-                frames, stage_info, episode_index = item
-                self._save_episode_lerobot_impl(frames, stage_info, episode_index)
+                frame_paths, stage_info, episode_index = item
+                self._save_episode_lerobot_impl(frame_paths, stage_info, episode_index)
 
             except Exception as e:
                 print(f"[ERROR] Background save failed: {e}")
@@ -367,12 +453,12 @@ class EpisodeRecorder:
             finally:
                 self.save_queue.task_done()
 
-    def queue_episode(self, frames: List[Dict], stage_info: Dict) -> int:
+    def queue_episode(self, frame_paths: List[Path], stage_info: Dict) -> int:
         """
         Queue episode for background saving.
 
         Args:
-            frames: List of frame dictionaries for this stage
+            frame_paths: List of temp file paths containing frame data
             stage_info: Stage dictionary with 'description', 'vlm_prompt', etc.
 
         Returns:
@@ -382,8 +468,8 @@ class EpisodeRecorder:
             episode_index = self.episode_count
             self.episode_count += 1
 
-        self.save_queue.put((frames, stage_info, episode_index))
-        print(f"[INFO] Queued episode {episode_index} ({len(frames)} frames, queue size: {self.save_queue.qsize()})")
+        self.save_queue.put((frame_paths, stage_info, episode_index))
+        print(f"[INFO] Queued episode {episode_index} ({len(frame_paths)} frames, queue size: {self.save_queue.qsize()})")
         return episode_index
 
     def _detect_and_decompose_move(self, board_image_path: str) -> Optional[Dict]:
@@ -493,9 +579,12 @@ class EpisodeRecorder:
         total_stages: int,
         board: chess.Board,
         move: chess.Move
-    ) -> Optional[List[Dict]]:
+    ) -> Optional[List[Path]]:
         """
         Record one stage at 15 FPS until user presses ENTER.
+
+        Frames are streamed to temp files on disk to prevent OOM during long
+        recordings. Memory usage stays constant (~10 MB) regardless of duration.
 
         Args:
             stage: Stage dictionary from decompose_move()
@@ -505,7 +594,7 @@ class EpisodeRecorder:
             move: The move being executed
 
         Returns:
-            List of frame dictionaries or None if recording fails
+            List of temp file paths containing frame data, or None if recording fails
         """
         print(f"\n{'='*60}")
         print(f"Stage {stage_index + 1}/{total_stages}")
@@ -551,9 +640,15 @@ class EpisodeRecorder:
         print("[PROMPT] Press ENTER to STOP recording")
 
         recording_active = True
-        episode_frames = []
+        frame_paths: List[Path] = []
         start_time = time.time()
         frame_count = 0
+
+        # Create temp directory for streaming frames to disk
+        # This prevents OOM by keeping memory usage constant (~10 MB)
+        temp_dir = Path(tempfile.mkdtemp(prefix="chessbot_frames_"))
+        first_positions = None
+        last_positions = None
 
         try:
             while recording_active:
@@ -601,14 +696,24 @@ class EpisodeRecorder:
                 # Stream to virtual camera
                 self.virtual_cam.write_frame(overlayed_frame)
 
-                # Store frame
-                episode_frames.append({
-                    "global_frame": overlayed_frame.copy(),
-                    "gripper_frame": gripper_frame.copy(),
-                    "joint_positions": np.array(joint_positions, dtype=np.float32),
-                    "timestamp": time.time() - start_time,
-                    "vlm_prompt": stage["vlm_prompt"]
-                })
+                # Stream frame to temp file instead of accumulating in memory
+                # This keeps memory usage constant regardless of recording length
+                temp_path = temp_dir / f"frame_{frame_count:06d}.npz"
+                np.savez_compressed(
+                    temp_path,
+                    global_frame=overlayed_frame,
+                    gripper_frame=gripper_frame,
+                    joint_positions=np.array(joint_positions, dtype=np.float32),
+                    timestamp=np.array([time.time() - start_time], dtype=np.float32),
+                    vlm_prompt=np.array([stage["vlm_prompt"]])
+                )
+                frame_paths.append(temp_path)
+
+                # Track first/last positions for mismatch check
+                positions_array = np.array(joint_positions, dtype=np.float32)
+                if first_positions is None:
+                    first_positions = positions_array
+                last_positions = positions_array
 
                 frame_count += 1
 
@@ -632,15 +737,14 @@ class EpisodeRecorder:
             print(f"     Frames: {frame_count}")
             print(f"     Duration: {duration:.2f}s")
             print(f"     Actual FPS: {actual_fps:.2f}")
+            print(f"     Temp files: {temp_dir}")
 
             # Check for position mismatch between start and end
-            if len(episode_frames) >= 2:
-                start_positions = episode_frames[0]["joint_positions"]
-                end_positions = episode_frames[-1]["joint_positions"]
+            if first_positions is not None and last_positions is not None:
                 mismatched_joints = []
 
-                for i in range(len(start_positions)):
-                    diff_rad = abs(start_positions[i] - end_positions[i])
+                for i in range(len(first_positions)):
+                    diff_rad = abs(first_positions[i] - last_positions[i])
                     diff_deg = diff_rad * (180.0 / np.pi)
                     if diff_rad > POSITION_TOLERANCE_RAD:
                         mismatched_joints.append((i, diff_deg))
@@ -650,30 +754,45 @@ class EpisodeRecorder:
                     for joint_idx, diff_deg in mismatched_joints:
                         print(f"          Joint {joint_idx}: {diff_deg:.1f} degrees difference")
 
-            return episode_frames
+            return frame_paths
 
         except KeyboardInterrupt:
             print("\n[INFO] Recording interrupted by user")
+            # Clean up temp files on interrupt
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return None
         except Exception as e:
             print(f"[ERROR] Recording failed: {e}")
             import traceback
             traceback.print_exc()
+            # Clean up temp files on error
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return None
 
-    def _save_episode_lerobot_impl(self, frames: List[Dict], stage_info: Dict, episode_index: int):
+    def _save_episode_lerobot_impl(self, frame_paths: List[Path], stage_info: Dict, episode_index: int):
         """
         Save single-stage episode to LeRobot dataset (called from background thread).
 
+        Reads frames from temp files on disk, adds them to LeRobot, then cleans up.
+        This streaming approach keeps memory usage low even for long episodes.
+
         Args:
-            frames: List of frame dictionaries for this stage
+            frame_paths: List of temp file paths containing frame data
             stage_info: Stage dictionary with 'description', 'vlm_prompt', etc.
             episode_index: Pre-assigned episode index
         """
+        from PIL import Image
+
+        temp_dir = frame_paths[0].parent if frame_paths else None
+
         try:
             vlm_prompt = stage_info.get("vlm_prompt", "")
 
-            print(f"[SAVE] Writing episode {episode_index} to LeRobot dataset...")
+            print(f"[SAVE] Writing episode {episode_index} to LeRobot dataset ({len(frame_paths)} frames)...")
+
+            # Pre-load next frame's joint positions for action calculation
+            # We need to peek ahead, so load them in pairs
+            next_positions = None
 
             with self.save_lock:
                 # Safety check: Reset corrupted episode buffer if needed
@@ -684,39 +803,55 @@ class EpisodeRecorder:
                     print("[WARN] Resetting corrupted episode buffer from previous failed save")
                     self.dataset.episode_buffer = None
 
-                for frame_idx, frame_data in enumerate(frames):
+                for frame_idx, frame_path in enumerate(frame_paths):
+                    # Load frame data from temp file
+                    data = np.load(frame_path)
+
+                    global_frame = data["global_frame"]
+                    gripper_frame = data["gripper_frame"]
+                    joint_positions = data["joint_positions"]
+
                     # Convert BGR (OpenCV) to RGB for LeRobot video encoding
-                    global_rgb = cv2.cvtColor(frame_data["global_frame"], cv2.COLOR_BGR2RGB)
-                    gripper_rgb = cv2.cvtColor(frame_data["gripper_frame"], cv2.COLOR_BGR2RGB)
+                    global_rgb = cv2.cvtColor(global_frame, cv2.COLOR_BGR2RGB)
+                    gripper_rgb = cv2.cvtColor(gripper_frame, cv2.COLOR_BGR2RGB)
 
                     # Convert numpy arrays to PIL Images for LeRobot
-                    from PIL import Image
                     global_pil = Image.fromarray(global_rgb)
                     gripper_pil = Image.fromarray(gripper_rgb)
 
                     # Action: next joint position (or current for last frame)
-                    if frame_idx < len(frames) - 1:
-                        action = frames[frame_idx + 1]["joint_positions"]
+                    if frame_idx < len(frame_paths) - 1:
+                        # Peek at next frame for action
+                        next_data = np.load(frame_paths[frame_idx + 1])
+                        action = next_data["joint_positions"]
                     else:
-                        action = frame_data["joint_positions"]
+                        action = joint_positions
 
                     self.dataset.add_frame({
                         "observation.images.global": global_pil,
                         "observation.images.gripper": gripper_pil,
-                        "observation.state": frame_data["joint_positions"],
+                        "observation.state": joint_positions,
                         "action": action,
                         "task": vlm_prompt  # Required by LeRobot
                     })
 
+                    # Delete temp file after processing to free disk space
+                    frame_path.unlink()
+
                 # Finalize episode (encode videos, write Parquet)
                 self.dataset.save_episode()
 
-            print(f"[SAVE] Episode {episode_index} saved: {len(frames)} frames")
+            print(f"[SAVE] Episode {episode_index} saved: {len(frame_paths)} frames")
 
         except Exception as e:
             print(f"[ERROR] Failed to save episode {episode_index} to LeRobot: {e}")
             import traceback
             traceback.print_exc()
+
+        finally:
+            # Clean up temp directory (should be empty, but ensure cleanup)
+            if temp_dir and temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def run(self):
         """Main episode collection loop."""
