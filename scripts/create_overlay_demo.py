@@ -196,6 +196,16 @@ def main():
         action="store_true",
         help="Use 4K MJPEG -> 720p downscale (supersampled, 30fps) instead of default YUYV"
     )
+    parser.add_argument(
+        "--corner-rgb",
+        action="store_true",
+        help="Use RGB for corner detection (no grayscale+CLAHE preprocessing)"
+    )
+    parser.add_argument(
+        "--piece-rgb",
+        action="store_true",
+        help="Use RGB for piece detection (no grayscale+CLAHE preprocessing)"
+    )
 
     args = parser.parse_args()
 
@@ -287,8 +297,16 @@ def main():
     try:
         # Initialize BoardDetector
         print("Initializing BoardDetector...")
-        detector = BoardDetector(camera_position=args.rotation)
+        detector = BoardDetector(
+            camera_position=args.rotation,
+            use_corner_rgb=args.corner_rgb,
+            use_piece_rgb=args.piece_rgb,
+        )
         print(f"[OK] BoardDetector initialized (rotation: {args.rotation})")
+        corner_mode = "RGB" if args.corner_rgb else "grayscale+CLAHE"
+        piece_mode = "RGB" if args.piece_rgb else "grayscale+CLAHE"
+        print(f"     Corner preprocessing: {corner_mode}")
+        print(f"     Piece preprocessing: {piece_mode}")
         print()
 
         # Detect board state

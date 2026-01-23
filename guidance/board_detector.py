@@ -29,7 +29,9 @@ class BoardDetector:
         self,
         corner_model_path: str = "data/best_corners.pt",
         piece_model_path: str = "data/best_transformed_detection.pt",
-        camera_position: str = "right"
+        camera_position: str = "right",
+        use_corner_rgb: bool = False,
+        use_piece_rgb: bool = False,
     ):
         """
         Initialize the BoardDetector.
@@ -38,10 +40,14 @@ class BoardDetector:
             corner_model_path: Path to the YOLO corner detection model
             piece_model_path: Path to the YOLO piece detection model
             camera_position: Camera position relative to board ('top', 'right', 'bottom', 'left')
+            use_corner_rgb: If True, use RGB for corner detection (no grayscale+CLAHE preprocessing)
+            use_piece_rgb: If True, use RGB for piece detection (no grayscale+CLAHE preprocessing)
         """
         self.corner_model_path = Path(corner_model_path)
         self.piece_model_path = Path(piece_model_path)
         self.camera_position = camera_position
+        self.use_corner_rgb = use_corner_rgb
+        self.use_piece_rgb = use_piece_rgb
 
         # Initialize models (lazy loading)
         self._corner_model: Optional[YOLO] = None
@@ -205,17 +211,23 @@ class BoardDetector:
         Raises:
             ValueError: If 4 distinct corners cannot be detected
         """
-        # Preprocess image for corner detection (grayscale + contrast normalization)
-        # This improves detection in dimly lit conditions
-        preprocessed = preprocess_for_corner_detection(image_path)
+        # Preprocessing depends on use_corner_rgb setting
+        if self.use_corner_rgb:
+            # RGB mode: use original image directly
+            temp_preprocessed_path = image_path
+            if debug:
+                print(f"[DEBUG]   Preprocessing: RGB mode (no preprocessing)")
+        else:
+            # Default: grayscale + CLAHE preprocessing
+            preprocessed = preprocess_for_corner_detection(image_path)
 
-        # Save preprocessed image to temp file for YOLO
-        temp_preprocessed_path = "data/temp_corner_preprocessed.png"
-        cv2.imwrite(temp_preprocessed_path, preprocessed)
+            # Save preprocessed image to temp file for YOLO
+            temp_preprocessed_path = "data/temp_corner_preprocessed.png"
+            cv2.imwrite(temp_preprocessed_path, preprocessed)
 
-        if debug:
-            print(f"[DEBUG]   Preprocessing: grayscale + CLAHE contrast normalization")
-            print(f"[DEBUG]   Preprocessed image saved to {temp_preprocessed_path}")
+            if debug:
+                print(f"[DEBUG]   Preprocessing: grayscale + CLAHE contrast normalization")
+                print(f"[DEBUG]   Preprocessed image saved to {temp_preprocessed_path}")
 
         results = self.corner_model.predict(
             source=temp_preprocessed_path,
@@ -423,15 +435,20 @@ class BoardDetector:
         model focus on shape features which are more robust to lighting variations.
 
         IMPORTANT: This preprocessing MUST match the training data preprocessing
-        (label_pieces.py applies the same preprocessing before labeling).
+        when use_piece_rgb=False. When use_piece_rgb=True, returns original RGB image.
 
         Args:
             image: Input PIL Image (RGB)
 
         Returns:
             Preprocessed PIL Image (RGB - 3-channel grayscale for YOLO compatibility)
+            or original RGB image if use_piece_rgb=True
         """
-        # Use the centralized preprocessing function for consistency
+        if self.use_piece_rgb:
+            # RGB mode: return original image unchanged
+            return image
+
+        # Default: Use the centralized preprocessing function for consistency
         preprocessed = preprocess_for_piece_detection(image)
         # Convert BGR (from preprocessing) to RGB for PIL
         rgb = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2RGB)
@@ -1158,7 +1175,10 @@ class BoardDetector:
         # Step 2: Detect pieces on ORIGINAL image (before transformation)
         if debug:
             print("[BoardDetector] Step 2: Detecting pieces on original image...")
-            print("[BoardDetector]   Preprocessing: grayscale + CLAHE (matches training data)")
+            if self.use_piece_rgb:
+                print("[BoardDetector]   Preprocessing: RGB mode (no preprocessing)")
+            else:
+                print("[BoardDetector]   Preprocessing: grayscale + CLAHE (matches training data)")
 
         # Load original image for detection
         original_image = Image.open(image_path)

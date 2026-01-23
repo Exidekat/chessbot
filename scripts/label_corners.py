@@ -4,9 +4,9 @@ Label Corners for Corner Detection Training
 Interactive tool to label the 4 CORNERS of the chessboard in training photos.
 This creates a YOLO-format dataset specifically for fine-tuning the CORNER detection model.
 
-IMPORTANT: Images are preprocessed (grayscale + CLAHE) BEFORE labeling to match
-the preprocessing applied during inference. This ensures training data distribution
-matches inference data distribution.
+IMPORTANT: Images are saved as ORIGINAL RGB. Preprocessing (grayscale + CLAHE) is
+applied DURING TRAINING by finetune_corners.py, not during labeling. This allows
+A/B testing between grayscale and RGB modes using the same labeled dataset.
 
 NOTE: This is for CORNER detection only, not piece detection.
 
@@ -24,11 +24,9 @@ import shutil
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.image_preprocessing import preprocess_for_corner_detection
-
 
 class CornerLabeler:
-    """Interactive corner labeling tool with preprocessing."""
+    """Interactive corner labeling tool (RGB mode - no preprocessing)."""
 
     def __init__(self, image_path):
         self.image_path = image_path
@@ -36,15 +34,15 @@ class CornerLabeler:
         if self.original_image is None:
             raise ValueError(f"Failed to load image: {image_path}")
 
-        # Preprocess image (grayscale + CLAHE) to match inference pipeline
-        # This is CRITICAL: labels must be created on preprocessed images
-        # because the model will see preprocessed images during inference
-        self.image = preprocess_for_corner_detection(self.original_image)
+        # Use original RGB image for labeling
+        # Preprocessing (grayscale + CLAHE) is applied during TRAINING, not labeling
+        # This allows the same dataset to train both grayscale and RGB models
+        self.image = self.original_image.copy()
 
         self.display_image = self.image.copy()
         self.corners = []  # List of (x, y) tuples
         self.corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-        self.window_name = "Label Corners (PREPROCESSED) - Click 4 corners: TL, TR, BR, BL"
+        self.window_name = "Label Corners (RGB) - Click 4 corners: TL, TR, BR, BL"
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse clicks."""
@@ -171,13 +169,13 @@ def create_yolo_dataset(input_dir, output_dir):
         return False
 
     print("\n" + "=" * 60)
-    print(f"CORNER LABELING (WITH PREPROCESSING)")
+    print(f"CORNER LABELING (RGB MODE)")
     print("=" * 60)
     print(f"Found {len(image_files)} images")
     print()
-    print("PREPROCESSING: Images will be converted to grayscale + CLAHE")
-    print("  This matches the preprocessing applied during inference.")
-    print("  Labels are created on preprocessed images for consistency.")
+    print("RGB MODE: Images are saved as original RGB (no preprocessing).")
+    print("  Preprocessing (grayscale + CLAHE) is applied during TRAINING.")
+    print("  This allows A/B testing between grayscale and RGB modes.")
     print()
     print("Instructions:")
     print("  1. Click 4 corners in order: TL, TR, BR, BL")
@@ -210,25 +208,25 @@ def create_yolo_dataset(input_dir, output_dir):
                 print("  [Skipped]")
                 continue
 
-            # Get preprocessed image dimensions (same as original)
-            img_height, img_width = labeler.image.shape[:2]
+            # Get image dimensions (original RGB)
+            img_height, img_width = labeler.original_image.shape[:2]
 
             # Convert to YOLO format
             yolo_labels = convert_to_yolo_format(corners, img_width, img_height)
 
-            # Save PREPROCESSED image and label
-            # Using .png to preserve quality (CLAHE grayscale)
+            # Save ORIGINAL RGB image and label
+            # Using .png to preserve quality
             image_dest = images_dir / (image_file.stem + ".png")
             label_dest = labels_dir / (image_file.stem + ".txt")
 
-            # Save preprocessed image (NOT the original!)
-            cv2.imwrite(str(image_dest), labeler.image)
+            # Save original RGB image (preprocessing applied during training)
+            cv2.imwrite(str(image_dest), labeler.original_image)
 
             # Write label file
             with open(label_dest, 'w') as f:
                 f.write('\n'.join(yolo_labels))
 
-            print(f"  [OK] Saved preprocessed image to dataset")
+            print(f"  [OK] Saved RGB image to dataset")
             labeled_count += 1
 
         except Exception as e:

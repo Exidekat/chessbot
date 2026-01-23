@@ -146,6 +146,8 @@ class EpisodeRecorder:
         camera_rotation: str = "right",
         turn: str = "black",
         use_yuyv: bool = False,
+        use_corner_rgb: bool = False,
+        use_piece_rgb: bool = False,
     ):
         """
         Initialize episode recorder.
@@ -175,10 +177,16 @@ class EpisodeRecorder:
         self.cache = StateCache("data/state_cache.json")
         self.keyboard = KeyboardInput()
 
+        # Store RGB mode settings
+        self.use_corner_rgb = use_corner_rgb
+        self.use_piece_rgb = use_piece_rgb
+
         # Initialize guidance components
         self.detector = BoardDetector(
             corner_model_path="data/best_corners.pt",
-            piece_model_path="data/best_transformed_detection.pt"
+            piece_model_path="data/best_transformed_detection.pt",
+            use_corner_rgb=use_corner_rgb,
+            use_piece_rgb=use_piece_rgb,
         )
         self.calculator = MoveCalculator(engine_path=engine_path)
 
@@ -1087,6 +1095,16 @@ Examples:
         action="store_true",
         help="Enable debug mode (verbose SVT-AV1 encoder output)"
     )
+    parser.add_argument(
+        "--corner-rgb",
+        action="store_true",
+        help="Use RGB for corner detection (no grayscale+CLAHE preprocessing)"
+    )
+    parser.add_argument(
+        "--piece-rgb",
+        action="store_true",
+        help="Use RGB for piece detection (no grayscale+CLAHE preprocessing)"
+    )
 
     args = parser.parse_args()
 
@@ -1144,6 +1162,10 @@ Examples:
     # Create recorder
     capture_mode_str = "720p YUYV" if use_yuyv else "4K MJPEG -> 720p"
     print(f"[OK] Board capture mode: {capture_mode_str}")
+    corner_mode = "RGB" if args.corner_rgb else "grayscale+CLAHE"
+    piece_mode = "RGB" if args.piece_rgb else "grayscale+CLAHE"
+    print(f"[OK] Corner preprocessing: {corner_mode}")
+    print(f"[OK] Piece preprocessing: {piece_mode}")
 
     recorder = EpisodeRecorder(
         output_dir=args.output,
@@ -1155,6 +1177,8 @@ Examples:
         camera_rotation=args.rotation,
         turn=args.turn,
         use_yuyv=use_yuyv,
+        use_corner_rgb=args.corner_rgb,
+        use_piece_rgb=args.piece_rgb,
     )
 
     # Run collection loop

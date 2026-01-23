@@ -308,6 +308,7 @@ def save_checkpoint(
     config: BaseTrainingConfig,
     path: Path,
     tile_mode: str = "multi_tile",
+    preprocessing_mode: str = "grayscale",
 ):
     """Save training checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,6 +322,7 @@ def save_checkpoint(
         "model_name": config.model_name,
         "full_finetuning": not (config.freeze_vision_encoder or config.freeze_language_encoder),
         "tile_mode": tile_mode,  # Save for deployment consistency
+        "preprocessing_mode": preprocessing_mode,  # Board detection preprocessing (metadata)
     }
 
     torch.save(checkpoint, path)
@@ -678,6 +680,9 @@ Examples:
     parser.add_argument("--tile-mode", type=str, default="multi_tile",
                         choices=["multi_tile", "letterbox"],
                         help="Global camera tiling mode (default: multi_tile)")
+    parser.add_argument("--preprocessing-mode", type=str, default="grayscale",
+                        choices=["grayscale", "rgb"],
+                        help="Board detection preprocessing mode used during episode collection (metadata only, default: grayscale)")
 
     args = parser.parse_args()
 
@@ -823,6 +828,7 @@ Examples:
     print(f"\nDataset format: {dataset_format}")
     print(f"Image size: {config.image_size}")
     print(f"Tile mode: {args.tile_mode}")
+    print(f"Preprocessing mode: {args.preprocessing_mode} (metadata - used during episode collection)")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 
@@ -962,6 +968,7 @@ Examples:
                 model, optimizer, epoch + 1, val_metrics["val_loss"], config,
                 checkpoint_dir / f"epoch_{epoch + 1:04d}.pt",
                 tile_mode=args.tile_mode,
+                preprocessing_mode=args.preprocessing_mode,
             )
 
         # Save best model and track improvement
@@ -972,6 +979,7 @@ Examples:
                 model, optimizer, epoch + 1, val_metrics["val_loss"], config,
                 checkpoint_dir / "best.pt",
                 tile_mode=args.tile_mode,
+                preprocessing_mode=args.preprocessing_mode,
             )
             print(f"  [BEST] New best val loss: {best_val_loss:.6f}")
         else:
@@ -990,6 +998,7 @@ Examples:
             model, optimizer, final_epoch, val_metrics["val_loss"], config,
             checkpoint_dir / "final.pt",
             tile_mode=args.tile_mode,
+            preprocessing_mode=args.preprocessing_mode,
         )
     else:
         print("\n[WARN] No training epochs completed - skipping final checkpoint")

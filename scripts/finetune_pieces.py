@@ -10,19 +10,30 @@ NOTE: This is for PIECE detection only, not corner detection.
 CLASSIFICATION PRIORITY: This script saves models based on LOWEST cls_loss,
 prioritizing correct piece classification over bbox accuracy.
 
+By default, applies grayscale + CLAHE preprocessing to match inference pipeline.
+Use --rgb flag to train on original RGB images (no preprocessing).
+
 Usage:
+    # Default: grayscale + CLAHE preprocessing (matches existing pipeline)
     python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml
+
+    # RGB mode: no preprocessing (for A/B testing)
+    python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml --rgb
 """
 
 import argparse
 import sys
 import shutil
+import random
+import yaml
 from pathlib import Path
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from utils.image_preprocessing import preprocess_dataset_for_pieces
 
 
 class BestClsLossTracker:
@@ -91,7 +102,72 @@ class BestClsLossTracker:
         print("=" * 60)
 
 
-def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=1280):
+def create_preprocessed_dataset(dataset_dir, use_rgb=False):
+    """
+    Create preprocessed dataset if needed.
+
+    If use_rgb=False (default), preprocesses images with grayscale + CLAHE to match
+    the inference pipeline. If use_rgb=True, uses original RGB images.
+
+    Args:
+        dataset_dir: Path to dataset directory containing images/ and labels/
+        use_rgb: If True, use original RGB images; if False, apply grayscale + CLAHE preprocessing
+
+    Returns:
+        Tuple of (path to images dir to use, temp_preprocessed_dir or None)
+    """
+    dataset_path = Path(dataset_dir)
+    images_dir = dataset_path / "images"
+
+    temp_preprocessed_dir = None
+
+    if not use_rgb:
+        # Apply grayscale + CLAHE preprocessing to temp directory
+        temp_preprocessed_dir = dataset_path / "temp_preprocessed" / "images"
+
+        # Clean up old preprocessed directory if exists
+        if temp_preprocessed_dir.parent.exists():
+            shutil.rmtree(temp_preprocessed_dir.parent)
+
+        print(f"\n[Preprocessing] Applying grayscale + CLAHE to images...")
+        num_preprocessed = preprocess_dataset_for_pieces(images_dir, temp_preprocessed_dir)
+        print(f"[Preprocessing] Preprocessed {num_preprocessed} images")
+
+        # Create a temporary data.yaml pointing to preprocessed images
+        temp_data_yaml = temp_preprocessed_dir.parent / "data.yaml"
+
+        # Copy labels to temp directory
+        temp_labels_dir = temp_preprocessed_dir.parent / "labels"
+        temp_labels_dir.mkdir(parents=True, exist_ok=True)
+
+        labels_dir = dataset_path / "labels"
+        for label_file in labels_dir.glob("*.txt"):
+            shutil.copy(label_file, temp_labels_dir / label_file.name)
+
+        # Read original data.yaml to get class names
+        original_yaml = dataset_path / "data.yaml"
+        with open(original_yaml, 'r') as f:
+            data_config = yaml.safe_load(f)
+
+        # Create temp data.yaml
+        temp_config = {
+            'path': str(temp_preprocessed_dir.parent.absolute()),
+            'train': 'images',
+            'val': 'images',
+            'nc': data_config.get('nc', 12),
+            'names': data_config.get('names', [])
+        }
+
+        with open(temp_data_yaml, 'w') as f:
+            yaml.dump(temp_config, f, default_flow_style=False)
+
+        return str(temp_data_yaml), temp_preprocessed_dir.parent
+    else:
+        print(f"\n[RGB Mode] Using original RGB images (no preprocessing)")
+        return str(dataset_path / "data.yaml"), None
+
+
+def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=1280, use_rgb=False):
     """
     Fine-tune piece detection model.
 
@@ -101,49 +177,72 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
         output_dir: Directory for training outputs
         epochs: Number of training epochs
         imgsz: Image size for training (default: 1280 to match 1280x720 camera resolution)
+        use_rgb: If True, train on RGB images without grayscale + CLAHE preprocessing
     """
+    preprocessing_mode = "RGB (no preprocessing)" if use_rgb else "Grayscale + CLAHE"
+
     print("=" * 60)
     print("PIECE DETECTION MODEL FINE-TUNING")
     print("=" * 60)
     print(f"Base model: {base_model}")
     print(f"Dataset: {data_yaml}")
+    print(f"Preprocessing: {preprocessing_mode}")
     print(f"Epochs: {epochs}")
     print(f"Image size: {imgsz}")
     print(f"Output: {output_dir}")
     print("=" * 60)
     print()
 
-    # Load base model
-    print("Loading base model...")
-    model = YOLO(base_model)
-    print("[OK] Model loaded")
-    print()
+    # Apply preprocessing if needed
+    dataset_dir = Path(data_yaml).parent
+    train_data_yaml, temp_preprocessed_dir = create_preprocessed_dataset(dataset_dir, use_rgb=use_rgb)
 
-    # Register custom callback for cls_loss tracking
-    cls_tracker = BestClsLossTracker(output_dir)
-    model.add_callback("on_fit_epoch_end", cls_tracker.on_fit_epoch_end)
-    model.add_callback("on_train_end", cls_tracker.on_train_end)
-    print("[OK] Registered cls_loss tracker (saves best_cls.pt)")
-    print()
+    try:
+        # Load base model
+        print("Loading base model...")
+        model = YOLO(base_model)
+        print("[OK] Model loaded")
+        print()
 
-    # Fine-tune
-    print("Starting fine-tuning...")
-    print("This may take 30-60 minutes depending on dataset size and hardware")
-    print("(Piece detection requires more epochs than corner detection)")
-    print()
-    print("UPDATED CONFIGURATION - Based on corner detection success:")
-    print("  - Grayscale + CLAHE preprocessing (no color augmentation)")
-    print("  - STRONG brightness augmentation (hsv_v=0.7)")
-    print("  - Classification priority (cls=1.0, box=0.5)")
-    print("  - Maximized augmentation (mosaic=1.0, mixup=0.2)")
-    print("  - More rotation variation (degrees=15.0, was 5.0)")
-    print("  - Lower final LR (lrf=0.001, was 0.01)")
-    print("  - Image size 1280 (matches 1280x720 training images)")
-    print("  - GPU training batch=8 (1280 uses 4x memory vs 640)")
-    print()
+        # Register custom callback for cls_loss tracking
+        cls_tracker = BestClsLossTracker(output_dir)
+        model.add_callback("on_fit_epoch_end", cls_tracker.on_fit_epoch_end)
+        model.add_callback("on_train_end", cls_tracker.on_train_end)
+        print("[OK] Registered cls_loss tracker (saves best_cls.pt)")
+        print()
 
-    results = model.train(
-        data=data_yaml,
+        # Fine-tune
+        print("Starting fine-tuning...")
+        print("This may take 30-60 minutes depending on dataset size and hardware")
+        print("(Piece detection requires more epochs than corner detection)")
+        print()
+
+        # Set augmentation parameters based on preprocessing mode
+        if use_rgb:
+            # RGB mode: enable color augmentation
+            hsv_h = 0.015   # Hue variation (color augmentation)
+            hsv_s = 0.4     # Saturation variation
+            hsv_v = 0.7     # Strong brightness variation
+            print("CONFIGURATION (RGB mode):")
+            print("  - Color augmentation: hue 1.5%, saturation 40%, brightness 70%")
+        else:
+            # Grayscale mode: disable hue/saturation (no color in grayscale)
+            hsv_h = 0.0     # Disabled - no hue in grayscale images
+            hsv_s = 0.0     # Disabled - no saturation in grayscale images
+            hsv_v = 0.7     # Strong brightness variation
+            print("CONFIGURATION (Grayscale mode):")
+            print("  - Brightness augmentation: 70% (no color augmentation)")
+
+        print("  - Classification priority (cls=1.0, box=0.5)")
+        print("  - Maximized augmentation (mosaic=1.0, mixup=0.2)")
+        print("  - More rotation variation (degrees=15.0)")
+        print("  - Lower final LR (lrf=0.001)")
+        print("  - Image size 1280 (matches 1280x720 training images)")
+        print("  - GPU training batch=8 (1280 uses 4x memory vs 640)")
+        print()
+
+        results = model.train(
+            data=train_data_yaml,
         epochs=epochs,
         imgsz=imgsz,
         project=output_dir,
@@ -167,10 +266,10 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
         dfl=1.0,    # Standard
 
         # Data augmentation - MAXIMIZED for small dataset
-        # NOTE: hsv_h and hsv_s disabled because training uses grayscale + CLAHE preprocessing
-        hsv_h=0.0,    # Disabled - no hue in grayscale images
-        hsv_s=0.0,    # Disabled - no saturation in grayscale images
-        hsv_v=0.7,    # STRONG brightness augmentation (corner success factor #1)
+        # Augmentation settings depend on preprocessing mode (RGB vs grayscale)
+        hsv_h=hsv_h,
+        hsv_s=hsv_s,
+        hsv_v=hsv_v,
         degrees=15.0,  # INCREASED from 5.0 - more rotation variation
         translate=0.15,  # Increased from 0.1
         scale=0.3,    # Increased from 0.2
@@ -184,38 +283,45 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
         close_mosaic=10,  # Disable mosaic in last 10 epochs for stability
     )
 
-    print("\n" + "=" * 60)
-    print("[OK] Fine-tuning complete!")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("[OK] Fine-tuning complete!")
+        print("=" * 60)
 
-    # Find best models
-    weights_dir = Path(output_dir) / "piece_finetune" / "weights"
-    best_map_path = weights_dir / "best.pt"      # YOLO's default (best mAP)
-    best_cls_path = weights_dir / "best_cls.pt"  # Our custom (best cls_loss)
+        # Find best models
+        weights_dir = Path(output_dir) / "piece_finetune" / "weights"
+        best_map_path = weights_dir / "best.pt"      # YOLO's default (best mAP)
+        best_cls_path = weights_dir / "best_cls.pt"  # Our custom (best cls_loss)
 
-    print("\nSaved models:")
-    if best_map_path.exists():
-        print(f"  best.pt     - Best mAP50-95 (detection quality)")
-    if best_cls_path.exists():
-        print(f"  best_cls.pt - Best cls_loss (classification accuracy) [RECOMMENDED]")
+        print("\nSaved models:")
+        if best_map_path.exists():
+            print(f"  best.pt     - Best mAP50-95 (detection quality)")
+        if best_cls_path.exists():
+            print(f"  best_cls.pt - Best cls_loss (classification accuracy) [RECOMMENDED]")
 
-    print()
-    print("To use the fine-tuned model (choose ONE):")
-    print()
-    print("  Option A - Best CLASSIFICATION (recommended for chess):")
-    print(f"    cp {best_cls_path} data/best_transformed_detection.pt")
-    print()
-    print("  Option B - Best DETECTION (if missing pieces is the issue):")
-    print(f"    cp {best_map_path} data/best_transformed_detection.pt")
-    print()
-    print("  Then test: python scripts/best_move_demo.py --debug")
-    print()
-    print("  To analyze misclassifications:")
-    print("    python scripts/validate_piece_labels_with_yolo.py --model best_cls.pt")
+        print()
+        print("To use the fine-tuned model (choose ONE):")
+        print()
+        print("  Option A - Best CLASSIFICATION (recommended for chess):")
+        print(f"    cp {best_cls_path} data/best_transformed_detection.pt")
+        print()
+        print("  Option B - Best DETECTION (if missing pieces is the issue):")
+        print(f"    cp {best_map_path} data/best_transformed_detection.pt")
+        print()
+        print("  Then test: python scripts/best_move_demo.py --debug")
+        print()
+        print("  To analyze misclassifications:")
+        print("    python scripts/validate_piece_labels_with_yolo.py --model best_cls.pt")
 
-    print("=" * 60)
+        print("=" * 60)
 
-    return results
+        return results
+
+    finally:
+        # Clean up temporary preprocessed directory
+        if temp_preprocessed_dir and temp_preprocessed_dir.exists():
+            print(f"\n[Cleanup] Removing preprocessed images: {temp_preprocessed_dir}")
+            shutil.rmtree(temp_preprocessed_dir)
+            print("[OK] Cleanup complete")
 
 
 def main():
@@ -252,6 +358,11 @@ def main():
         default=1280,
         help="Image size for training (default: 1280 to match 1280x720 images)"
     )
+    parser.add_argument(
+        "--rgb",
+        action="store_true",
+        help="Train on RGB images without grayscale + CLAHE preprocessing (for A/B testing)"
+    )
 
     args = parser.parse_args()
 
@@ -282,7 +393,8 @@ def main():
             base_model=str(base_model),
             output_dir=str(output_dir),
             epochs=args.epochs,
-            imgsz=args.imgsz
+            imgsz=args.imgsz,
+            use_rgb=args.rgb
         )
         return 0
     except Exception as e:

@@ -6,9 +6,9 @@ This creates a YOLO-format dataset specifically for fine-tuning the PIECE detect
 
 NOTE: This is for PIECE detection only, not corner detection.
 
-IMPORTANT: Images are preprocessed with grayscale + CLAHE before labeling to match
-the inference pipeline. The preprocessed images are saved to the dataset so labels
-match what the model sees during inference.
+IMPORTANT: Images are saved as ORIGINAL RGB. Preprocessing (grayscale + CLAHE) is
+applied DURING TRAINING by finetune_pieces.py, not during labeling. This allows
+A/B testing between grayscale and RGB modes using the same labeled dataset.
 
 Supports 12 piece classes:
   0: b-bishop    1: b-king      2: b-knight
@@ -28,8 +28,6 @@ import yaml
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from utils.image_preprocessing import preprocess_for_piece_detection
 
 
 # Piece class mapping (same as YOLO model training)
@@ -53,17 +51,18 @@ CLASS_TO_ID = {v: k for k, v in PIECE_CLASSES.items()}
 
 
 class PieceLabeler:
-    """Interactive piece bounding box labeling tool."""
+    """Interactive piece bounding box labeling tool (RGB mode - no preprocessing)."""
 
     def __init__(self, image_path):
         self.image_path = image_path
-        original_image = cv2.imread(str(image_path))
-        if original_image is None:
+        self.original_image = cv2.imread(str(image_path))
+        if self.original_image is None:
             raise ValueError(f"Failed to load image: {image_path}")
 
-        # Preprocess image with grayscale + CLAHE to match inference pipeline
-        # This ensures labels match what the model sees during detection
-        self.image = preprocess_for_piece_detection(original_image)
+        # Use original RGB image for labeling
+        # Preprocessing (grayscale + CLAHE) is applied during TRAINING, not labeling
+        # This allows the same dataset to train both grayscale and RGB models
+        self.image = self.original_image.copy()
 
         self.display_image = self.image.copy()
         self.boxes = []  # List of (class_id, x1, y1, x2, y2)
@@ -304,10 +303,12 @@ def create_yolo_dataset(input_dir, output_dir):
         return False
 
     print("\n" + "=" * 60)
-    print(f"PIECE LABELING")
+    print(f"PIECE LABELING (RGB MODE)")
     print("=" * 60)
     print(f"Found {len(image_files)} images")
-    print("\nNOTE: Images are preprocessed with grayscale + CLAHE to match inference.")
+    print("\nRGB MODE: Images are saved as original RGB (no preprocessing).")
+    print("  Preprocessing (grayscale + CLAHE) is applied during TRAINING.")
+    print("  This allows A/B testing between grayscale and RGB modes.")
     print("\nInstructions:")
     print("  1. Draw bounding boxes around each piece")
     print("  2. Press keyboard shortcuts to select piece class:")
@@ -349,25 +350,23 @@ def create_yolo_dataset(input_dir, output_dir):
                 print("  [Warning] No pieces labeled")
                 continue
 
-            # Load and preprocess image (must match what labeler showed)
-            original_img = cv2.imread(str(image_file))
-            preprocessed_img = preprocess_for_piece_detection(original_img)
-            img_height, img_width = preprocessed_img.shape[:2]
+            # Get image dimensions from labeler (original RGB)
+            img_height, img_width = labeler.original_image.shape[:2]
 
             # Convert to YOLO format
             yolo_labels = convert_to_yolo_format(boxes, img_width, img_height)
 
-            # Save preprocessed image and label (label_dest already defined above)
+            # Save ORIGINAL RGB image and label (label_dest already defined above)
             image_dest = images_dir / image_file.name
 
-            # Save preprocessed image (not original) so training matches inference
-            cv2.imwrite(str(image_dest), preprocessed_img)
+            # Save original RGB image (preprocessing applied during training)
+            cv2.imwrite(str(image_dest), labeler.original_image)
 
             # Write label file
             with open(label_dest, 'w') as f:
                 f.write('\n'.join(yolo_labels))
 
-            print(f"  [OK] Saved {len(boxes)} pieces to dataset")
+            print(f"  [OK] Saved {len(boxes)} pieces to dataset (RGB)")
             labeled_count += 1
             total_pieces += len(boxes)
 
