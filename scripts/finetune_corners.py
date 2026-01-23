@@ -7,15 +7,15 @@ specific chessboard setup.
 NOTE: This is for CORNER detection only, not piece detection.
       For piece detection fine-tuning, use a separate script.
 
-By default, applies grayscale + CLAHE preprocessing to match inference pipeline.
-Use --rgb flag to train on original RGB images (no preprocessing).
+By default, trains on original RGB images (no preprocessing).
+Use --grayscale flag to apply grayscale + CLAHE preprocessing.
 
 Usage:
-    # Default: grayscale + CLAHE preprocessing (matches existing pipeline)
+    # Default: RGB mode (no preprocessing)
     python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml
 
-    # RGB mode: no preprocessing (for A/B testing)
-    python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml --rgb
+    # Grayscale mode: apply grayscale + CLAHE preprocessing
+    python scripts/finetune_corners.py --data data/training/corner_dataset/data.yaml --grayscale
 """
 
 import argparse
@@ -32,17 +32,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.image_preprocessing import preprocess_dataset_for_corners
 
 
-def create_train_val_split(dataset_dir, val_fraction=0.0, use_rgb=False):
+def create_train_val_split(dataset_dir, val_fraction=0.0, use_grayscale=False):
     """
     Create temporary train/val split directories.
 
-    If use_rgb=False (default), preprocesses images with grayscale + CLAHE to match
-    the inference pipeline. If use_rgb=True, uses original RGB images.
+    By default, uses original RGB images. If use_grayscale=True, preprocesses images
+    with grayscale + CLAHE.
 
     Args:
         dataset_dir: Path to dataset directory containing images/ and labels/
         val_fraction: Fraction of data to use for validation (default: 0.0 = use full set for both)
-        use_rgb: If True, use original RGB images; if False, apply grayscale + CLAHE preprocessing
+        use_grayscale: If True, apply grayscale + CLAHE preprocessing; if False (default), use RGB
 
     Returns:
         Tuple of (path to temporary data.yaml, num_train, num_val, temp_preprocessed_dir or None)
@@ -88,11 +88,11 @@ def create_train_val_split(dataset_dir, val_fraction=0.0, use_rgb=False):
         print(f"  Validation: {num_val} images ({100*val_fraction:.0f}%)")
         print(f"  Random seed: 42")
 
-    # Preprocessing step (unless RGB mode)
+    # Preprocessing step (only if grayscale mode requested)
     temp_preprocessed_dir = None
-    source_images_dir = images_dir  # Default: use original images
+    source_images_dir = images_dir  # Default: use original RGB images
 
-    if not use_rgb:
+    if use_grayscale:
         # Apply grayscale + CLAHE preprocessing to temp directory
         temp_preprocessed_dir = dataset_path / "temp_preprocessed" / "images"
 
@@ -173,7 +173,7 @@ def create_train_val_split(dataset_dir, val_fraction=0.0, use_rgb=False):
 
 
 def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=1280,
-                          val_fraction=0.0, lr=0.0001, patience=20, freeze=10, use_rgb=False):
+                          val_fraction=0.0, lr=0.0001, patience=20, freeze=10, use_grayscale=False):
     """
     Fine-tune corner detection model.
 
@@ -187,9 +187,9 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
         lr: Learning rate (default: 0.0001 - low for fine-tuning)
         patience: Early stopping patience (default: 20)
         freeze: Number of layers to freeze (default: 10 - freeze backbone)
-        use_rgb: If True, train on RGB images without grayscale + CLAHE preprocessing
+        use_grayscale: If True, apply grayscale + CLAHE preprocessing; if False (default), use RGB
     """
-    preprocessing_mode = "RGB (no preprocessing)" if use_rgb else "Grayscale + CLAHE"
+    preprocessing_mode = "Grayscale + CLAHE" if use_grayscale else "RGB (no preprocessing)"
 
     print("=" * 60)
     print("CORNER DETECTION MODEL FINE-TUNING")
@@ -210,7 +210,7 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
     # Create train/val split (with optional preprocessing)
     dataset_dir = Path(data_yaml).parent
     temp_yaml, num_train, num_val, temp_preprocessed_dir = create_train_val_split(
-        dataset_dir, val_fraction=val_fraction, use_rgb=use_rgb
+        dataset_dir, val_fraction=val_fraction, use_grayscale=use_grayscale
     )
 
     # Track temp directories for cleanup
@@ -251,20 +251,20 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
         print(f"  - Early stopping patience: {patience} epochs")
         print()
         # Set augmentation parameters based on preprocessing mode
-        if use_rgb:
-            # RGB mode: enable color augmentation
-            hsv_h = 0.015   # Hue variation (color augmentation)
-            hsv_s = 0.4     # Saturation variation
-            hsv_v = 0.35    # Brightness variation
-            print("Augmentations enabled (RGB mode):")
-            print("  - Color augmentation: hue 1.5%, saturation 40%, brightness 35%")
-        else:
+        if use_grayscale:
             # Grayscale mode: disable hue/saturation (no color in grayscale)
             hsv_h = 0.0     # Disabled - no hue in grayscale images
             hsv_s = 0.0     # Disabled - no saturation in grayscale images
             hsv_v = 0.35    # Brightness variation only
             print("Augmentations enabled (Grayscale mode):")
             print("  - Brightness variation: 35% (no color augmentation)")
+        else:
+            # RGB mode (default): enable color augmentation
+            hsv_h = 0.015   # Hue variation (color augmentation)
+            hsv_s = 0.4     # Saturation variation
+            hsv_v = 0.35    # Brightness variation
+            print("Augmentations enabled (RGB mode):")
+            print("  - Color augmentation: hue 1.5%, saturation 40%, brightness 35%")
 
         print("  - Geometric: rotation 5deg, translation 5%, scale 10%")
         print(f"  - Horizontal flip: 50% (effectively ~{num_train * 2} augmented samples)")
@@ -398,9 +398,9 @@ def main():
         help="Number of backbone layers to freeze (default: 10 - freeze backbone, train detection head)"
     )
     parser.add_argument(
-        "--rgb",
+        "--grayscale",
         action="store_true",
-        help="Train on RGB images without grayscale + CLAHE preprocessing (for A/B testing)"
+        help="Apply grayscale + CLAHE preprocessing (default is RGB, no preprocessing)"
     )
 
     args = parser.parse_args()
@@ -436,7 +436,7 @@ def main():
             lr=args.lr,
             patience=args.patience,
             freeze=args.freeze,
-            use_rgb=args.rgb
+            use_grayscale=args.grayscale
         )
         return 0
     except Exception as e:

@@ -10,15 +10,15 @@ NOTE: This is for PIECE detection only, not corner detection.
 CLASSIFICATION PRIORITY: This script saves models based on LOWEST cls_loss,
 prioritizing correct piece classification over bbox accuracy.
 
-By default, applies grayscale + CLAHE preprocessing to match inference pipeline.
-Use --rgb flag to train on original RGB images (no preprocessing).
+By default, trains on original RGB images (no preprocessing).
+Use --grayscale flag to apply grayscale + CLAHE preprocessing.
 
 Usage:
-    # Default: grayscale + CLAHE preprocessing (matches existing pipeline)
+    # Default: RGB mode (no preprocessing)
     python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml
 
-    # RGB mode: no preprocessing (for A/B testing)
-    python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml --rgb
+    # Grayscale mode: apply grayscale + CLAHE preprocessing
+    python scripts/finetune_pieces.py --data data/training/piece_dataset/data.yaml --grayscale
 """
 
 import argparse
@@ -102,16 +102,16 @@ class BestClsLossTracker:
         print("=" * 60)
 
 
-def create_preprocessed_dataset(dataset_dir, use_rgb=False):
+def create_preprocessed_dataset(dataset_dir, use_grayscale=False):
     """
     Create preprocessed dataset if needed.
 
-    If use_rgb=False (default), preprocesses images with grayscale + CLAHE to match
-    the inference pipeline. If use_rgb=True, uses original RGB images.
+    By default, uses original RGB images. If use_grayscale=True, preprocesses images
+    with grayscale + CLAHE.
 
     Args:
         dataset_dir: Path to dataset directory containing images/ and labels/
-        use_rgb: If True, use original RGB images; if False, apply grayscale + CLAHE preprocessing
+        use_grayscale: If True, apply grayscale + CLAHE preprocessing; if False (default), use RGB
 
     Returns:
         Tuple of (path to images dir to use, temp_preprocessed_dir or None)
@@ -121,7 +121,7 @@ def create_preprocessed_dataset(dataset_dir, use_rgb=False):
 
     temp_preprocessed_dir = None
 
-    if not use_rgb:
+    if use_grayscale:
         # Apply grayscale + CLAHE preprocessing to temp directory
         temp_preprocessed_dir = dataset_path / "temp_preprocessed" / "images"
 
@@ -167,7 +167,7 @@ def create_preprocessed_dataset(dataset_dir, use_rgb=False):
         return str(dataset_path / "data.yaml"), None
 
 
-def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=1280, use_rgb=False):
+def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=1280, use_grayscale=False):
     """
     Fine-tune piece detection model.
 
@@ -177,9 +177,9 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
         output_dir: Directory for training outputs
         epochs: Number of training epochs
         imgsz: Image size for training (default: 1280 to match 1280x720 camera resolution)
-        use_rgb: If True, train on RGB images without grayscale + CLAHE preprocessing
+        use_grayscale: If True, apply grayscale + CLAHE preprocessing; if False (default), use RGB
     """
-    preprocessing_mode = "RGB (no preprocessing)" if use_rgb else "Grayscale + CLAHE"
+    preprocessing_mode = "Grayscale + CLAHE" if use_grayscale else "RGB (no preprocessing)"
 
     print("=" * 60)
     print("PIECE DETECTION MODEL FINE-TUNING")
@@ -195,7 +195,7 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
 
     # Apply preprocessing if needed
     dataset_dir = Path(data_yaml).parent
-    train_data_yaml, temp_preprocessed_dir = create_preprocessed_dataset(dataset_dir, use_rgb=use_rgb)
+    train_data_yaml, temp_preprocessed_dir = create_preprocessed_dataset(dataset_dir, use_grayscale=use_grayscale)
 
     try:
         # Load base model
@@ -218,20 +218,20 @@ def finetune_piece_model(data_yaml, base_model, output_dir, epochs=100, imgsz=12
         print()
 
         # Set augmentation parameters based on preprocessing mode
-        if use_rgb:
-            # RGB mode: enable color augmentation
-            hsv_h = 0.015   # Hue variation (color augmentation)
-            hsv_s = 0.4     # Saturation variation
-            hsv_v = 0.7     # Strong brightness variation
-            print("CONFIGURATION (RGB mode):")
-            print("  - Color augmentation: hue 1.5%, saturation 40%, brightness 70%")
-        else:
+        if use_grayscale:
             # Grayscale mode: disable hue/saturation (no color in grayscale)
             hsv_h = 0.0     # Disabled - no hue in grayscale images
             hsv_s = 0.0     # Disabled - no saturation in grayscale images
             hsv_v = 0.7     # Strong brightness variation
             print("CONFIGURATION (Grayscale mode):")
             print("  - Brightness augmentation: 70% (no color augmentation)")
+        else:
+            # RGB mode (default): enable color augmentation
+            hsv_h = 0.015   # Hue variation (color augmentation)
+            hsv_s = 0.4     # Saturation variation
+            hsv_v = 0.7     # Strong brightness variation
+            print("CONFIGURATION (RGB mode):")
+            print("  - Color augmentation: hue 1.5%, saturation 40%, brightness 70%")
 
         print("  - Classification priority (cls=1.0, box=0.5)")
         print("  - Maximized augmentation (mosaic=1.0, mixup=0.2)")
@@ -359,9 +359,9 @@ def main():
         help="Image size for training (default: 1280 to match 1280x720 images)"
     )
     parser.add_argument(
-        "--rgb",
+        "--grayscale",
         action="store_true",
-        help="Train on RGB images without grayscale + CLAHE preprocessing (for A/B testing)"
+        help="Apply grayscale + CLAHE preprocessing (default is RGB, no preprocessing)"
     )
 
     args = parser.parse_args()
@@ -394,7 +394,7 @@ def main():
             output_dir=str(output_dir),
             epochs=args.epochs,
             imgsz=args.imgsz,
-            use_rgb=args.rgb
+            use_grayscale=args.grayscale
         )
         return 0
     except Exception as e:

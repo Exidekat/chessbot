@@ -210,7 +210,7 @@ Download with `python download.py` on first run.
 
 1. **Corner Detection** (YOLO stage 1)
    - Input: 1280x720 board image (from 720p YUYV by default, or 4K MJPEG downscale with --mjpeg)
-   - Preprocessing: Grayscale conversion + CLAHE contrast normalization (must match training data)
+   - Preprocessing: RGB by default (use `--corner-grayscale` for grayscale+CLAHE)
    - Output: 4 corners (TL, TR, BR, BL)
    - Params: `corner_conf=0.005`, `min_corner_distance=30.0`
 
@@ -220,7 +220,7 @@ Download with `python download.py` on first run.
 
 3. **Piece Detection** (YOLO stage 2)
    - Input: Transformed board image
-   - Preprocessing: Grayscale conversion + CLAHE contrast normalization (must match training data)
+   - Preprocessing: RGB by default (use `--piece-grayscale` for grayscale+CLAHE)
    - Output: Piece bounding boxes + class (0-11: b-bishop to W-Rook)
    - Params: `base_conf=0.35`, `pawn_threshold=0.45` (higher to reduce misclassification)
 
@@ -608,8 +608,9 @@ This means we should have exactly 2 lines per script usage. Some scripts may hav
     - **Real-time VLA**: Native 720p MJPEG at 30fps for low latency. Used by `LiveCameraCapture` class during episode recording and VLA inference control loops.
   - **Default capture mode**: Controlled by `DEFAULT_USE_YUYV` in `utils/camera_helpers.py`. Currently set to `True` (YUYV default).
   - **Gripper Camera (eMeet C950)**: Captures at 640x480, then resized to 224x224 for VLA input. Most cameras don't natively support 224x224.
-- Both corner detection and piece detection use grayscale + CLAHE preprocessing. Training images must be preprocessed before labeling:
-  - Corner detection: Use `preprocess_for_corner_detection()` (handled automatically by `label_corners.py`)
-  - Piece detection: Use `preprocess_for_piece_detection()` (handled automatically by `label_pieces.py`)
-  - Existing piece datasets can be converted with `scripts/convert_piece_dataset.py`
+- Detection preprocessing modes:
+  - **RGB (Default)**: Both corner and piece detection use original RGB images by default. This was determined to perform better through A/B testing.
+  - **Grayscale + CLAHE**: Use `--corner-grayscale` and/or `--piece-grayscale` flags to enable grayscale preprocessing.
+  - Labeling scripts (`label_corners.py`, `label_pieces.py`) save original RGB images. Preprocessing is applied during training if `--grayscale` flag is used.
+  - Existing grayscale datasets can be migrated to RGB with `scripts/migrate_dataset_to_rgb.py`
 - All YOLO detection (corners and pieces) uses 1280x720 images for consistency with training data.

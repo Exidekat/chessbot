@@ -146,8 +146,8 @@ class EpisodeRecorder:
         camera_rotation: str = "right",
         turn: str = "black",
         use_yuyv: bool = False,
-        use_corner_rgb: bool = False,
-        use_piece_rgb: bool = False,
+        use_corner_grayscale: bool = False,
+        use_piece_grayscale: bool = False,
     ):
         """
         Initialize episode recorder.
@@ -161,6 +161,8 @@ class EpisodeRecorder:
             engine_path: Path to UCI chess engine
             camera_rotation: Camera rotation ('top', 'right', 'bottom', 'left')
             turn: Whose turn to calculate move for ('white' or 'black')
+            use_corner_grayscale: If True, use grayscale+CLAHE for corner detection (default is RGB)
+            use_piece_grayscale: If True, use grayscale+CLAHE for piece detection (default is RGB)
         """
         self.output_dir = Path(output_dir)
 
@@ -177,16 +179,16 @@ class EpisodeRecorder:
         self.cache = StateCache("data/state_cache.json")
         self.keyboard = KeyboardInput()
 
-        # Store RGB mode settings
-        self.use_corner_rgb = use_corner_rgb
-        self.use_piece_rgb = use_piece_rgb
+        # Store grayscale mode settings
+        self.use_corner_grayscale = use_corner_grayscale
+        self.use_piece_grayscale = use_piece_grayscale
 
         # Initialize guidance components
         self.detector = BoardDetector(
             corner_model_path="data/best_corners.pt",
             piece_model_path="data/best_transformed_detection.pt",
-            use_corner_rgb=use_corner_rgb,
-            use_piece_rgb=use_piece_rgb,
+            use_corner_rgb=not use_corner_grayscale,
+            use_piece_rgb=not use_piece_grayscale,
         )
         self.calculator = MoveCalculator(engine_path=engine_path)
 
@@ -1096,14 +1098,14 @@ Examples:
         help="Enable debug mode (verbose SVT-AV1 encoder output)"
     )
     parser.add_argument(
-        "--corner-rgb",
+        "--corner-grayscale",
         action="store_true",
-        help="Use RGB for corner detection (no grayscale+CLAHE preprocessing)"
+        help="Use grayscale+CLAHE for corner detection (default is RGB)"
     )
     parser.add_argument(
-        "--piece-rgb",
+        "--piece-grayscale",
         action="store_true",
-        help="Use RGB for piece detection (no grayscale+CLAHE preprocessing)"
+        help="Use grayscale+CLAHE for piece detection (default is RGB)"
     )
 
     args = parser.parse_args()
@@ -1162,8 +1164,8 @@ Examples:
     # Create recorder
     capture_mode_str = "720p YUYV" if use_yuyv else "4K MJPEG -> 720p"
     print(f"[OK] Board capture mode: {capture_mode_str}")
-    corner_mode = "RGB" if args.corner_rgb else "grayscale+CLAHE"
-    piece_mode = "RGB" if args.piece_rgb else "grayscale+CLAHE"
+    corner_mode = "grayscale+CLAHE" if args.corner_grayscale else "RGB"
+    piece_mode = "grayscale+CLAHE" if args.piece_grayscale else "RGB"
     print(f"[OK] Corner preprocessing: {corner_mode}")
     print(f"[OK] Piece preprocessing: {piece_mode}")
 
@@ -1177,8 +1179,8 @@ Examples:
         camera_rotation=args.rotation,
         turn=args.turn,
         use_yuyv=use_yuyv,
-        use_corner_rgb=args.corner_rgb,
-        use_piece_rgb=args.piece_rgb,
+        use_corner_grayscale=args.corner_grayscale,
+        use_piece_grayscale=args.piece_grayscale,
     )
 
     # Run collection loop

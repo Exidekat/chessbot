@@ -30,8 +30,8 @@ class BoardDetector:
         corner_model_path: str = "data/best_corners.pt",
         piece_model_path: str = "data/best_transformed_detection.pt",
         camera_position: str = "right",
-        use_corner_rgb: bool = False,
-        use_piece_rgb: bool = False,
+        use_corner_rgb: bool = True,
+        use_piece_rgb: bool = True,
     ):
         """
         Initialize the BoardDetector.
@@ -40,8 +40,10 @@ class BoardDetector:
             corner_model_path: Path to the YOLO corner detection model
             piece_model_path: Path to the YOLO piece detection model
             camera_position: Camera position relative to board ('top', 'right', 'bottom', 'left')
-            use_corner_rgb: If True, use RGB for corner detection (no grayscale+CLAHE preprocessing)
-            use_piece_rgb: If True, use RGB for piece detection (no grayscale+CLAHE preprocessing)
+            use_corner_rgb: If True (default), use RGB for corner detection.
+                           If False, apply grayscale+CLAHE preprocessing.
+            use_piece_rgb: If True (default), use RGB for piece detection.
+                          If False, apply grayscale+CLAHE preprocessing.
         """
         self.corner_model_path = Path(corner_model_path)
         self.piece_model_path = Path(piece_model_path)

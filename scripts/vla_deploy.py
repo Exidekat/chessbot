@@ -917,14 +917,14 @@ def main():
         help="Global camera tiling mode (auto-detects from checkpoint if not set)"
     )
     parser.add_argument(
-        "--corner-rgb",
+        "--corner-grayscale",
         action="store_true",
-        help="Use RGB for corner detection (no grayscale+CLAHE preprocessing)"
+        help="Use grayscale+CLAHE for corner detection (default is RGB)"
     )
     parser.add_argument(
-        "--piece-rgb",
+        "--piece-grayscale",
         action="store_true",
-        help="Use RGB for piece detection (no grayscale+CLAHE preprocessing)"
+        help="Use grayscale+CLAHE for piece detection (default is RGB)"
     )
 
     args = parser.parse_args()
@@ -1171,12 +1171,12 @@ def main():
 
     detector = BoardDetector(
         camera_position=args.rotation,
-        use_corner_rgb=args.corner_rgb,
-        use_piece_rgb=args.piece_rgb,
+        use_corner_rgb=not args.corner_grayscale,
+        use_piece_rgb=not args.piece_grayscale,
     )
     print(f"[OK] BoardDetector initialized (rotation: {args.rotation})")
-    corner_mode = "RGB" if args.corner_rgb else "grayscale+CLAHE"
-    piece_mode = "RGB" if args.piece_rgb else "grayscale+CLAHE"
+    corner_mode = "grayscale+CLAHE" if args.corner_grayscale else "RGB"
+    piece_mode = "grayscale+CLAHE" if args.piece_grayscale else "RGB"
     print(f"     Corner preprocessing: {corner_mode}")
     print(f"     Piece preprocessing: {piece_mode}")
 
