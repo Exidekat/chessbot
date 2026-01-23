@@ -204,7 +204,7 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
         print(f"  - Early stopping patience: {patience} epochs")
         print()
         print("Augmentations enabled:")
-        print("  - Brightness variation: 70% (strong - handles lighting changes)")
+        print("  - Brightness variation: 35% (moderate - handles lighting changes)")
         print("  - Color jitter: hue 1.5%, saturation 40%")
         print("  - Geometric: rotation 5deg, translation 5%, scale 10%")
         print(f"  - Horizontal flip: 50% (effectively ~{num_train * 2} augmented samples)")
@@ -235,7 +235,7 @@ def finetune_corner_model(data_yaml, base_model, output_dir, epochs=50, imgsz=12
             # NOTE: hsv_h and hsv_s disabled because training uses grayscale + CLAHE preprocessing
             hsv_h=0.0,    # Disabled - no hue in grayscale images
             hsv_s=0.0,    # Disabled - no saturation in grayscale images
-            hsv_v=0.7,    # STRONG brightness/value variation (simulates darker/brighter lighting)
+            hsv_v=0.35,   # Moderate brightness/value variation (simulates lighting changes)
 
             # Additional augmentations
             degrees=5.0,      # Small rotation (board may not be perfectly aligned)
