@@ -708,8 +708,9 @@ class EpisodeRecorder:
 
                 # Stream frame to temp file instead of accumulating in memory
                 # This keeps memory usage constant regardless of recording length
+                # Using uncompressed saves for speed (~15 FPS vs ~5 FPS with compression)
                 temp_path = temp_dir / f"frame_{frame_count:06d}.npz"
-                np.savez_compressed(
+                np.savez(
                     temp_path,
                     global_frame=overlayed_frame,
                     gripper_frame=gripper_frame,
@@ -893,39 +894,54 @@ class EpisodeRecorder:
                     if key != 'ENTER':
                         continue
 
-                    # Capture board image using 4K MJPEG -> 720p downscale
-                    # This matches the training data pipeline for consistent detection
-                    board_image_path = Path("data/board_capture.png")
+                    # Retry loop for board capture and detection
+                    # Automatically retries on engine crashes or detection failures
+                    max_retries = 3
+                    move_info = None
 
-                    # Stop live capture to release camera for 4K capture
-                    print("[INFO] Stopping live capture for board detection...")
-                    self.global_cam_capture.stop()
-                    time.sleep(0.5)  # Allow camera to fully release
+                    for attempt in range(max_retries):
+                        if attempt > 0:
+                            print(f"\n[INFO] Retry attempt {attempt + 1}/{max_retries}...")
+                            time.sleep(1.0)  # Brief delay before retry
 
-                    # Capture board image for detection
-                    if self.use_yuyv:
-                        success = capture_720p_yuyv(self.global_camera_device, board_image_path)
-                        capture_mode = "720p YUYV"
-                    else:
-                        success = capture_4k_downscale(self.global_camera_device, board_image_path)
-                        capture_mode = "4K -> 720p"
+                        # Capture board image using 4K MJPEG -> 720p downscale
+                        # This matches the training data pipeline for consistent detection
+                        board_image_path = Path("data/board_capture.png")
 
-                    # Restart live capture for episode recording
-                    print("[INFO] Restarting live capture...")
-                    self.global_cam_capture.start()
-                    time.sleep(1.0)  # Allow camera to reinitialize
+                        # Stop live capture to release camera for 4K capture
+                        print("[INFO] Stopping live capture for board detection...")
+                        self.global_cam_capture.stop()
+                        time.sleep(0.5)  # Allow camera to fully release
 
-                    if not success:
-                        print("[ERROR] Failed to capture board image")
-                        continue
+                        # Capture board image for detection
+                        if self.use_yuyv:
+                            success = capture_720p_yuyv(self.global_camera_device, board_image_path)
+                            capture_mode = "720p YUYV"
+                        else:
+                            success = capture_4k_downscale(self.global_camera_device, board_image_path)
+                            capture_mode = "4K -> 720p"
 
-                    print(f"[OK] Board image captured: {board_image_path} ({capture_mode})")
+                        # Restart live capture for episode recording
+                        print("[INFO] Restarting live capture...")
+                        self.global_cam_capture.start()
+                        time.sleep(1.0)  # Allow camera to reinitialize
 
-                    # Detect and decompose move
-                    move_info = self._detect_and_decompose_move(str(board_image_path))
+                        if not success:
+                            print("[ERROR] Failed to capture board image")
+                            continue  # Retry capture
+
+                        print(f"[OK] Board image captured: {board_image_path} ({capture_mode})")
+
+                        # Detect and decompose move
+                        move_info = self._detect_and_decompose_move(str(board_image_path))
+
+                        if move_info is not None:
+                            break  # Success, exit retry loop
+
+                        print("[ERROR] Failed to process board, retrying...")
 
                     if move_info is None:
-                        print("[ERROR] Failed to process board, try again")
+                        print(f"[ERROR] Failed after {max_retries} attempts, press ENTER to try again")
                         continue
 
                     # Record each stage as its own episode
