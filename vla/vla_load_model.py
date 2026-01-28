@@ -24,7 +24,7 @@ try:
     from transformers import AutoTokenizer
 except ImportError as e:
     print(f"[X] Failed to import required packages: {e}")
-    print("    Run: conda activate ltx && pip install lerobot transformers")
+    print("    Run: conda activate cb && pip install lerobot transformers")
     sys.exit(1)
 
 

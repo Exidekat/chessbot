@@ -186,6 +186,7 @@ class ChessEpisodeDataset(Dataset):
                     repo_id="local/chess_episodes",
                     root=self.dataset_path,
                     video_backend=video_backend,
+                    revision="main",  # Bypass HF Hub version check for local datasets
                 )
                 print(f"[OK] Using {video_backend} video backend")
             except Exception as e:
@@ -196,6 +197,7 @@ class ChessEpisodeDataset(Dataset):
                         repo_id="local/chess_episodes",
                         root=self.dataset_path,
                         video_backend="pyav",
+                        revision="main",  # Bypass HF Hub version check for local datasets
                     )
                     self.video_backend = "pyav"
                 else:
@@ -206,6 +208,7 @@ class ChessEpisodeDataset(Dataset):
             self.lerobot_dataset = LeRobotDataset(
                 repo_id="local/chess_episodes",
                 root=self.dataset_path,
+                revision="main",  # Bypass HF Hub version check for local datasets
             )
             self.video_backend = None
             print(f"[OK] Using PNG image backend (no video decoding)")

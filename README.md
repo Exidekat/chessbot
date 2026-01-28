@@ -22,8 +22,8 @@ ChessBot provides a complete software stack for autonomous chess-playing robots:
 git clone --recurse-submodules https://github.com/Exidekat/chessbot
 cd chessbot
 
-# Install dependencies (to ltx conda environment)
-conda activate ltx
+# Install dependencies (to cb conda environment)
+conda activate cb
 pip install -r requirements.txt
 
 # Download YOLO models
@@ -284,8 +284,8 @@ sudo usermod -a -G dialout $USER
 
 ### Import Errors
 ```bash
-# Ensure ltx environment
-conda activate ltx
+# Ensure cb environment
+conda activate cb
 pip install -r requirements.txt
 ```
 

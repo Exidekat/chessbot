@@ -1,5 +1,5 @@
-# OpenPI Dependencies for Conda ltx Environment
-# Install with: conda activate ltx && pip install -r vla/openpi_requirements.txt
+# OpenPI Dependencies for Conda cb Environment
+# Install with: conda activate cb && pip install -r vla/openpi_requirements.txt
 
 # Core OpenPI dependencies
 augmax>=0.3.4

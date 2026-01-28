@@ -23,7 +23,7 @@ try:
     from lerobot.configs.types import PolicyFeature, FeatureType
 except ImportError as e:
     print(f"[X] Failed to import SmolVLA dependencies: {e}")
-    print("    Run: conda activate ltx && pip install lerobot")
+    print("    Run: conda activate cb && pip install lerobot")
     sys.exit(1)
 
 from .registry import register_model

@@ -17,7 +17,7 @@ The VLA (Vision-Language-Action) approach represents the evolution beyond symbol
 git submodule update --init --recursive
 
 # 2. Install OpenPI dependencies (CONDA-SAFE METHOD)
-conda activate ltx
+conda activate cb
 pip install -r vla/openpi_requirements.txt
 pip install -e submodules/openpi/packages/openpi-client/
 pip install -e submodules/openpi/

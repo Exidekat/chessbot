@@ -51,7 +51,7 @@ echo ""
 if [ -z "$CONDA_DEFAULT_ENV" ]; then
     echo_warn "No conda environment active."
     echo_warn "Please activate your conda environment first:"
-    echo "    conda activate ltx"
+    echo "    conda activate cb"
     echo ""
     read -p "Continue anyway? (y/N) " -n 1 -r
     echo

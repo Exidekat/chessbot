@@ -10,9 +10,9 @@ ChessBot is a modular chess robot system with YOLO-based computer vision, multi-
 
 ## Environment Setup
 
-- **Python Environment**: Always use the 'ltx' conda environment for testing
-- **Package Installation**: Install packages to 'ltx' environment, never 'base'
-- If import errors occur, update requirements.txt and request user to install to ltx environment
+- **Python Environment**: Always use the 'cb' conda environment for testing
+- **Package Installation**: Install packages to 'cb' environment, never 'base'
+- If import errors occur, update requirements.txt and request user to install to cb environment
 - **Git Submodules**: This project uses git submodules for external dependencies
   - `submodules/openpi`: Physical Intelligence's π₀ VLA model (vision-language-action)
   - `submodules/real-life-chess-vision`: Original chess vision reference
@@ -510,8 +510,8 @@ The π₀ model is integrated via git submodule at `submodules/openpi/`:
 # Initialize OpenPI submodule (first time)
 git submodule update --init --recursive
 
-# Install OpenPI dependencies to ltx conda environment (CONDA-SAFE METHOD)
-conda activate ltx
+# Install OpenPI dependencies to cb conda environment (CONDA-SAFE METHOD)
+conda activate cb
 pip install -r vla/openpi_requirements.txt
 pip install -e submodules/openpi/packages/openpi-client/
 pip install -e submodules/openpi/
@@ -525,7 +525,7 @@ python vla/verify_openpi.py
 **Requirements:**
 - GPU: NVIDIA with >8GB VRAM for inference, >22.5GB for LoRA fine-tuning
 - OS: Ubuntu 22.04 (tested)
-- Python: 3.11+ (installed in ltx conda environment)
+- Python: 3.11+ (installed in cb conda environment)
 - CUDA: 12.x (for JAX/PyTorch GPU support)
 
 **Model Variants:**
@@ -572,7 +572,7 @@ python download.py
 
 **Import Errors**:
 - Check requirements.txt has the package
-- Install to ltx environment: `conda activate ltx && pip install -r requirements.txt`
+- Install to cb environment: `conda activate cb && pip install -r requirements.txt`
 
 **Low Detection Accuracy**:
 - Use `--debug` flag to inspect visualizations

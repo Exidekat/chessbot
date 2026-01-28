@@ -90,7 +90,7 @@ try:
     print("[OK] PyTorch import successful")
 except ImportError as e:
     print(f"[X] Failed to import PyTorch: {e}")
-    print("    Run: conda activate ltx && pip install torch")
+    print("    Run: conda activate cb && pip install torch")
     sys.exit(1)
 
 # Helper function for preprocessing observations

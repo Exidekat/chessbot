@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify OpenPI installation in ltx conda environment."""
+"""Verify OpenPI installation in cb conda environment."""
 
 import sys
 
@@ -20,7 +20,7 @@ def check_import(module_name, display_name=None):
 def main():
     """Run verification checks."""
     print("=" * 60)
-    print("OpenPI Installation Verification (ltx environment)")
+    print("OpenPI Installation Verification (cb environment)")
     print("=" * 60)
     print()
 
@@ -70,7 +70,7 @@ def main():
         print("[X] Some dependencies failed to install")
         print()
         print("Troubleshooting:")
-        print("  1. Ensure you're in the ltx conda environment: conda activate ltx")
+        print("  1. Ensure you're in the cb conda environment: conda activate cb")
         print("  2. Install dependencies: pip install -r vla/openpi_requirements.txt")
         print("  3. Install openpi-client: pip install -e submodules/openpi/packages/openpi-client/")
         print("  4. Install openpi: pip install -e submodules/openpi/")

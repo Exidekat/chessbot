@@ -5,8 +5,11 @@ torch>=2.0.0  # PyTorch for YOLO models
 ultralytics>=8.0.0  # YOLOv8 implementation
 opencv-python>=4.8.0  # OpenCV for image processing
 pillow>=10.0.0  # Image loading and manipulation
-lerobot
-transformers
+lerobot[pi]
+# PI05 requires patched transformers from lerobot branch (NOT standard PyPI version)
+# If transformers check fails, manually install:
+#   pip install "git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi"
+transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi
 pyserial
 
 # Computational Geometry
