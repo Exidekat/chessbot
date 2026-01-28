@@ -769,6 +769,115 @@ class EpisodeValidator:
         with open(quality_file, 'w') as f:
             json.dump(self.episode_qualities, f, indent=2)
 
+    def _rebuild_lerobot_after_deletion(self, deleted_indices: List[int]):
+        """
+        Rebuild LeRobot parquet files after episode deletion.
+
+        This removes deleted episodes from:
+        - data/chunk-*/file-*.parquet (frame data)
+        - meta/episodes/chunk-*/file-*.parquet (episode metadata)
+        - meta/info.json (totals)
+
+        Args:
+            deleted_indices: List of episode indices that were deleted
+        """
+        import pandas as pd
+
+        if not deleted_indices:
+            return
+
+        deleted_set = set(deleted_indices)
+        print(f"[INFO] Rebuilding LeRobot dataset (removing {len(deleted_indices)} episodes)...")
+
+        # 1. Rebuild data parquet files
+        data_dir = self.dataset_path / "data"
+        data_files = sorted(data_dir.glob("chunk-*/file-*.parquet"))
+
+        for data_file in data_files:
+            try:
+                df = pd.read_parquet(data_file)
+                original_len = len(df)
+
+                # Filter out deleted episodes
+                df = df[~df["episode_index"].isin(deleted_set)]
+
+                if len(df) < original_len:
+                    if len(df) == 0:
+                        # Delete empty file
+                        data_file.unlink()
+                        print(f"[INFO] Removed empty data file: {data_file.name}")
+                    else:
+                        # Rewrite filtered data
+                        df.to_parquet(data_file, index=False)
+                        print(f"[INFO] Updated {data_file.name}: {original_len} -> {len(df)} rows")
+            except Exception as e:
+                print(f"[WARNING] Failed to update {data_file}: {e}")
+
+        # 2. Rebuild meta/episodes parquet files
+        episodes_dir = self.dataset_path / "meta" / "episodes"
+        ep_files = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
+
+        for ep_file in ep_files:
+            try:
+                df = pd.read_parquet(ep_file)
+                original_len = len(df)
+
+                # Filter out deleted episodes
+                df = df[~df["episode_index"].isin(deleted_set)]
+
+                if len(df) < original_len:
+                    if len(df) == 0:
+                        # Delete empty file
+                        ep_file.unlink()
+                        print(f"[INFO] Removed empty episode file: {ep_file.name}")
+                    else:
+                        # Rewrite filtered data
+                        df.to_parquet(ep_file, index=False)
+                        print(f"[INFO] Updated {ep_file.name}: {original_len} -> {len(df)} episodes")
+            except Exception as e:
+                print(f"[WARNING] Failed to update {ep_file}: {e}")
+
+        # 3. Update meta/info.json
+        info_path = self.dataset_path / "meta" / "info.json"
+        if info_path.exists():
+            try:
+                with open(info_path, 'r') as f:
+                    info = json.load(f)
+
+                old_total = info.get("total_episodes", 0)
+                info["total_episodes"] = old_total - len(deleted_indices)
+
+                # Recalculate total frames if present
+                if "total_frames" in info:
+                    # Read remaining data to count frames
+                    total_frames = 0
+                    for data_file in data_dir.glob("chunk-*/file-*.parquet"):
+                        try:
+                            df = pd.read_parquet(data_file)
+                            total_frames += len(df)
+                        except:
+                            pass
+                    info["total_frames"] = total_frames
+
+                with open(info_path, 'w') as f:
+                    json.dump(info, f, indent=2)
+
+                print(f"[INFO] Updated info.json: {old_total} -> {info['total_episodes']} episodes")
+
+            except Exception as e:
+                print(f"[WARNING] Failed to update info.json: {e}")
+
+        # 4. Clean up empty chunk directories
+        for subdir in ["data", "videos/observation.images.global", "videos/observation.images.gripper", "meta/episodes"]:
+            target_dir = self.dataset_path / subdir
+            if target_dir.exists():
+                for chunk_dir in target_dir.glob("chunk-*"):
+                    if chunk_dir.is_dir() and not any(chunk_dir.iterdir()):
+                        chunk_dir.rmdir()
+                        print(f"[INFO] Removed empty directory: {chunk_dir}")
+
+        print("[OK] LeRobot dataset rebuild complete")
+
     def delete_bad_episodes(self, confirm: bool = True) -> int:
         """
         Delete all episodes marked as bad.
@@ -794,6 +903,7 @@ class EpisodeValidator:
                 return 0
 
         deleted = 0
+        deleted_lerobot_indices = []  # Track LeRobot episodes for parquet rebuild
 
         for ep_idx in bad_episodes:
             # Find episode
@@ -815,11 +925,37 @@ class EpisodeValidator:
                 except Exception as e:
                     print(f"[ERROR] Failed to delete {ep_dir}: {e}")
 
+            elif episode["format"] == "lerobot":
+                # For LeRobot format, delete the video files for this episode
+                try:
+                    videos_deleted = 0
+                    for video_key in ["observation.images.global", "observation.images.gripper"]:
+                        chunk_key = f"videos/{video_key}/chunk_index"
+                        file_key = f"videos/{video_key}/file_index"
+                        chunk_idx = episode.get(chunk_key, 0)
+                        file_idx = episode.get(file_key, 0)
+
+                        video_path = self.dataset_path / "videos" / video_key / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
+                        if video_path.exists():
+                            video_path.unlink()
+                            videos_deleted += 1
+
+                    print(f"[OK] Deleted episode {ep_idx} ({videos_deleted} video files)")
+                    deleted += 1
+                    deleted_lerobot_indices.append(ep_idx)
+
+                except Exception as e:
+                    print(f"[ERROR] Failed to delete LeRobot episode {ep_idx}: {e}")
+
             # Remove from qualities
             del self.episode_qualities[ep_idx]
 
         # Save updated qualities
         self._save_qualities()
+
+        # Rebuild LeRobot parquet files if any LeRobot episodes were deleted
+        if deleted_lerobot_indices:
+            self._rebuild_lerobot_after_deletion(deleted_lerobot_indices)
 
         # Reload dataset
         self.episodes = []
@@ -912,6 +1048,52 @@ class EpisodeValidator:
         print(f"{'='*90}")
         print(f"Total: {len(self.episodes)} episodes\n")
 
+    def _parse_indices(self, args: List[str]) -> List[int]:
+        """
+        Parse episode indices from command arguments.
+
+        Supports multiple formats:
+        - Single: "17"
+        - Multiple: "17 18 19 20"
+        - Range: "17-38"
+        - Python list: "[17, 18, 19]" or "17, 18, 19"
+
+        Args:
+            args: List of string arguments after the command
+
+        Returns:
+            List of parsed integer indices
+        """
+        indices = []
+
+        # Join args and clean up Python list syntax
+        combined = " ".join(args)
+        combined = combined.replace("[", "").replace("]", "").replace(",", " ")
+
+        for part in combined.split():
+            part = part.strip()
+            if not part:
+                continue
+
+            # Check for range syntax (e.g., "17-38")
+            if "-" in part and not part.startswith("-"):
+                try:
+                    start, end = part.split("-", 1)
+                    start, end = int(start), int(end)
+                    if start <= end:
+                        indices.extend(range(start, end + 1))
+                    else:
+                        indices.extend(range(start, end - 1, -1))
+                except ValueError:
+                    print(f"[WARNING] Invalid range: {part}")
+            else:
+                try:
+                    indices.append(int(part))
+                except ValueError:
+                    print(f"[WARNING] Invalid index: {part}")
+
+        return indices
+
     def run_interactive_review(self):
         """Run interactive episode review loop."""
         print(f"\n{'='*60}")
@@ -923,14 +1105,14 @@ class EpisodeValidator:
             return
 
         print("Commands:")
-        print("  l        - List all episodes")
-        print("  i <idx>  - Show episode info")
-        print("  p <idx>  - Playback episode")
-        print("  g <idx>  - Mark episode as good")
-        print("  b <idx>  - Mark episode as bad")
-        print("  d        - Delete all bad episodes")
-        print("  e <path> - Export good episodes to path")
-        print("  q        - Quit")
+        print("  l            - List all episodes")
+        print("  i <idx>      - Show episode info")
+        print("  p <idx>      - Playback episode")
+        print("  g <indices>  - Mark episode(s) as good (e.g., g 5 or g 1-10 or g 1 2 3)")
+        print("  b <indices>  - Mark episode(s) as bad (e.g., b 5 or b 17-38 or b 17 18 19)")
+        print("  d            - Delete all bad episodes")
+        print("  e <path>     - Export good episodes to path")
+        print("  q            - Quit")
         print()
 
         while True:
@@ -966,17 +1148,19 @@ class EpisodeValidator:
 
                 elif action == 'g' or action == 'good':
                     if len(parts) < 2:
-                        print("[ERROR] Usage: g <episode_index>")
+                        print("[ERROR] Usage: g <idx> or g <idx1> <idx2> ... or g <start>-<end>")
                         continue
-                    ep_idx = int(parts[1])
-                    self.mark_episode(ep_idx, "good")
+                    indices = self._parse_indices(parts[1:])
+                    for ep_idx in indices:
+                        self.mark_episode(ep_idx, "good")
 
                 elif action == 'b' or action == 'bad':
                     if len(parts) < 2:
-                        print("[ERROR] Usage: b <episode_index>")
+                        print("[ERROR] Usage: b <idx> or b <idx1> <idx2> ... or b <start>-<end>")
                         continue
-                    ep_idx = int(parts[1])
-                    self.mark_episode(ep_idx, "bad")
+                    indices = self._parse_indices(parts[1:])
+                    for ep_idx in indices:
+                        self.mark_episode(ep_idx, "bad")
 
                 elif action == 'd' or action == 'delete':
                     self.delete_bad_episodes()
