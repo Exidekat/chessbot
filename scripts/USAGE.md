@@ -151,23 +151,39 @@ python scripts/collect_vla_episodes.py --output data/episodes/ --no-lerobot
 
 ## VLA Episode Validation (Training Data Review)
 
-# Interactive episode review (list, info, playback, mark good/bad, export)
-python scripts/validate_vla_episodes.py --dataset data/episodes/
+# Interactive episode review (list, info, playback, mark good/bad, export, execute)
+# Default dataset path is data/lerobot_episodes/
+python scripts/validate_vla_episodes.py
 
 # List all episodes with basic info
-python scripts/validate_vla_episodes.py --dataset data/episodes/ --list
+python scripts/validate_vla_episodes.py --list
 
 # Show detailed info for specific episode
-python scripts/validate_vla_episodes.py --dataset data/episodes/ --info 0
+python scripts/validate_vla_episodes.py --info 0
 
-# Playback specific episode (controls: SPACE=pause, A/D=seek, W/S=speed, Q=quit)
-python scripts/validate_vla_episodes.py --dataset data/episodes/ --play 0
+# Playback specific episode video (controls: SPACE=pause, A/D=seek, W/S=speed, Q=quit)
+python scripts/validate_vla_episodes.py --play 0
+
+# Execute episode on robot hardware (replays recorded actions)
+python scripts/validate_vla_episodes.py --execute 0
+
+# Execute at half speed (safer for testing)
+python scripts/validate_vla_episodes.py --execute 0 --speed 0.5
+
+# Dry run (simulate execution without robot)
+python scripts/validate_vla_episodes.py --execute 0 --dry-run
+
+# Execute with specific robot port
+python scripts/validate_vla_episodes.py --execute 0 --robot-port /dev/ttyACM0
+
+# Use custom dataset path
+python scripts/validate_vla_episodes.py --dataset data/my_episodes/
 
 # Export good episodes only to new directory
-python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/episodes_filtered/
+python scripts/validate_vla_episodes.py --export data/episodes_filtered/
 
 # Force raw file mode (disable LeRobot)
-python scripts/validate_vla_episodes.py --dataset data/episodes/ --no-lerobot
+python scripts/validate_vla_episodes.py --no-lerobot
 
 ## LeRobot Dataset Management
 

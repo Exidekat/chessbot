@@ -2,30 +2,45 @@
 """
 VLA Episode Validation Tool
 
-Review, playback, and filter collected VLA episodes.
+Review, playback, filter, and execute collected VLA episodes.
 Supports both LeRobot dataset format and raw file storage.
 
 Features:
 - Episode information display (metadata, statistics)
 - Video playback with controls (pause, speed, seek)
+- Action playback on physical SO-100 robot
 - Quality control (mark good/bad, delete bad episodes)
 - Export filtered dataset
 
 Usage:
-    # Interactive review
-    python scripts/validate_vla_episodes.py --dataset data/episodes/
+    # Interactive review (default dataset: data/lerobot_episodes/)
+    python scripts/validate_vla_episodes.py
 
     # Export good episodes only
-    python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/episodes_filtered/
+    python scripts/validate_vla_episodes.py --export data/episodes_filtered/
 
     # List all episodes
-    python scripts/validate_vla_episodes.py --dataset data/episodes/ --list
+    python scripts/validate_vla_episodes.py --list
+
+    # Execute episode on robot hardware
+    python scripts/validate_vla_episodes.py --execute 0
+
+    # Execute at half speed (safety mode)
+    python scripts/validate_vla_episodes.py --execute 0 --speed 0.5
+
+    # Dry run (simulate without robot)
+    python scripts/validate_vla_episodes.py --execute 0 --dry-run
 """
 
 import argparse
 import json
+import os
 import shutil
 import time
+
+# Suppress Qt font warnings from OpenCV before importing cv2
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts=false"
+
 import cv2
 import numpy as np
 from pathlib import Path
@@ -41,6 +56,14 @@ try:
     LEROBOT_AVAILABLE = True
 except ImportError:
     LEROBOT_AVAILABLE = False
+
+# Try to import robot control (optional dependency for action playback)
+try:
+    from controls.robot_controller import RobotController, load_joint_configs_for_port
+    from controls.so100_arm import SO100State
+    ROBOT_AVAILABLE = True
+except ImportError:
+    ROBOT_AVAILABLE = False
 
 
 class EpisodeValidator:
@@ -73,6 +96,10 @@ class EpisodeValidator:
         # Playback state
         self.current_speed_idx = 2  # Default 1.0x
         self.paused = False
+
+        # Robot control for action playback (optional)
+        self.robot_controller: Optional['RobotController'] = None
+        self.robot_port: Optional[str] = None
 
         # Load dataset
         self._load_dataset()
@@ -401,6 +428,305 @@ class EpisodeValidator:
 
         print(f"{'='*60}\n")
 
+    def _connect_robot(self, port: Optional[str] = None) -> bool:
+        """
+        Connect to SO-100 robot for action playback.
+
+        Args:
+            port: Serial port (auto-detect/prompt if None)
+
+        Returns:
+            bool: True if connection successful
+        """
+        if not ROBOT_AVAILABLE:
+            print("[ERROR] Robot control not available - controls module not found")
+            return False
+
+        # Auto-detect port if not specified
+        if port is None:
+            available_ports = []
+            for i in range(10):
+                test_port = f"/dev/ttyACM{i}"
+                if os.path.exists(test_port):
+                    available_ports.append(test_port)
+
+            if len(available_ports) == 0:
+                print("[ERROR] No robot port found (checked /dev/ttyACM0-9)")
+                return False
+            elif len(available_ports) == 1:
+                port = available_ports[0]
+                print(f"[INFO] Auto-selected robot port: {port}")
+            else:
+                # Multiple ports found - prompt user to select
+                print(f"\n[INFO] Multiple robot ports found:")
+                for i, p in enumerate(available_ports):
+                    # Check for port-specific config
+                    port_name = p.split('/')[-1]
+                    config_path = Path("data") / f"so100_config_{port_name}.csv"
+                    config_status = "(has config)" if config_path.exists() else "(no config)"
+                    print(f"  [{i}] {p} {config_status}")
+
+                while True:
+                    try:
+                        selection = input(f"Select port [0-{len(available_ports)-1}]: ").strip()
+                        idx = int(selection)
+                        if 0 <= idx < len(available_ports):
+                            port = available_ports[idx]
+                            break
+                        else:
+                            print(f"[ERROR] Invalid selection. Enter 0-{len(available_ports)-1}")
+                    except ValueError:
+                        print(f"[ERROR] Invalid input. Enter a number 0-{len(available_ports)-1}")
+
+        # Check if already connected to same port
+        if self.robot_controller and self.robot_port == port:
+            print(f"[INFO] Robot already connected on {port}")
+            return True
+
+        # Disconnect existing if different port
+        if self.robot_controller:
+            self._disconnect_robot()
+
+        try:
+            # Load joint configs for this port
+            config_dir = Path("data")
+            joint_configs, config_source = load_joint_configs_for_port(port, config_dir)
+
+            print(f"[INFO] Config source: {config_source}")
+
+            # Create controller with stability system enabled
+            self.robot_controller = RobotController(
+                port=port,
+                joint_configs=joint_configs,
+                config_source=config_source,
+                enable_stability_system=True
+            )
+
+            if not self.robot_controller.connect():
+                print(f"[ERROR] Failed to connect to robot on {port}")
+                self.robot_controller = None
+                return False
+
+            self.robot_port = port
+            print(f"[OK] Robot connected on {port}")
+
+            # Enable torque and start control loop
+            # IMPORTANT: Set home targets BEFORE starting control loop
+            # Otherwise robot immediately moves to [0,0,0,0,0,0] radians (min limits)
+            self.robot_controller.enable_torque()
+            self.robot_controller.set_home_targets()
+            self.robot_controller.start_control_loop()
+            print(f"[OK] Control loop started (holding at home position)")
+
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] Robot connection failed: {e}")
+            self.robot_controller = None
+            return False
+
+    def _disconnect_robot(self):
+        """Disconnect from robot."""
+        if self.robot_controller:
+            print("[INFO] Disconnecting robot...")
+            self.robot_controller.disconnect()
+            self.robot_controller = None
+            self.robot_port = None
+
+    def execute_episode(
+        self,
+        episode_index: int,
+        speed_multiplier: float = 1.0,
+        dry_run: bool = False,
+        go_to_start: bool = True,
+        robot_port: Optional[str] = None
+    ) -> bool:
+        """
+        Execute episode actions on physical robot.
+
+        Replays the recorded action values (commanded positions) from the episode
+        at the original FPS, scaled by speed_multiplier.
+
+        Args:
+            episode_index: Episode to execute
+            speed_multiplier: Playback speed (0.5 = half speed, 2.0 = double)
+            dry_run: If True, only simulate without sending commands
+            go_to_start: Move to first position before starting
+            robot_port: Robot serial port (auto-detect if None)
+
+        Controls during execution:
+            SPACE: Pause/resume
+            Q/ESC: Abort execution
+
+        Returns:
+            True if completed, False if aborted
+        """
+        # Load episode frames (contains action values)
+        frames = self._load_episode_frames(episode_index)
+        if frames is None or len(frames) == 0:
+            print(f"[ERROR] No frames found for episode {episode_index}")
+            return False
+
+        info = self.get_episode_info(episode_index)
+        if info is None:
+            print(f"[ERROR] Episode {episode_index} not found")
+            return False
+
+        fps = info.get("fps", 15)
+        duration = len(frames) / fps if fps > 0 else 0
+
+        print(f"\n{'='*60}")
+        print(f"Episode Execution: Episode {episode_index}")
+        print(f"{'='*60}")
+        print(f"Frames: {len(frames)}")
+        print(f"FPS: {fps}")
+        print(f"Duration: {duration:.2f}s")
+        print(f"Speed: {speed_multiplier}x")
+        print(f"Mode: {'DRY RUN (no robot commands)' if dry_run else 'LIVE EXECUTION'}")
+        print(f"{'='*60}")
+
+        # Connect to robot if not dry run
+        if not dry_run:
+            if not self._connect_robot(robot_port):
+                print("[ERROR] Cannot execute - robot not available")
+                return False
+
+        # Extract action values from frames
+        # Use 'action' if available (commanded positions), fall back to 'joint_positions' (observed)
+        actions = []
+        for frame in frames:
+            # LeRobot format stores action separately
+            action = frame.get("action")
+            if action is None:
+                # Fall back to joint_positions (raw format or observation.state)
+                action = frame.get("joint_positions", [0.0] * 6)
+            if hasattr(action, 'tolist'):
+                action = action.tolist()
+            actions.append(np.array(action, dtype=np.float32))
+
+        if len(actions) == 0:
+            print("[ERROR] No action data found in episode")
+            return False
+
+        # Show first/last actions for confirmation
+        print(f"\nFirst action: {[f'{v:.3f}' for v in actions[0]]}")
+        print(f"Last action:  {[f'{v:.3f}' for v in actions[-1]]}")
+
+        # Confirm execution
+        print(f"\n[WARNING] Robot will move through {len(actions)} positions!")
+        response = input("Proceed with execution? (yes/no): ").strip().lower()
+        if response != "yes":
+            print("[INFO] Execution cancelled")
+            return False
+
+        # Move to start position if requested
+        if go_to_start and not dry_run:
+            print("\n[INFO] Moving to start position at 0.1x speed...")
+            start_action = actions[0]
+
+            # Move slowly to start
+            self.robot_controller.set_target_positions(start_action)
+
+            # Wait for robot to reach position (with timeout)
+            print(f"  Target: {[f'{v:.2f}' for v in start_action]}")
+            time.sleep(3.0)  # Give robot time to reach start
+
+            input("Robot at start position. Press ENTER to begin playback...")
+
+        # Create display window for visual feedback
+        cv2.namedWindow("Episode Execution", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Episode Execution", 800, 200)
+
+        # Execute actions
+        frame_interval = (1.0 / fps) / speed_multiplier
+        paused = False
+        aborted = False
+        frame_idx = 0
+        last_frame_time = time.time()
+
+        print(f"\n[INFO] Executing episode (press SPACE to pause, Q/ESC to abort)")
+
+        try:
+            while frame_idx < len(actions):
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord('q') or key == 27:  # Q or ESC
+                    print("\n[INFO] Execution aborted by user")
+                    aborted = True
+                    break
+                elif key == ord(' '):  # SPACE
+                    paused = not paused
+                    print(f"[INFO] {'Paused' if paused else 'Resumed'}")
+
+                # Skip if paused
+                if paused:
+                    time.sleep(0.05)
+                    continue
+
+                # Check timing
+                elapsed = time.time() - last_frame_time
+                if elapsed < frame_interval:
+                    time.sleep(max(0, frame_interval - elapsed - 0.001))
+                    continue
+
+                last_frame_time = time.time()
+
+                # Get current action
+                action = actions[frame_idx]
+
+                # Send to robot if not dry run
+                if not dry_run:
+                    self.robot_controller.set_target_positions(action)
+
+                # Create status display
+                status_img = np.zeros((200, 800, 3), dtype=np.uint8)
+                progress = (frame_idx + 1) / len(actions)
+
+                # Progress bar
+                bar_width = 700
+                bar_height = 30
+                bar_x = 50
+                bar_y = 30
+                cv2.rectangle(status_img, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+                cv2.rectangle(status_img, (bar_x, bar_y), (bar_x + int(bar_width * progress), bar_y + bar_height), (0, 200, 0), -1)
+                cv2.rectangle(status_img, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 1)
+
+                # Text info
+                cv2.putText(status_img, f"Episode {episode_index}", (50, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(status_img, f"Frame {frame_idx + 1}/{len(actions)} ({progress*100:.1f}%)", (50, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.putText(status_img, f"Speed: {speed_multiplier}x  {'DRY RUN' if dry_run else 'LIVE'}", (50, 150),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 255) if dry_run else (150, 255, 150), 1)
+                cv2.putText(status_img, "SPACE: pause | Q/ESC: abort", (50, 180),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+
+                cv2.imshow("Episode Execution", status_img)
+
+                frame_idx += 1
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Execution interrupted")
+            aborted = True
+
+        finally:
+            cv2.destroyWindow("Episode Execution")
+
+        if not aborted:
+            print(f"\n[OK] Execution complete ({frame_idx} frames)")
+
+        # Offer to return to home
+        if not dry_run and self.robot_controller:
+            response = input("\nReturn to home position? (y/n): ").strip().lower()
+            if response == 'y':
+                print("[INFO] Moving to home position...")
+                self.robot_controller.set_home_targets()
+                time.sleep(2.0)
+                print("[OK] Robot at home position")
+
+        return not aborted
+
     def _load_episode_frames(self, episode_index: int) -> Optional[List[Dict]]:
         """
         Load all frames for an episode.
@@ -409,7 +735,7 @@ class EpisodeValidator:
             episode_index: Episode index
 
         Returns:
-            List of frame dictionaries with 'global_frame', 'gripper_frame', 'joint_positions'
+            List of frame dictionaries with 'global_frame', 'gripper_frame', 'joint_positions', 'action'
         """
         # Find episode
         episode = None
@@ -488,10 +814,15 @@ class EpisodeValidator:
                 gripper_video_frames = self._load_video_frames(episode, "observation.images.gripper", target_shape=gripper_shape)
 
                 for i, (_, row) in enumerate(ep_data.iterrows()):
-                    # Get observation state (joint positions)
+                    # Get observation state (joint positions - what was measured)
                     joint_pos = row.get("observation.state", [0.0] * 6)
                     if hasattr(joint_pos, 'tolist'):
                         joint_pos = joint_pos.tolist()
+
+                    # Get action (commanded positions - what was sent to robot)
+                    action = row.get("action", None)
+                    if action is not None and hasattr(action, 'tolist'):
+                        action = action.tolist()
 
                     # Get frames from video if available
                     global_cam = global_video_frames[i] if global_video_frames and i < len(global_video_frames) else None
@@ -505,6 +836,7 @@ class EpisodeValidator:
                         "global_frame": global_cam,
                         "gripper_frame": gripper_cam,
                         "joint_positions": joint_pos,
+                        "action": action,  # Commanded positions for playback
                         "timestamp": float(timestamp),
                         "task": episode_task
                     })
@@ -1107,7 +1439,10 @@ class EpisodeValidator:
         print("Commands:")
         print("  l            - List all episodes")
         print("  i <idx>      - Show episode info")
-        print("  p <idx>      - Playback episode")
+        print("  p <idx>      - Playback episode (video only)")
+        print("  x <idx>      - Execute episode on robot (requires hardware)")
+        print("  x <idx> -s   - Execute at half speed (safety mode)")
+        print("  x <idx> -d   - Dry run (simulate without robot)")
         print("  g <indices>  - Mark episode(s) as good (e.g., g 5 or g 1-10 or g 1 2 3)")
         print("  b <indices>  - Mark episode(s) as bad (e.g., b 5 or b 17-38 or b 17 18 19)")
         print("  d            - Delete all bad episodes")
@@ -1146,6 +1481,23 @@ class EpisodeValidator:
                     ep_idx = int(parts[1])
                     self.playback_episode(ep_idx)
 
+                elif action == 'x' or action == 'exec' or action == 'execute':
+                    if len(parts) < 2:
+                        print("[ERROR] Usage: x <episode_index> [-s|-d]")
+                        print("  -s : half speed (0.5x)")
+                        print("  -d : dry run (no robot commands)")
+                        continue
+                    ep_idx = int(parts[1])
+                    # Parse flags
+                    speed = 1.0
+                    dry_run = False
+                    for flag in parts[2:]:
+                        if flag == '-s':
+                            speed = 0.5
+                        elif flag == '-d':
+                            dry_run = True
+                    self.execute_episode(ep_idx, speed_multiplier=speed, dry_run=dry_run)
+
                 elif action == 'g' or action == 'good':
                     if len(parts) < 2:
                         print("[ERROR] Usage: g <idx> or g <idx1> <idx2> ... or g <start>-<end>")
@@ -1183,6 +1535,9 @@ class EpisodeValidator:
             except Exception as e:
                 print(f"[ERROR] {e}")
 
+        # Cleanup robot connection on exit
+        self._disconnect_robot()
+
 
 def main():
     """Main entry point with argument parsing."""
@@ -1191,28 +1546,43 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Interactive review
-    python scripts/validate_vla_episodes.py --dataset data/episodes/
+    # Interactive review (default dataset: data/lerobot_episodes/)
+    python scripts/validate_vla_episodes.py
 
     # List all episodes
-    python scripts/validate_vla_episodes.py --dataset data/episodes/ --list
+    python scripts/validate_vla_episodes.py --list
 
     # Show info for episode 0
-    python scripts/validate_vla_episodes.py --dataset data/episodes/ --info 0
+    python scripts/validate_vla_episodes.py --info 0
 
-    # Playback episode 0
-    python scripts/validate_vla_episodes.py --dataset data/episodes/ --play 0
+    # Playback episode 0 (video only)
+    python scripts/validate_vla_episodes.py --play 0
+
+    # Execute episode 0 on robot hardware
+    python scripts/validate_vla_episodes.py --execute 0
+
+    # Execute at half speed (safer for testing)
+    python scripts/validate_vla_episodes.py --execute 0 --speed 0.5
+
+    # Dry run (simulate without robot)
+    python scripts/validate_vla_episodes.py --execute 0 --dry-run
+
+    # Execute with specific robot port
+    python scripts/validate_vla_episodes.py --execute 0 --robot-port /dev/ttyACM0
+
+    # Use custom dataset path
+    python scripts/validate_vla_episodes.py --dataset data/my_episodes/
 
     # Export good episodes
-    python scripts/validate_vla_episodes.py --dataset data/episodes/ --export data/episodes_filtered/
+    python scripts/validate_vla_episodes.py --export data/episodes_filtered/
         """
     )
 
     parser.add_argument(
         "--dataset",
         type=str,
-        default="data/episodes",
-        help="Path to episode dataset directory (default: data/episodes)"
+        default="data/lerobot_episodes",
+        help="Path to episode dataset directory (default: data/lerobot_episodes)"
     )
 
     parser.add_argument(
@@ -1248,6 +1618,34 @@ Examples:
         help="Disable LeRobot dataset format (use raw files only)"
     )
 
+    # Robot execution arguments
+    parser.add_argument(
+        "--execute",
+        type=int,
+        metavar="IDX",
+        help="Execute episode on robot hardware and exit"
+    )
+
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Playback speed multiplier for --execute (default: 1.0)"
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate execution without sending robot commands"
+    )
+
+    parser.add_argument(
+        "--robot-port",
+        type=str,
+        default=None,
+        help="Robot serial port for --execute (auto-detect if not specified)"
+    )
+
     args = parser.parse_args()
 
     # Check dataset exists
@@ -1273,6 +1671,16 @@ Examples:
     if args.play is not None:
         validator.playback_episode(args.play)
         return 0
+
+    if args.execute is not None:
+        success = validator.execute_episode(
+            episode_index=args.execute,
+            speed_multiplier=args.speed,
+            dry_run=args.dry_run,
+            robot_port=args.robot_port
+        )
+        validator._disconnect_robot()
+        return 0 if success else 1
 
     if args.export:
         validator.export_filtered_dataset(args.export)
