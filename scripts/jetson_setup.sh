@@ -28,6 +28,10 @@ echo_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 echo_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 echo_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# Save project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
 # =============================================================================
 # Pre-flight checks
 # =============================================================================
@@ -84,7 +88,8 @@ sudo apt-get install -y \
     libswscale-dev \
     build-essential \
     git \
-    ffmpeg
+    ffmpeg \
+    cmake
 sudo apt-get install -y v4l2*
 
 echo_info "System dependencies installed."
@@ -98,9 +103,36 @@ fi
 
 # Verify stockfish
 if command -v stockfish &> /dev/null; then
-    echo_info "Stockfish installed: $(stockfish --version 2>&1 || echo 'version check not supported')"
+    echo_info "Stockfish installed."
 else
     echo_error "Stockfish installation failed"
+fi
+
+# =============================================================================
+# Step 1.5: Build nvtop from source (apt version lacks Tegra support)
+# =============================================================================
+
+echo ""
+echo "============================================================"
+echo "Step 1.5: Installing jtop (Jetson GPU monitor)"
+echo "============================================================"
+
+# jtop (jetson-stats) is the proper monitoring tool for Jetson/Tegra devices
+# nvtop doesn't support Tegra GPUs properly
+if command -v jtop &> /dev/null; then
+    echo_info "jtop already installed."
+else
+    echo_info "Installing jetson-stats (includes jtop)..."
+    sudo pip3 install jetson-stats
+    sudo systemctl restart jtop.service 2>/dev/null || true
+    echo_info "jtop installed. You may need to reboot or re-login for full functionality."
+fi
+
+# Verify jtop
+if command -v jtop &> /dev/null; then
+    echo_info "jtop installed successfully."
+else
+    echo_warn "jtop installation may have failed - check manually"
 fi
 
 # =============================================================================
@@ -136,7 +168,7 @@ else
 fi
 
 # Step 2.5: Other pip dependencies
-python -m pip install -r requirements.txt
+python -m pip install -r "$PROJECT_ROOT/requirements.txt"
 
 # =============================================================================
 # Step 3: PyTorch Installation
@@ -212,7 +244,11 @@ if [ -z "$SKIP_TORCHVISION" ]; then
     cd torchvision
 
     export BUILD_VERSION=0.20.0
-    python3 setup.py install --user
+    pip install --no-build-isolation .
+
+    # Clean up build directory to prevent import conflicts
+    cd /tmp
+    rm -rf torchvision
 
     echo_info "torchvision installed."
 fi
