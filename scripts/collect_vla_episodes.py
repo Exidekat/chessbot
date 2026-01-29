@@ -58,7 +58,9 @@ from guidance import (
 )
 from guidance.move_decomposer import decompose_move
 from utils.state_cache import StateCache
+from utils.robot_state_publisher import RobotStateSubscriber
 from utils.keyboard_input import KeyboardInput
+from controls.robot_controller import load_joint_configs_for_port, get_config_path_for_port
 from utils.camera_helpers import (
     get_camera_index_from_device,
     get_default_global_camera,
@@ -148,6 +150,7 @@ class EpisodeRecorder:
         use_yuyv: bool = False,
         use_corner_grayscale: bool = False,
         use_piece_grayscale: bool = False,
+        fresh: bool = False,
     ):
         """
         Initialize episode recorder.
@@ -163,8 +166,10 @@ class EpisodeRecorder:
             turn: Whose turn to calculate move for ('white' or 'black')
             use_corner_grayscale: If True, use grayscale+CLAHE for corner detection (default is RGB)
             use_piece_grayscale: If True, use grayscale+CLAHE for piece detection (default is RGB)
+            fresh: If True, create a fresh dataset (ignores existing data)
         """
         self.output_dir = Path(output_dir)
+        self.fresh = fresh
 
         self.global_camera_device = global_camera_device
         self.gripper_camera_device = gripper_camera_device
@@ -176,8 +181,11 @@ class EpisodeRecorder:
         self.use_yuyv = use_yuyv
 
         # Initialize components
-        self.cache = StateCache("data/state_cache.json")
+        self.cache = StateCache("data/state_cache.json")  # Legacy, still used for some state
         self.keyboard = KeyboardInput()
+
+        # ZMQ subscriber for low-latency position sharing from tele_op.py
+        self.robot_subscriber: Optional[RobotStateSubscriber] = None
 
         # Store grayscale mode settings
         self.use_corner_grayscale = use_corner_grayscale
@@ -204,6 +212,11 @@ class EpisodeRecorder:
         # State
         self.perspective_matrix: Optional[np.ndarray] = None
         self.transformed_image_path = "data/chessboard_transformed.png"
+
+        # Robot config for home-relative normalization
+        self.robot_port: Optional[str] = None  # Will be set from ZMQ subscriber
+        self.robot_config_source: Optional[Path] = None  # Source config file path
+        self.recording_home: Optional[np.ndarray] = None  # Home positions from config
 
         # Background saving thread
         self.save_queue: queue.Queue = queue.Queue()
@@ -298,15 +311,45 @@ class EpisodeRecorder:
     def _initialize_dataset(self):
         """Initialize or load LeRobot dataset."""
         # First, recover any corrupted parquet files from previous OOM crashes
-        if self.output_dir.exists():
+        if self.output_dir.exists() and not self.fresh:
             self._recover_corrupted_dataset()
 
         # LeRobot v3.0 uses meta/info.json
         lerobot_meta = self.output_dir / "meta" / "info.json"
         repo_id = f"local/chess_vla_{self.output_dir.name}"
 
+        # Check if --fresh flag was used
+        if self.fresh and self.output_dir.exists():
+            print(f"[INFO] --fresh flag: removing existing dataset at {self.output_dir}")
+            import shutil
+            shutil.rmtree(self.output_dir)
+            lerobot_meta = self.output_dir / "meta" / "info.json"  # Reset path check
+
         if lerobot_meta.exists():
-            print(f"[INFO] Loading existing dataset from {self.output_dir}")
+            print(f"[INFO] Found existing dataset at {self.output_dir}")
+
+            # Get actual episode indices from metadata
+            episode_meta_dir = self.output_dir / "meta" / "episodes" / "chunk-000"
+            actual_episodes = []
+            if episode_meta_dir.exists():
+                import pandas as pd
+                meta_dfs = []
+                for f in sorted(episode_meta_dir.glob("*.parquet")):
+                    meta_dfs.append(pd.read_parquet(f))
+                if meta_dfs:
+                    all_meta = pd.concat(meta_dfs, ignore_index=True)
+                    actual_episodes = sorted(all_meta['episode_index'].unique().tolist())
+
+            # Check for non-contiguous episode indices (common after validation deletes)
+            expected_contiguous = list(range(len(actual_episodes)))
+            is_contiguous = (actual_episodes == expected_contiguous)
+
+            if not is_contiguous and actual_episodes:
+                print(f"[WARN] Dataset has non-contiguous episode indices ({len(actual_episodes)} episodes, indices {min(actual_episodes)}-{max(actual_episodes)})")
+                print(f"[WARN] LeRobot cannot load datasets with gaps. Use --fresh to start a new dataset.")
+                print(f"[INFO] Alternatively, re-index dataset: python scripts/reindex_dataset.py --dataset {self.output_dir}")
+                raise RuntimeError("Cannot load dataset with non-contiguous episode indices")
+
             self.dataset = LeRobotDataset(
                 repo_id=repo_id,
                 root=str(self.output_dir),
@@ -332,7 +375,61 @@ class EpisodeRecorder:
             )
             self.episode_count = 0
 
+        # Initialize robot config tracking for home-relative normalization
+        self._initialize_robot_config_tracking()
+
         print(f"[OK] Dataset ready: {self.episode_count} existing episodes")
+
+    def _initialize_robot_config_tracking(self):
+        """
+        Initialize robot config tracking for home-relative position normalization.
+
+        This enables multi-robot portability by:
+        1. Starting ZMQ subscriber to receive robot port from tele_op.py
+        2. Storing the source config path for per-episode copying
+        3. Loading home positions for reference during training
+        """
+        # Create robot_configs directory in dataset
+        robot_configs_dir = self.output_dir / "robot_configs"
+        robot_configs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Start ZMQ subscriber to get robot port and positions from tele_op.py
+        print("[INFO] Connecting to tele_op.py via ZMQ...")
+        self.robot_subscriber = RobotStateSubscriber()
+        self.robot_subscriber.start()
+
+        # Wait for first message from tele_op.py to get robot port
+        if self.robot_subscriber.wait_for_connection(timeout=5.0):
+            self.robot_port = self.robot_subscriber.get_robot_port()
+            print(f"[OK] Connected to tele_op.py, receiving positions from {self.robot_port}")
+        else:
+            print(f"[WARN] No connection to tele_op.py (is it running with tele-op active?)")
+            self.robot_port = None
+
+        if self.robot_port:
+            print(f"[INFO] Recording robot port: {self.robot_port}")
+
+            # Get source config path (will be copied per-episode)
+            self.robot_config_source = get_config_path_for_port(self.robot_port, Path("data"))
+
+            if self.robot_config_source.exists():
+                print(f"[OK] Robot config source: {self.robot_config_source}")
+
+                # Load home positions for reference
+                try:
+                    joint_configs, _ = load_joint_configs_for_port(self.robot_port, Path("data"))
+                    self.recording_home = np.array([c.home_rad for c in joint_configs], dtype=np.float32)
+                    home_deg = np.degrees(self.recording_home)
+                    print(f"[INFO] Recording home positions: [{', '.join(f'{d:.1f}' for d in home_deg)}] deg")
+                except Exception as e:
+                    print(f"[WARN] Failed to load home positions: {e}")
+                    self.recording_home = None
+            else:
+                print(f"[WARN] No config found for {self.robot_port}, home normalization disabled")
+                self.robot_config_source = None
+        else:
+            print(f"[WARN] Could not determine robot port, home normalization disabled")
+            print(f"       Make sure tele_op.py is running with tele-op mode active")
 
     def start_cameras(self) -> bool:
         """
@@ -412,6 +509,12 @@ class EpisodeRecorder:
 
         print("[OK] Cameras stopped")
 
+    def stop_subscriber(self):
+        """Stop ZMQ subscriber."""
+        if self.robot_subscriber:
+            self.robot_subscriber.stop()
+            self.robot_subscriber = None
+
     def start_save_thread(self):
         """Start background save worker thread."""
         if self.save_thread is not None and self.save_thread.is_alive():
@@ -477,6 +580,12 @@ class EpisodeRecorder:
         with self.save_lock:
             episode_index = self.episode_count
             self.episode_count += 1
+
+            # Copy robot config for this episode (per-episode for multi-robot portability)
+            if self.robot_config_source and self.robot_config_source.exists():
+                robot_configs_dir = self.output_dir / "robot_configs"
+                episode_config_path = robot_configs_dir / f"episode_{episode_index:06d}.csv"
+                shutil.copy2(self.robot_config_source, episode_config_path)
 
         self.save_queue.put((frame_paths, stage_info, episode_index))
         print(f"[INFO] Queued episode {episode_index} ({len(frame_paths)} frames, queue size: {self.save_queue.qsize()})")
@@ -668,12 +777,14 @@ class EpisodeRecorder:
                 global_frame = self.global_cam_capture.get_latest_frame()
                 ret, gripper_frame = self.gripper_cam.read()
 
-                # Refresh cache from disk to get latest joint positions from tele_op.py
-                self.cache.refresh()
-
-                # Read robot state from cache (NO serial conflict!)
-                # Note: gripper is joint_5 in joint_positions
-                joint_positions = self.cache.get("robot_state.joint_positions")
+                # Get joint positions from ZMQ subscriber (low-latency, <1ms)
+                # Falls back to cache if subscriber not available
+                if self.robot_subscriber:
+                    joint_positions = self.robot_subscriber.get_joint_positions()
+                else:
+                    # Legacy fallback: read from file-based cache
+                    self.cache.refresh()
+                    joint_positions = self.cache.get("robot_state.joint_positions")
 
                 # Validate data
                 if global_frame is None:
@@ -864,6 +975,7 @@ class EpisodeRecorder:
             if temp_dir and temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+
     def run(self):
         """Main episode collection loop."""
         print(f"\n{'='*60}")
@@ -1012,9 +1124,13 @@ class EpisodeRecorder:
                 # Stop save thread (waits for queue to drain)
                 self.stop_save_thread()
                 self.stop_cameras()
+                self.stop_subscriber()
+
                 print("\n[OK] Episode collection complete")
                 print(f"     Total episodes: {self.episode_count}")
                 print(f"     Output: {self.output_dir}")
+                if self.robot_config_source:
+                    print(f"     Robot configs saved per-episode in: {self.output_dir / 'robot_configs'}")
 
 
 def main():
@@ -1123,6 +1239,11 @@ Examples:
         action="store_true",
         help="Use grayscale+CLAHE for piece detection (default is RGB)"
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Create a fresh dataset (ignores existing data, useful when existing dataset has corrupted/non-contiguous indices)"
+    )
 
     args = parser.parse_args()
 
@@ -1197,6 +1318,7 @@ Examples:
         use_yuyv=use_yuyv,
         use_corner_grayscale=args.corner_grayscale,
         use_piece_grayscale=args.piece_grayscale,
+        fresh=args.fresh,
     )
 
     # Run collection loop

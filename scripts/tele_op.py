@@ -43,6 +43,7 @@ from controls.robot_controller import (
 )
 from utils.state_cache import StateCache
 from utils.keyboard_input import KeyboardInput
+from utils.robot_state_publisher import RobotStatePublisher
 
 
 # Global list of connected robots for cleanup
@@ -128,7 +129,61 @@ def build_status_table(robots: List[RobotController]) -> List[str]:
     return lines
 
 
-def run_interactive_menu(robots: List[RobotController], cache: StateCache):
+def select_primary_follower(robots: List[RobotController], keyboard: KeyboardInput) -> Optional[RobotController]:
+    """
+    Select which robot to use as the primary follower for position streaming.
+
+    This robot's positions will be continuously published via ZMQ for
+    collect_vla_episodes.py to record, even when not in tele-op mode.
+
+    Args:
+        robots: List of connected robots
+        keyboard: Keyboard input handler
+
+    Returns:
+        Selected robot, or None if only one robot (auto-selected)
+    """
+    if len(robots) == 1:
+        print(f"\n[INFO] Auto-selected {robots[0].port} as primary follower (only one robot)")
+        return robots[0]
+
+    while True:
+        clear_screen()
+        print("=" * 60)
+        print("Select PRIMARY FOLLOWER for Position Streaming")
+        print("=" * 60)
+        print()
+        print("This robot's joint positions will be continuously streamed")
+        print("to collect_vla_episodes.py for episode recording.")
+        print()
+        print("Available robots:")
+        print()
+
+        for i, robot in enumerate(robots, start=1):
+            config_info = f"({robot.config_source})"
+            print(f"  [{i}] {robot.port} {config_info}")
+
+        print()
+        print("=" * 60)
+        print("\nPress number key to select...")
+
+        key = keyboard.get_key(timeout=0.1)
+        if key and key.isdigit():
+            choice = int(key)
+            if 1 <= choice <= len(robots):
+                selected = robots[choice - 1]
+                print(f"\n[OK] Selected {selected.port} as primary follower")
+                return selected
+
+        time.sleep(0.05)
+
+
+def run_interactive_menu(
+    robots: List[RobotController],
+    cache: StateCache,
+    publisher: Optional[RobotStatePublisher] = None,
+    primary_follower: Optional[RobotController] = None
+):
     """
     Run interactive menu system for Stage 2.
 
@@ -136,10 +191,13 @@ def run_interactive_menu(robots: List[RobotController], cache: StateCache):
     - Main menu with status table
     - Exit option
     - Tele-op Leader/Follower mode
+    - Continuous position streaming from primary follower
 
     Args:
         robots: List of connected RobotController instances
         cache: StateCache for sharing joint positions with VLA episode collection
+        publisher: ZMQ publisher for low-latency position sharing
+        primary_follower: Robot to stream positions from (for VLA recording)
     """
     print("\n" + "=" * 80)
     print("Stage 2: Interactive Menu")
@@ -150,7 +208,7 @@ def run_interactive_menu(robots: List[RobotController], cache: StateCache):
 
     with KeyboardInput() as keyboard:
         while True:
-            choice = show_main_menu(robots, keyboard)
+            choice = show_main_menu(robots, keyboard, publisher, primary_follower)
 
             if choice is None or choice == 1:
                 # Exit
@@ -159,7 +217,7 @@ def run_interactive_menu(robots: List[RobotController], cache: StateCache):
 
             elif choice == 2:
                 # Tele-op Leader/Follower
-                run_teleop_leader_follower(robots, keyboard, cache)
+                run_teleop_leader_follower(robots, keyboard, cache, publisher)
                 # After returning, reset robots to home
                 reset_robots_to_home(robots)
 
@@ -170,14 +228,33 @@ def run_interactive_menu(robots: List[RobotController], cache: StateCache):
                 reset_robots_to_home(robots)
 
 
-def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Optional[int]:
+def show_main_menu(
+    robots: List[RobotController],
+    keyboard: KeyboardInput,
+    publisher: Optional[RobotStatePublisher] = None,
+    primary_follower: Optional[RobotController] = None
+) -> Optional[int]:
     """
     Display main menu with status table and options.
+
+    Continuously publishes primary follower positions while displaying menu.
 
     Returns:
         int: Selected option, or None for exit
     """
     while True:
+        # Publish primary follower positions (always streaming for VLA recording)
+        if publisher and primary_follower:
+            try:
+                state = primary_follower.arm.get_state()
+                publisher.publish(
+                    joint_positions=state.joint_positions.tolist(),
+                    robot_port=primary_follower.port,
+                    gripper_state=float(state.joint_positions[5])
+                )
+            except Exception:
+                pass  # Don't crash menu if publish fails
+
         clear_screen()
         print("=" * 115)
         print("SO-100 Teleoperation - Main Menu")
@@ -190,6 +267,8 @@ def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Op
 
         print()
         print(f"Last updated: {time.strftime('%H:%M:%S')}")
+        if primary_follower:
+            print(f"Streaming positions from: {primary_follower.port}")
         print()
         print("=" * 115)
         print("OPTIONS:")
@@ -199,7 +278,7 @@ def show_main_menu(robots: List[RobotController], keyboard: KeyboardInput) -> Op
         print("=" * 115)
         print("\nPress number key to select option...")
 
-        key = keyboard.get_key(timeout=0.5)
+        key = keyboard.get_key(timeout=0.1)  # Faster polling for continuous streaming
         if key == 'ESC' or key == '1':
             return 1  # Exit
         elif key == '2':
@@ -316,7 +395,12 @@ def show_workspace_warning(keyboard: KeyboardInput, show_mode_selection: bool = 
         time.sleep(0.05)
 
 
-def run_teleop_leader_follower(robots: List[RobotController], keyboard: KeyboardInput, cache: StateCache):
+def run_teleop_leader_follower(
+    robots: List[RobotController],
+    keyboard: KeyboardInput,
+    cache: StateCache,
+    publisher: Optional[RobotStatePublisher] = None
+):
     """
     Run the tele-op leader/follower mode.
 
@@ -325,6 +409,12 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
     3. Show workspace warning with mode selection
     4. Run tele-op loop at 15Hz (Home-to-Home or EncPos-to-EncPos)
     5. ESC returns to main menu
+
+    Args:
+        robots: List of connected robot controllers
+        keyboard: Keyboard input handler
+        cache: State cache for file-based sharing (legacy)
+        publisher: ZMQ publisher for low-latency position sharing with collect_vla_episodes.py
     """
     # Step 1: Select leader
     leader = select_robot_port(robots, keyboard, "Select LEADER Arm Port")
@@ -399,12 +489,20 @@ def run_teleop_leader_follower(robots: List[RobotController], keyboard: Keyboard
         follower_deg = np.degrees(follower_state.joint_positions)
         target_deg = np.degrees(follower_targets)
 
-        # Write follower joint positions to cache for VLA recording
+        # Write follower joint positions to cache for VLA recording (legacy file-based)
         cache.update_joint_positions(
             positions=follower_state.joint_positions.tolist(),
             gripper_state=float(follower_state.joint_positions[5]),  # Joint 6 is gripper
             source="robot"
         )
+
+        # Publish positions via ZMQ for low-latency sharing with collect_vla_episodes.py
+        if publisher:
+            publisher.publish(
+                joint_positions=follower_state.joint_positions.tolist(),
+                robot_port=follower.port,
+                gripper_state=float(follower_state.joint_positions[5])
+            )
 
         header = f"{'':15}"
         for j in range(1, 7):
@@ -929,8 +1027,12 @@ def main():
     args = parser.parse_args()
     config_dir = Path(args.config_dir)
 
-    # Initialize state cache for VLA episode collection
+    # Initialize state cache for VLA episode collection (legacy file-based)
     cache = StateCache("data/state_cache.json")
+
+    # Initialize ZMQ publisher for low-latency position sharing with collect_vla_episodes.py
+    publisher = RobotStatePublisher()
+    publisher.start()
 
     # Register signal handlers for cleanup
     signal.signal(signal.SIGINT, cleanup_handler)
@@ -1044,13 +1146,19 @@ def main():
 
         return 0
 
-    # Interactive mode: wait for user to proceed
+    # Interactive mode: select primary follower for position streaming
+    print("\n" + "-" * 80)
+
+    # Select primary follower (for continuous position streaming to VLA recording)
+    with KeyboardInput() as keyboard:
+        primary_follower = select_primary_follower(robots, keyboard)
+
     print("\n" + "-" * 80)
     input("Press ENTER to continue to Interactive Menu...")
 
     # Run interactive menu (handles homing and tele-op)
     try:
-        run_interactive_menu(robots, cache)
+        run_interactive_menu(robots, cache, publisher, primary_follower)
     except Exception as e:
         print(f"Error in interactive menu: {e}")
         import traceback
@@ -1060,6 +1168,7 @@ def main():
         print("\nCleaning up...")
         for robot in robots:
             robot.disconnect()
+        publisher.stop()
         print("[OK] All robots disconnected and torque released")
 
     return 0

@@ -59,11 +59,13 @@ except ImportError:
 
 # Try to import robot control (optional dependency for action playback)
 try:
-    from controls.robot_controller import RobotController, load_joint_configs_for_port
+    from controls.robot_controller import RobotController, load_joint_configs_for_port, JointConfig
     from controls.so100_arm import SO100State
     ROBOT_AVAILABLE = True
 except ImportError:
     ROBOT_AVAILABLE = False
+
+import csv
 
 
 class EpisodeValidator:
@@ -101,6 +103,9 @@ class EpisodeValidator:
         self.robot_controller: Optional['RobotController'] = None
         self.robot_port: Optional[str] = None
 
+        # Home-relative normalization state
+        self.robot_configs_cache: Dict[int, np.ndarray] = {}  # episode_index -> home positions
+
         # Load dataset
         self._load_dataset()
 
@@ -125,6 +130,13 @@ class EpisodeValidator:
                 loaded = json.load(f)
                 self.episode_qualities = {int(k): v for k, v in loaded.items()}
             print(f"[INFO] Loaded quality annotations for {len(self.episode_qualities)} episodes")
+
+        # Check for per-episode robot configs (for home-relative normalization)
+        robot_configs_dir = self.dataset_path / "robot_configs"
+        if robot_configs_dir.exists():
+            config_count = len(list(robot_configs_dir.glob("episode_*.csv")))
+            if config_count > 0:
+                print(f"[INFO] Found {config_count} per-episode robot configs for home-relative normalization")
 
     def _load_lerobot_dataset(self):
         """Load LeRobot v3.0 format dataset by reading parquet files directly."""
@@ -221,6 +233,93 @@ class EpisodeValidator:
             except Exception as e:
                 print(f"[WARNING] Corrupted parquet file {data_file}: {e}")
                 self._corrupted_files.add((chunk_idx, file_idx))
+
+    def _get_recording_home(self, episode_index: int) -> Optional[np.ndarray]:
+        """
+        Get the home positions used when recording an episode.
+
+        Loads from per-episode config file: robot_configs/episode_{index:06d}.csv
+
+        Args:
+            episode_index: Episode index to look up
+
+        Returns:
+            np.ndarray: Home positions (6 joints, radians), or None if not available
+        """
+        # Check cache first
+        if episode_index in self.robot_configs_cache:
+            return self.robot_configs_cache[episode_index]
+
+        # Load from per-episode config file
+        config_path = self.dataset_path / "robot_configs" / f"episode_{episode_index:06d}.csv"
+        if not config_path.exists():
+            return None
+
+        try:
+            home_positions = []
+            with open(config_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    home_positions.append(float(row['home_rad']))
+
+            if len(home_positions) != 6:
+                print(f"[WARN] Invalid robot config (expected 6 joints): {config_path}")
+                return None
+
+            home_array = np.array(home_positions, dtype=np.float32)
+            self.robot_configs_cache[episode_index] = home_array
+            return home_array
+
+        except Exception as e:
+            print(f"[WARN] Failed to load robot config for episode {episode_index}: {e}")
+            return None
+
+    def _get_playback_home(self) -> Optional[np.ndarray]:
+        """
+        Get the home positions of the current playback robot.
+
+        Returns:
+            np.ndarray: Home positions (6 joints, radians), or None if not available
+        """
+        if not self.robot_controller or not self.robot_port:
+            return None
+
+        try:
+            joint_configs, _ = load_joint_configs_for_port(self.robot_port, Path("data"))
+            return np.array([c.home_rad for c in joint_configs], dtype=np.float32)
+        except Exception as e:
+            print(f"[WARN] Failed to load playback robot home: {e}")
+            return None
+
+    def _transform_actions(
+        self,
+        actions: List[np.ndarray],
+        recording_home: np.ndarray,
+        playback_home: np.ndarray
+    ) -> List[np.ndarray]:
+        """
+        Transform actions from recording robot frame to playback robot frame.
+
+        Formula: action_playback = (action_recorded - home_recorded) + home_playback
+
+        This converts absolute positions recorded on one robot to equivalent
+        positions on another robot with different home calibration.
+
+        Args:
+            actions: List of action arrays (6 joints, radians)
+            recording_home: Home positions of recording robot (6 joints, radians)
+            playback_home: Home positions of playback robot (6 joints, radians)
+
+        Returns:
+            List of transformed action arrays
+        """
+        transformed = []
+        for action in actions:
+            # Convert to home-relative, then to playback absolute
+            relative = action - recording_home
+            absolute = relative + playback_home
+            transformed.append(absolute)
+        return transformed
 
     def _load_video_frames(self, episode: Dict, video_key: str, target_shape: Optional[tuple] = None) -> Optional[List[np.ndarray]]:
         """
@@ -607,6 +706,28 @@ class EpisodeValidator:
         if len(actions) == 0:
             print("[ERROR] No action data found in episode")
             return False
+
+        # Apply home-relative transformation for multi-robot portability
+        recording_home = self._get_recording_home(episode_index)
+        playback_home = self._get_playback_home() if not dry_run else None
+
+        if recording_home is not None and playback_home is not None:
+            # Check if homes are different (transformation needed)
+            home_diff = np.abs(recording_home - playback_home)
+            max_diff_deg = np.degrees(np.max(home_diff))
+
+            if max_diff_deg > 1.0:  # More than 1 degree difference
+                print(f"\n[INFO] Home-relative transformation enabled")
+                print(f"  Recording home: [{', '.join(f'{np.degrees(h):.1f}' for h in recording_home)}] deg")
+                print(f"  Playback home:  [{', '.join(f'{np.degrees(h):.1f}' for h in playback_home)}] deg")
+                print(f"  Max difference: {max_diff_deg:.1f} deg")
+                actions = self._transform_actions(actions, recording_home, playback_home)
+                print(f"[OK] Actions transformed to playback robot frame")
+            else:
+                print(f"[INFO] Homes match within 1 deg, no transformation needed")
+        elif recording_home is None and not dry_run:
+            print(f"\n[WARN] No recording config found for episode {episode_index}")
+            print(f"       Using raw actions (may be incorrect on different robot)")
 
         # Show first/last actions for confirmation
         print(f"\nFirst action: {[f'{v:.3f}' for v in actions[0]]}")
@@ -1105,27 +1226,56 @@ class EpisodeValidator:
         """
         Rebuild LeRobot parquet files after episode deletion.
 
-        This removes deleted episodes from:
-        - data/chunk-*/file-*.parquet (frame data)
-        - meta/episodes/chunk-*/file-*.parquet (episode metadata)
-        - meta/info.json (totals)
+        This removes deleted episodes and RE-INDEXES remaining episodes to maintain
+        contiguous indices (0, 1, 2, ...). This is critical because LeRobot cannot
+        handle datasets with gaps in episode indices.
+
+        Updates:
+        - data/chunk-*/file-*.parquet (frame data - episode_index column)
+        - meta/episodes/chunk-*/file-*.parquet (episode metadata - episode_index column)
+        - videos/*/chunk-*/file-*.mp4 (renamed to match new indices)
+        - robot_configs/episode_*.csv (renamed to match new indices)
+        - meta/info.json (totals and splits)
 
         Args:
             deleted_indices: List of episode indices that were deleted
         """
         import pandas as pd
+        import shutil
 
         if not deleted_indices:
             return
 
         deleted_set = set(deleted_indices)
-        print(f"[INFO] Rebuilding LeRobot dataset (removing {len(deleted_indices)} episodes)...")
+        print(f"[INFO] Rebuilding LeRobot dataset (removing {len(deleted_indices)} episodes and re-indexing)...")
 
-        # 1. Rebuild data parquet files
         data_dir = self.dataset_path / "data"
-        data_files = sorted(data_dir.glob("chunk-*/file-*.parquet"))
+        episodes_dir = self.dataset_path / "meta" / "episodes"
 
-        for data_file in data_files:
+        # Step 1: Get all remaining episode indices and create mapping to new contiguous indices
+        remaining_episodes = set()
+        for data_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
+            try:
+                df = pd.read_parquet(data_file)
+                remaining_episodes.update(df["episode_index"].unique())
+            except Exception as e:
+                print(f"[WARNING] Failed to read {data_file}: {e}")
+
+        # Remove deleted episodes from the set
+        remaining_episodes -= deleted_set
+        remaining_episodes = sorted(remaining_episodes)
+
+        if not remaining_episodes:
+            print("[WARNING] No episodes remaining after deletion!")
+            return
+
+        # Create old_index -> new_index mapping
+        index_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(remaining_episodes)}
+        print(f"[INFO] Re-indexing {len(remaining_episodes)} episodes: {min(remaining_episodes)}-{max(remaining_episodes)} -> 0-{len(remaining_episodes)-1}")
+
+        # Step 2: Update data parquet files (filter deleted + remap indices)
+        print("[INFO] Updating data parquet files...")
+        for data_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
             try:
                 df = pd.read_parquet(data_file)
                 original_len = len(df)
@@ -1133,23 +1283,21 @@ class EpisodeValidator:
                 # Filter out deleted episodes
                 df = df[~df["episode_index"].isin(deleted_set)]
 
-                if len(df) < original_len:
-                    if len(df) == 0:
-                        # Delete empty file
-                        data_file.unlink()
-                        print(f"[INFO] Removed empty data file: {data_file.name}")
-                    else:
-                        # Rewrite filtered data
-                        df.to_parquet(data_file, index=False)
-                        print(f"[INFO] Updated {data_file.name}: {original_len} -> {len(df)} rows")
+                if len(df) == 0:
+                    data_file.unlink()
+                    print(f"  Removed empty: {data_file.name}")
+                else:
+                    # Remap episode indices to contiguous
+                    df["episode_index"] = df["episode_index"].map(index_mapping)
+                    df.to_parquet(data_file, index=False)
+                    if len(df) < original_len:
+                        print(f"  Updated {data_file.name}: {original_len} -> {len(df)} rows")
             except Exception as e:
                 print(f"[WARNING] Failed to update {data_file}: {e}")
 
-        # 2. Rebuild meta/episodes parquet files
-        episodes_dir = self.dataset_path / "meta" / "episodes"
-        ep_files = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
-
-        for ep_file in ep_files:
+        # Step 3: Update meta/episodes parquet files
+        print("[INFO] Updating episode metadata...")
+        for ep_file in sorted(episodes_dir.glob("chunk-*/file-*.parquet")):
             try:
                 df = pd.read_parquet(ep_file)
                 original_len = len(df)
@@ -1157,19 +1305,68 @@ class EpisodeValidator:
                 # Filter out deleted episodes
                 df = df[~df["episode_index"].isin(deleted_set)]
 
-                if len(df) < original_len:
-                    if len(df) == 0:
-                        # Delete empty file
-                        ep_file.unlink()
-                        print(f"[INFO] Removed empty episode file: {ep_file.name}")
-                    else:
-                        # Rewrite filtered data
-                        df.to_parquet(ep_file, index=False)
-                        print(f"[INFO] Updated {ep_file.name}: {original_len} -> {len(df)} episodes")
+                if len(df) == 0:
+                    ep_file.unlink()
+                    print(f"  Removed empty: {ep_file.name}")
+                else:
+                    # Remap episode indices
+                    df["episode_index"] = df["episode_index"].map(index_mapping)
+                    df.to_parquet(ep_file, index=False)
+                    if len(df) < original_len:
+                        print(f"  Updated {ep_file.name}: {original_len} -> {len(df)} episodes")
             except Exception as e:
                 print(f"[WARNING] Failed to update {ep_file}: {e}")
 
-        # 3. Update meta/info.json
+        # Step 4: Rename video files to match new indices
+        print("[INFO] Renaming video files...")
+        for video_key in ["observation.images.global", "observation.images.gripper"]:
+            video_dir = self.dataset_path / "videos" / video_key
+            if not video_dir.exists():
+                continue
+
+            for chunk_dir in sorted(video_dir.glob("chunk-*")):
+                for video_file in sorted(chunk_dir.glob("file-*.mp4")):
+                    # Extract old episode index from filename (file-NNNNNN.mp4)
+                    try:
+                        old_idx = int(video_file.stem.replace("file-", ""))
+                    except ValueError:
+                        continue
+
+                    if old_idx in deleted_set:
+                        # Delete video for deleted episode
+                        video_file.unlink()
+                        print(f"  Deleted: {video_key}/{chunk_dir.name}/{video_file.name}")
+                    elif old_idx in index_mapping:
+                        new_idx = index_mapping[old_idx]
+                        if old_idx != new_idx:
+                            # Rename to new index
+                            new_name = f"file-{new_idx:06d}.mp4"
+                            new_path = chunk_dir / new_name
+                            video_file.rename(new_path)
+                            print(f"  Renamed: {video_file.name} -> {new_name}")
+
+        # Step 5: Rename robot_configs per-episode files
+        robot_configs_dir = self.dataset_path / "robot_configs"
+        if robot_configs_dir.exists():
+            print("[INFO] Renaming robot config files...")
+            for config_file in sorted(robot_configs_dir.glob("episode_*.csv")):
+                try:
+                    old_idx = int(config_file.stem.replace("episode_", ""))
+                except ValueError:
+                    continue
+
+                if old_idx in deleted_set:
+                    config_file.unlink()
+                    print(f"  Deleted: {config_file.name}")
+                elif old_idx in index_mapping:
+                    new_idx = index_mapping[old_idx]
+                    if old_idx != new_idx:
+                        new_name = f"episode_{new_idx:06d}.csv"
+                        new_path = robot_configs_dir / new_name
+                        config_file.rename(new_path)
+                        print(f"  Renamed: {config_file.name} -> {new_name}")
+
+        # Step 6: Update meta/info.json
         info_path = self.dataset_path / "meta" / "info.json"
         if info_path.exists():
             try:
@@ -1177,29 +1374,31 @@ class EpisodeValidator:
                     info = json.load(f)
 
                 old_total = info.get("total_episodes", 0)
-                info["total_episodes"] = old_total - len(deleted_indices)
+                new_total = len(remaining_episodes)
+                info["total_episodes"] = new_total
 
-                # Recalculate total frames if present
-                if "total_frames" in info:
-                    # Read remaining data to count frames
-                    total_frames = 0
-                    for data_file in data_dir.glob("chunk-*/file-*.parquet"):
-                        try:
-                            df = pd.read_parquet(data_file)
-                            total_frames += len(df)
-                        except:
-                            pass
-                    info["total_frames"] = total_frames
+                # Recalculate total frames
+                total_frames = 0
+                for data_file in data_dir.glob("chunk-*/file-*.parquet"):
+                    try:
+                        df = pd.read_parquet(data_file)
+                        total_frames += len(df)
+                    except:
+                        pass
+                info["total_frames"] = total_frames
+
+                # Set splits to contiguous range (0:N format)
+                info["splits"] = {"train": f"0:{new_total}"}
 
                 with open(info_path, 'w') as f:
                     json.dump(info, f, indent=2)
 
-                print(f"[INFO] Updated info.json: {old_total} -> {info['total_episodes']} episodes")
+                print(f"[INFO] Updated info.json: {old_total} -> {new_total} episodes, splits: 0:{new_total}")
 
             except Exception as e:
                 print(f"[WARNING] Failed to update info.json: {e}")
 
-        # 4. Clean up empty chunk directories
+        # Step 7: Clean up empty chunk directories
         for subdir in ["data", "videos/observation.images.global", "videos/observation.images.gripper", "meta/episodes"]:
             target_dir = self.dataset_path / subdir
             if target_dir.exists():
@@ -1208,7 +1407,7 @@ class EpisodeValidator:
                         chunk_dir.rmdir()
                         print(f"[INFO] Removed empty directory: {chunk_dir}")
 
-        print("[OK] LeRobot dataset rebuild complete")
+        print(f"[OK] LeRobot dataset rebuild complete: {len(remaining_episodes)} episodes (indices 0-{len(remaining_episodes)-1})")
 
     def delete_bad_episodes(self, confirm: bool = True) -> int:
         """

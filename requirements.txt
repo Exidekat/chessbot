@@ -11,6 +11,7 @@ lerobot[pi]
 #   pip install "git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi"
 transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi
 pyserial
+pyzmq>=25.0.0  # ZMQ for low-latency IPC between tele_op and collect_vla_episodes
 
 # Computational Geometry
 shapely>=2.0.0  # For IoU calculations and polygon operations

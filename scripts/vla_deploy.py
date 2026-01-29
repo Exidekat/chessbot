@@ -220,6 +220,7 @@ class VLAWrapper:
     - Multi-model loading (PI0, SmolVLA)
     - Quantile normalization/denormalization
     - Action chunk execution (50-step trajectories)
+    - Home-relative position normalization for multi-robot portability
     """
 
     def __init__(
@@ -233,6 +234,7 @@ class VLAWrapper:
         chunk_execution: bool = False,
         control_freq: float = 50.0,
         tile_mode: str = "multi_tile",
+        playback_home: Optional[np.ndarray] = None,
     ):
         """
         Initialize VLA model.
@@ -247,6 +249,8 @@ class VLAWrapper:
             chunk_execution: If True, execute full 50-step action chunks
             control_freq: Control frequency in Hz (default 50 Hz for chunk execution)
             tile_mode: Global camera tiling mode ("multi_tile" or "letterbox")
+            playback_home: Home positions of playback robot for home-relative normalization
+                          If provided, model outputs (home-relative) are converted to absolute
         """
         self.model_name = model_name
         self.device = device
@@ -257,6 +261,7 @@ class VLAWrapper:
         self.control_freq = control_freq
         self.control_dt = 1.0 / control_freq
         self.tile_mode = tile_mode
+        self.playback_home = playback_home
 
         # Initialize real-time spike filter for observation.state
         # Uses same threshold as training data preprocessing for consistency
@@ -284,6 +289,8 @@ class VLAWrapper:
         if chunk_execution:
             print(f"Chunk execution: ENABLED ({control_freq} Hz)")
         print(f"Spike filter: ENABLED (threshold={self.spike_filter.threshold} rad)")
+        if playback_home is not None:
+            print(f"Home-relative norm: ENABLED (will add playback home to outputs)")
 
         if robot_controller:
             print(f"Robot: SO-100 via RobotController (position-controlled)")
@@ -365,6 +372,9 @@ class VLAWrapper:
         If chunk_execution is enabled and action contains action_chunk,
         executes the full 50-step trajectory at control_freq Hz.
 
+        If playback_home is set (for home-relative normalization), the home
+        offset is added to convert model outputs to absolute positions.
+
         Args:
             action: Action dict from predict_action()
                    - joint_positions: Single-step target (6D)
@@ -374,20 +384,31 @@ class VLAWrapper:
         Returns:
             bool: True if execution successful
         """
+        # Apply home-relative to absolute conversion if playback_home is set
+        # This enables multi-robot portability: model outputs home-relative offsets,
+        # we add the playback robot's home to get correct absolute positions
+        joint_positions = action["joint_positions"]
+        if self.playback_home is not None:
+            joint_positions = joint_positions + self.playback_home
+
         # Check for chunk-based execution
         if self.chunk_execution and "action_chunk" in action:
-            return self._execute_action_chunk(action["action_chunk"])
+            action_chunk = action["action_chunk"]
+            if self.playback_home is not None:
+                # Transform entire chunk
+                action_chunk = action_chunk + self.playback_home
+            return self._execute_action_chunk(action_chunk)
 
         # Single-step execution (original behavior)
         # Prefer RobotController (position-controlled with continuous holding)
         if self.robot_controller:
-            self.robot_controller.set_target_positions(action["joint_positions"])
+            self.robot_controller.set_target_positions(joint_positions)
             return True
 
         # Fallback to direct SO100Arm control
         if self.robot_arm:
             success = self.robot_arm.move_joints(
-                action["joint_positions"],
+                joint_positions,
                 speed=speed,
                 blocking=False  # Non-blocking for continuous control
             )
@@ -992,6 +1013,8 @@ def main():
     print("=" * 60)
 
     robot_controller = None
+    playback_home = None  # For home-relative normalization
+
     if not args.no_robot and SO100_AVAILABLE:
         try:
             # Load port-specific joint configs for calibrated home positions
@@ -1001,6 +1024,9 @@ def main():
             print(f"[INFO] Config source: {config_source}")
             home_degs = [f"{np.degrees(c.home_rad):.1f}" for c in joint_configs]
             print(f"[INFO] Home positions: [{', '.join(home_degs)}] deg")
+
+            # Extract home positions for home-relative normalization
+            playback_home = np.array([c.home_rad for c in joint_configs], dtype=np.float32)
 
             # Create RobotController for position-controlled operation
             robot_controller = RobotController(
@@ -1138,7 +1164,15 @@ def main():
         chunk_execution=args.chunk_execution,
         control_freq=args.control_freq,
         tile_mode=tile_mode,
+        playback_home=playback_home,
     )
+
+    # Log home-relative normalization status
+    if playback_home is not None:
+        print(f"[INFO] Home-relative normalization: ENABLED")
+        print(f"       Playback home: [{', '.join(f'{np.degrees(h):.1f}' for h in playback_home)}] deg")
+    else:
+        print(f"[INFO] Home-relative normalization: DISABLED (no robot or config)")
 
     # CRITICAL: Validate normalizer when robot is connected
     # Without normalization, raw model outputs will send robot to dangerous positions
