@@ -31,6 +31,32 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.angle_utils import fix_angle_spikes, smooth_actions
 
 
+def load_quality_annotations(dataset_path: Path) -> Dict[int, str]:
+    """
+    Load episode quality annotations from dataset.
+
+    Quality annotations are saved by validate_vla_episodes.py to:
+    {dataset_path}/episode_qualities.json
+
+    Args:
+        dataset_path: Path to the dataset directory
+
+    Returns:
+        Dict mapping episode_index -> quality ("good", "bad", or "unreviewed")
+    """
+    quality_file = dataset_path / "episode_qualities.json"
+    if not quality_file.exists():
+        return {}
+
+    try:
+        with open(quality_file, 'r') as f:
+            loaded = json.load(f)
+            return {int(k): v for k, v in loaded.items()}
+    except Exception as e:
+        print(f"[WARN] Failed to load quality annotations: {e}")
+        return {}
+
+
 class FilterMode(Enum):
     """Filtering mode for removing idle frames."""
     POSITION = "position"      # Original: position-based comparison
@@ -405,6 +431,7 @@ def clean_dataset(
     smooth_actions: bool = False,
     smooth_sigma: float = 1.0,
     output_format: str = "png",
+    skip_bad: bool = True,
     verbose: bool = True,
 ) -> Dict:
     """
@@ -425,6 +452,7 @@ def clean_dataset(
         output_format: Output format - 'video' (AV1 re-encode) or 'png' (frame extraction)
                       PNG format provides ~10-20x faster training (no video decoding)
                       at the cost of ~10-20x more storage
+        skip_bad: Skip episodes marked as 'bad' in episode_qualities.json (default: True)
         verbose: Print progress
 
     Returns:
@@ -443,11 +471,22 @@ def clean_dataset(
 
     fps = info.get("fps", 15)
 
+    # Load quality annotations if skip_bad is enabled
+    quality_annotations = {}
+    bad_episodes = set()
+    if skip_bad:
+        quality_annotations = load_quality_annotations(input_dir)
+        bad_episodes = {idx for idx, quality in quality_annotations.items() if quality == "bad"}
+
     if verbose:
         print(f"[*] Loading dataset from: {input_dir}")
         print(f"    Original episodes: {info['total_episodes']}")
         print(f"    Original frames: {info['total_frames']}")
         print(f"    Filter mode: {mode.value}")
+        if skip_bad and quality_annotations:
+            print(f"    Quality annotations: {len(quality_annotations)} episodes annotated")
+            if bad_episodes:
+                print(f"    Skipping bad episodes: {sorted(bad_episodes)}")
         if mode == FilterMode.MAGNITUDE:
             print(f"    Idle threshold: {idle_threshold}")
         else:
@@ -468,6 +507,8 @@ def clean_dataset(
         "cleaned_frames": 0,
         "removed_frames": 0,
         "episodes_processed": 0,
+        "episodes_skipped": 0,
+        "skipped_episode_indices": [],
         "per_episode": [],
     }
 
@@ -486,6 +527,14 @@ def clean_dataset(
 
         # Process each episode in this file
         for ep_idx in df["episode_index"].unique():
+            # Skip episodes marked as 'bad' in quality annotations
+            if ep_idx in bad_episodes:
+                if verbose:
+                    print(f"    Episode {ep_idx}: SKIPPED (marked as bad)")
+                stats["episodes_skipped"] += 1
+                stats["skipped_episode_indices"].append(ep_idx)
+                continue
+
             ep_df = df[df["episode_index"] == ep_idx].copy()
 
             cleaned_df, removed_frames, orig_count, new_count, preprocess_info = clean_episode(
@@ -857,6 +906,9 @@ def clean_dataset(
         print("=" * 50)
         print("[OK] Dataset cleaning complete!")
         print("=" * 50)
+        print(f"    Episodes processed: {stats['episodes_processed']}")
+        if stats['episodes_skipped'] > 0:
+            print(f"    Episodes skipped (bad): {stats['episodes_skipped']} {stats['skipped_episode_indices']}")
         print(f"    Original frames: {stats['original_frames']}")
         print(f"    Cleaned frames: {stats['cleaned_frames']}")
         print(f"    Removed frames: {stats['removed_frames']}")
@@ -908,7 +960,11 @@ def main():
         epilog="""
 Examples:
     # Default: PNG frame extraction (fast training, larger storage)
+    # Episodes marked as 'bad' in episode_qualities.json are skipped by default
     python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes
+
+    # Include bad episodes (override default skip behavior)
+    python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes --include-bad
 
     # Use video format instead (compact, slower training)
     python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes --no-png
@@ -919,7 +975,7 @@ Examples:
     # Backward compatible: position-based filtering
     python scripts/clean_lerobot_dataset.py --mode position --tolerance 0.01
 
-    # Dry run to preview changes
+    # Dry run to preview changes (shows which episodes would be skipped)
     python scripts/clean_lerobot_dataset.py --dry-run
 
 Based on OpenPI, VLA-Cache, and OpenVLA best practices.
@@ -999,6 +1055,17 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         help="Output format: 'video' (AV1 re-encode) or 'png' (frame extraction, default)"
     )
     parser.add_argument(
+        "--skip-bad",
+        action="store_true",
+        default=True,
+        help="Skip episodes marked as 'bad' in episode_qualities.json (default: True)"
+    )
+    parser.add_argument(
+        "--include-bad",
+        action="store_true",
+        help="Include episodes marked as 'bad' (overrides --skip-bad)"
+    )
+    parser.add_argument(
         "--no-png",
         action="store_true",
         help="Disable PNG frame extraction, use video format instead (shortcut for --output-format video)"
@@ -1024,6 +1091,10 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
     if args.no_png:
         args.output_format = "video"
 
+    # Handle --include-bad flag (overrides --skip-bad)
+    if args.include_bad:
+        args.skip_bad = False
+
     if args.dry_run:
         print("[DRY RUN] Analyzing dataset without creating output...")
         print(f"    Mode: {args.mode}")
@@ -1033,19 +1104,39 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
             print(f"    Position tolerance: {args.tolerance}")
         print(f"    Angle unwrapping: {args.unwrap_angles}")
         print(f"    Action smoothing: {args.smooth_actions}")
+        print(f"    Skip bad episodes: {args.skip_bad}")
         print()
 
         input_dir = Path(args.input)
         data_dir = input_dir / "data"
 
+        # Load quality annotations for dry run
+        quality_annotations = {}
+        bad_episodes = set()
+        if args.skip_bad:
+            quality_annotations = load_quality_annotations(input_dir)
+            bad_episodes = {idx for idx, quality in quality_annotations.items() if quality == "bad"}
+            if quality_annotations:
+                print(f"Quality annotations: {len(quality_annotations)} episodes annotated")
+                if bad_episodes:
+                    print(f"Bad episodes to skip: {sorted(bad_episodes)}")
+                print()
+
         total_orig = 0
         total_keep = 0
         total_unwrap_fixes = 0
+        total_skipped = 0
 
         for pq_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
             df = pq.read_table(pq_file).to_pandas()
 
             for ep_idx in df["episode_index"].unique():
+                # Skip bad episodes in dry run
+                if ep_idx in bad_episodes:
+                    print(f"Episode {ep_idx}: SKIPPED (marked as bad)")
+                    total_skipped += 1
+                    continue
+
                 ep_df = df[df["episode_index"] == ep_idx]
                 states = np.array(ep_df["observation.state"].tolist())
                 actions = np.array(ep_df["action"].tolist())
@@ -1079,6 +1170,8 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         print()
         print(f"Total: {total_orig} -> {total_keep} frames")
         print(f"Would remove: {total_orig - total_keep} frames ({100*(total_orig-total_keep)/total_orig:.1f}%)")
+        if total_skipped > 0:
+            print(f"Episodes skipped (bad): {total_skipped}")
         if args.unwrap_angles and total_unwrap_fixes > 0:
             print(f"Angle unwrap fixes: {total_unwrap_fixes} corrections")
         return
@@ -1094,6 +1187,7 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         smooth_actions=args.smooth_actions,
         smooth_sigma=args.smooth_sigma,
         output_format=args.output_format,
+        skip_bad=args.skip_bad,
         verbose=not args.quiet,
     )
 
