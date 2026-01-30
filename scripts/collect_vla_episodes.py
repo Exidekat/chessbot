@@ -425,11 +425,15 @@ class EpisodeRecorder:
                     print(f"[WARN] Failed to load home positions: {e}")
                     self.recording_home = None
             else:
-                print(f"[WARN] No config found for {self.robot_port}, home normalization disabled")
-                self.robot_config_source = None
+                raise RuntimeError(
+                    f"No robot config found for {self.robot_port}. "
+                    f"Expected config at: {self.robot_config_source}"
+                )
         else:
-            print(f"[WARN] Could not determine robot port, home normalization disabled")
-            print(f"       Make sure tele_op.py is running with tele-op mode active")
+            raise RuntimeError(
+                "Could not determine robot port - tele_op.py must be running with tele-op mode active. "
+                "Start tele_op.py first, then run this script."
+            )
 
     def start_cameras(self) -> bool:
         """
@@ -582,10 +586,21 @@ class EpisodeRecorder:
             self.episode_count += 1
 
             # Copy robot config for this episode (per-episode for multi-robot portability)
-            if self.robot_config_source and self.robot_config_source.exists():
-                robot_configs_dir = self.output_dir / "robot_configs"
-                episode_config_path = robot_configs_dir / f"episode_{episode_index:06d}.csv"
-                shutil.copy2(self.robot_config_source, episode_config_path)
+            # This is REQUIRED - episodes without configs are useless for training
+            if not self.robot_config_source:
+                raise RuntimeError(
+                    f"Cannot save episode {episode_index}: no robot config source. "
+                    f"Ensure tele_op.py is running before starting collection."
+                )
+            if not self.robot_config_source.exists():
+                raise RuntimeError(
+                    f"Cannot save episode {episode_index}: robot config not found at {self.robot_config_source}"
+                )
+
+            robot_configs_dir = self.output_dir / "robot_configs"
+            robot_configs_dir.mkdir(parents=True, exist_ok=True)
+            episode_config_path = robot_configs_dir / f"episode_{episode_index:06d}.csv"
+            shutil.copy2(self.robot_config_source, episode_config_path)
 
         self.save_queue.put((frame_paths, stage_info, episode_index))
         print(f"[INFO] Queued episode {episode_index} ({len(frame_paths)} frames, queue size: {self.save_queue.qsize()})")

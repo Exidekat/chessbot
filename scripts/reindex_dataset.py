@@ -53,11 +53,45 @@ def reindex_dataset(dataset_path: Path, dry_run: bool = False):
         print("[ERROR] No episodes found in dataset!")
         return False
 
-    # Check if already contiguous
+    # Check if episode indices are contiguous
     expected_contiguous = list(range(len(current_episodes)))
-    if current_episodes == expected_contiguous:
+    indices_contiguous = (current_episodes == expected_contiguous)
+
+    # Check if parquet file names are contiguous (LeRobot requires this)
+    def check_file_contiguity(directory: Path, pattern: str) -> bool:
+        """Check if file-NNN.parquet files are contiguously numbered."""
+        files = sorted(directory.glob(pattern))
+        if not files:
+            return True
+        indices = []
+        for f in files:
+            try:
+                idx = int(f.stem.replace("file-", ""))
+                indices.append(idx)
+            except ValueError:
+                continue
+        return indices == list(range(len(indices)))
+
+    data_files_contiguous = all(
+        check_file_contiguity(chunk_dir, "file-*.parquet")
+        for chunk_dir in data_dir.glob("chunk-*")
+    )
+    meta_files_contiguous = all(
+        check_file_contiguity(chunk_dir, "file-*.parquet")
+        for chunk_dir in episodes_dir.glob("chunk-*")
+    ) if episodes_dir.exists() else True
+
+    if indices_contiguous and data_files_contiguous and meta_files_contiguous:
         print(f"[OK] Dataset already has contiguous indices (0-{len(current_episodes)-1})")
         return True
+
+    # Report what needs fixing
+    if not indices_contiguous:
+        print(f"[INFO] Episode indices have gaps: {min(current_episodes)}-{max(current_episodes)} ({len(current_episodes)} episodes)")
+    if not data_files_contiguous:
+        print(f"[INFO] Data parquet files have gaps in numbering")
+    if not meta_files_contiguous:
+        print(f"[INFO] Meta/episodes parquet files have gaps in numbering")
 
     # Create old_index -> new_index mapping
     index_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(current_episodes)}
@@ -113,6 +147,48 @@ def reindex_dataset(dataset_path: Path, dry_run: bool = False):
         except Exception as e:
             print(f"[ERROR] Failed to update {ep_file}: {e}")
             return False
+
+    # Step 3b: Renumber data parquet file names to be contiguous
+    print("\n[INFO] Renumbering data parquet files...")
+    for chunk_dir in sorted(data_dir.glob("chunk-*")):
+        files = sorted(chunk_dir.glob("file-*.parquet"))
+        # First pass: rename to temp to avoid collisions
+        temp_renames = []
+        for new_idx, f in enumerate(files):
+            old_name = f.name
+            new_name = f"file-{new_idx:03d}.parquet"
+            if old_name != new_name:
+                temp_path = chunk_dir / f"{f.stem}.tmp"
+                final_path = chunk_dir / new_name
+                temp_renames.append((f, temp_path, final_path, old_name, new_name))
+        # Rename to temp
+        for src, temp, _, _, _ in temp_renames:
+            src.rename(temp)
+        # Rename to final
+        for _, temp, final, old_name, new_name in temp_renames:
+            temp.rename(final)
+            print(f"  {chunk_dir.name}/{old_name} -> {new_name}")
+
+    # Step 3c: Renumber meta/episodes parquet file names to be contiguous
+    print("\n[INFO] Renumbering episode metadata files...")
+    for chunk_dir in sorted(episodes_dir.glob("chunk-*")):
+        files = sorted(chunk_dir.glob("file-*.parquet"))
+        # First pass: rename to temp to avoid collisions
+        temp_renames = []
+        for new_idx, f in enumerate(files):
+            old_name = f.name
+            new_name = f"file-{new_idx:03d}.parquet"
+            if old_name != new_name:
+                temp_path = chunk_dir / f"{f.stem}.tmp"
+                final_path = chunk_dir / new_name
+                temp_renames.append((f, temp_path, final_path, old_name, new_name))
+        # Rename to temp
+        for src, temp, _, _, _ in temp_renames:
+            src.rename(temp)
+        # Rename to final
+        for _, temp, final, old_name, new_name in temp_renames:
+            temp.rename(final)
+            print(f"  {chunk_dir.name}/{old_name} -> {new_name}")
 
     # Step 4: Rename video files
     print("\n[INFO] Renaming video files...")
