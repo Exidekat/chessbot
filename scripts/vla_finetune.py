@@ -308,7 +308,7 @@ def save_checkpoint(
     config: BaseTrainingConfig,
     path: Path,
     tile_mode: str = "multi_tile",
-    preprocessing_mode: str = "grayscale",
+    preprocessing_mode: str = "rgb",
 ):
     """Save training checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +322,7 @@ def save_checkpoint(
         "model_name": config.model_name,
         "full_finetuning": not (config.freeze_vision_encoder or config.freeze_language_encoder),
         "tile_mode": tile_mode,  # Save for deployment consistency
-        "preprocessing_mode": preprocessing_mode,  # Board detection preprocessing (metadata)
+        "preprocessing_mode": preprocessing_mode,  # Board detection mode during collection (metadata only)
     }
 
     torch.save(checkpoint, path)
@@ -680,9 +680,9 @@ Examples:
     parser.add_argument("--tile-mode", type=str, default="multi_tile",
                         choices=["multi_tile", "letterbox"],
                         help="Global camera tiling mode (default: multi_tile)")
-    parser.add_argument("--preprocessing-mode", type=str, default="grayscale",
+    parser.add_argument("--preprocessing-mode", type=str, default="rgb",
                         choices=["grayscale", "rgb"],
-                        help="Board detection preprocessing mode used during episode collection (metadata only, default: grayscale)")
+                        help="Board detection preprocessing mode used during episode collection (metadata only, default: rgb)")
 
     args = parser.parse_args()
 
@@ -828,7 +828,7 @@ Examples:
     print(f"\nDataset format: {dataset_format}")
     print(f"Image size: {config.image_size}")
     print(f"Tile mode: {args.tile_mode}")
-    print(f"Preprocessing mode: {args.preprocessing_mode} (metadata - used during episode collection)")
+    print(f"Collection detection mode: {args.preprocessing_mode} (metadata only - images are always RGB)")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 

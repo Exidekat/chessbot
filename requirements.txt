@@ -27,3 +27,6 @@ matplotlib>=3.7.0  # For plotting grid and visualization (optional)
 
 # For SmolVLA
 num2words
+
+# For memory-efficient training (8-bit Adam optimizer)
+bitsandbytes

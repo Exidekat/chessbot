@@ -245,30 +245,109 @@ def extract_frames_to_video(
 
     output_video.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create a select filter for specific frames
-    # FFmpeg select filter uses 1-indexed frame numbers with eq(n,X)
-    select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
-
     # Codec settings
     if codec == "av1":
         codec_args = ["-c:v", "libaom-av1", "-crf", "30", "-cpu-used", "8"]
     else:
         codec_args = ["-c:v", "libx264", "-crf", "23", "-preset", "fast"]
 
-    cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-i", str(input_video),
-        "-vf", f"select='{select_expr}',setpts=N/{fps}/TB",
-        *codec_args,
-        "-pix_fmt", "yuv420p",
-        "-r", str(fps),
-        str(output_video)
-    ]
+    # For large frame lists, extract to PNG first then encode to video
+    # This avoids shell argument length limits and ffmpeg filter issues
+    if len(keep_frames) > 500:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            extracted_idx = 0
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"[WARN] FFmpeg error: {result.stderr}")
-        return False
+            # Try PyAV first (supports AV1 codec)
+            try:
+                import av
+                container = av.open(str(input_video))
+                stream = container.streams.video[0]
+
+                frame_set = set(keep_frames)
+                frame_num = 0
+
+                for frame in container.decode(stream):
+                    if frame_num in frame_set:
+                        img = frame.to_ndarray(format='bgr24')
+                        out_path = tmpdir / f"frame_{extracted_idx:06d}.png"
+                        import cv2
+                        cv2.imwrite(str(out_path), img)
+                        extracted_idx += 1
+                    frame_num += 1
+                    # Early exit if we've extracted all needed frames
+                    if extracted_idx >= len(keep_frames):
+                        break
+
+                container.close()
+
+            except ImportError:
+                # PyAV not available, fall back to ffmpeg batching
+                batch_size = 400
+                for batch_start in range(0, len(keep_frames), batch_size):
+                    batch_frames = keep_frames[batch_start:batch_start + batch_size]
+                    select_expr = "+".join([f"eq(n\\,{f})" for f in batch_frames])
+
+                    batch_dir = tmpdir / f"batch_{batch_start:06d}"
+                    batch_dir.mkdir(parents=True, exist_ok=True)
+
+                    cmd = [
+                        "ffmpeg", "-y", "-v", "error",
+                        "-i", str(input_video),
+                        "-vf", f"select='{select_expr}'",
+                        "-vsync", "vfr",
+                        str(batch_dir / "frame_%06d.png")
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        print(f"[WARN] FFmpeg batch error: {result.stderr}")
+                        continue
+
+                    # Collect extracted frames
+                    batch_pngs = sorted(batch_dir.glob("frame_*.png"))
+                    for png in batch_pngs:
+                        new_name = tmpdir / f"frame_{extracted_idx:06d}.png"
+                        shutil.move(str(png), str(new_name))
+                        extracted_idx += 1
+
+            if extracted_idx != len(keep_frames):
+                print(f"[WARN] Expected {len(keep_frames)} frames, extracted {extracted_idx}")
+
+            if extracted_idx == 0:
+                print(f"[WARN] No frames extracted!")
+                return False
+
+            # Encode PNGs to video
+            cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-framerate", str(fps),
+                "-i", str(tmpdir / "frame_%06d.png"),
+                *codec_args,
+                "-pix_fmt", "yuv420p",
+                str(output_video)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[WARN] FFmpeg encode error: {result.stderr}")
+                return False
+    else:
+        # For smaller frame lists, use inline select filter
+        select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
+
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(input_video),
+            "-vf", f"select='{select_expr}',setpts=N/{fps}/TB",
+            *codec_args,
+            "-pix_fmt", "yuv420p",
+            "-r", str(fps),
+            str(output_video)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[WARN] FFmpeg error: {result.stderr}")
+            return False
 
     return output_video.exists()
 
@@ -306,22 +385,79 @@ def extract_frames_to_png(
     episode_dir = output_dir / f"episode-{episode_idx:06d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract all frames at once using ffmpeg's select filter (more efficient)
-    # Build select expression for the frames we want
-    select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
+    # For large frame lists, use PyAV to avoid ffmpeg command line limits
+    # PyAV supports AV1 codec while OpenCV may not
+    if len(keep_frames) > 500:
+        extracted_idx = 0
 
-    # Use a temporary approach: extract to temp files with ffmpeg frame numbers,
-    # then rename to our sequential numbering
+        try:
+            import av
+            import cv2
+            container = av.open(str(input_video))
+            stream = container.streams.video[0]
+
+            frame_set = set(keep_frames)
+            frame_num = 0
+
+            for frame in container.decode(stream):
+                if frame_num in frame_set:
+                    img = frame.to_ndarray(format='bgr24')
+                    out_path = episode_dir / f"frame-{extracted_idx:06d}.png"
+                    cv2.imwrite(str(out_path), img)
+                    extracted_idx += 1
+                frame_num += 1
+                # Early exit if we've extracted all needed frames
+                if extracted_idx >= len(keep_frames):
+                    break
+
+            container.close()
+
+            if extracted_idx != len(keep_frames):
+                print(f"[WARN] Expected {len(keep_frames)} frames, extracted {extracted_idx}")
+
+            return episode_dir.exists() and extracted_idx > 0
+
+        except ImportError:
+            # PyAV not available - fall back to ffmpeg batching
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+                batch_size = 400
+
+                for batch_start in range(0, len(keep_frames), batch_size):
+                    batch_frames = keep_frames[batch_start:batch_start + batch_size]
+                    select_expr = "+".join([f"eq(n\\,{f})" for f in batch_frames])
+
+                    cmd = [
+                        "ffmpeg", "-y", "-v", "error",
+                        "-i", str(input_video),
+                        "-vf", f"select='{select_expr}'",
+                        "-vsync", "vfr",
+                        str(tmpdir / "frame_%06d.png")
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        print(f"[WARN] FFmpeg batch error: {result.stderr}")
+                        continue
+
+                    # Move extracted frames to episode directory
+                    batch_pngs = sorted(tmpdir.glob("frame_*.png"))
+                    for png in batch_pngs:
+                        dst_path = episode_dir / f"frame-{extracted_idx:06d}.png"
+                        shutil.move(str(png), str(dst_path))
+                        extracted_idx += 1
+
+                return episode_dir.exists() and extracted_idx > 0
+
+    # For smaller frame lists, use ffmpeg's select filter
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
+        select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
 
-        # Extract selected frames to temp directory
-        # ffmpeg will output frame_0001.png, frame_0002.png, etc. for selected frames
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-i", str(input_video),
             "-vf", f"select='{select_expr}'",
-            "-vsync", "vfr",  # Variable frame rate to handle select filter
+            "-vsync", "vfr",
             str(tmpdir / "frame_%06d.png")
         ]
 
@@ -331,7 +467,6 @@ def extract_frames_to_png(
             return False
 
         # Rename extracted frames to sequential numbering (0-indexed)
-        # LeRobot format: frame-XXXXXX.png (with hyphen, not underscore)
         extracted_frames = sorted(tmpdir.glob("frame_*.png"))
         if len(extracted_frames) != len(keep_frames):
             print(f"[WARN] Expected {len(keep_frames)} frames, got {len(extracted_frames)}")
@@ -431,7 +566,7 @@ def clean_dataset(
     smooth_actions: bool = False,
     smooth_sigma: float = 1.0,
     output_format: str = "png",
-    skip_bad: bool = True,
+    skip_bad_episodes: bool = True,
     verbose: bool = True,
 ) -> Dict:
     """
@@ -452,7 +587,7 @@ def clean_dataset(
         output_format: Output format - 'video' (AV1 re-encode) or 'png' (frame extraction)
                       PNG format provides ~10-20x faster training (no video decoding)
                       at the cost of ~10-20x more storage
-        skip_bad: Skip episodes marked as 'bad' in episode_qualities.json (default: True)
+        skip_bad_episodes: Skip episodes marked as 'bad' in episode_qualities.json
         verbose: Print progress
 
     Returns:
@@ -471,22 +606,20 @@ def clean_dataset(
 
     fps = info.get("fps", 15)
 
-    # Load quality annotations if skip_bad is enabled
+    # Load quality annotations if available (for skipping bad episodes)
     quality_annotations = {}
     bad_episodes = set()
-    if skip_bad:
+    if skip_bad_episodes:
         quality_annotations = load_quality_annotations(input_dir)
         bad_episodes = {idx for idx, quality in quality_annotations.items() if quality == "bad"}
+        if verbose and bad_episodes:
+            print(f"[*] Found {len(bad_episodes)} bad episodes to skip: {sorted(bad_episodes)}")
 
     if verbose:
         print(f"[*] Loading dataset from: {input_dir}")
         print(f"    Original episodes: {info['total_episodes']}")
         print(f"    Original frames: {info['total_frames']}")
         print(f"    Filter mode: {mode.value}")
-        if skip_bad and quality_annotations:
-            print(f"    Quality annotations: {len(quality_annotations)} episodes annotated")
-            if bad_episodes:
-                print(f"    Skipping bad episodes: {sorted(bad_episodes)}")
         if mode == FilterMode.MAGNITUDE:
             print(f"    Idle threshold: {idle_threshold}")
         else:
@@ -507,14 +640,29 @@ def clean_dataset(
         "cleaned_frames": 0,
         "removed_frames": 0,
         "episodes_processed": 0,
-        "episodes_skipped": 0,
-        "skipped_episode_indices": [],
         "per_episode": [],
     }
 
     # Track frame mapping per episode for video processing
-    episode_frame_maps = {}  # episode_idx -> list of original frame indices to keep
-    episode_orig_lengths = {}  # episode_idx -> original frame count (for video offset calc)
+    episode_frame_maps = {}  # new_ep_idx -> list of original frame indices to keep
+    episode_orig_lengths = {}  # orig_ep_idx -> original frame count (for video offset calc)
+
+    # Build mapping from original episode index to new contiguous index
+    # First pass: collect all episode indices that will be kept
+    kept_episodes = []
+    for pq_file in parquet_files:
+        df = pq.read_table(pq_file).to_pandas()
+        for ep_idx in df["episode_index"].unique():
+            if ep_idx not in bad_episodes and ep_idx not in kept_episodes:
+                kept_episodes.append(ep_idx)
+    kept_episodes = sorted(kept_episodes)
+
+    # Create old->new index mapping for contiguous output
+    old_to_new_ep_idx = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_episodes)}
+
+    if verbose and bad_episodes:
+        print(f"    Episodes after filtering: {len(kept_episodes)} (skipped {len(bad_episodes)} bad)")
+        print(f"    Reindexing: {min(kept_episodes)}-{max(kept_episodes)} -> 0-{len(kept_episodes)-1}")
 
     all_cleaned_dfs = []
     global_new_index = 0
@@ -527,15 +675,16 @@ def clean_dataset(
 
         # Process each episode in this file
         for ep_idx in df["episode_index"].unique():
-            # Skip episodes marked as 'bad' in quality annotations
+            # Skip bad episodes
             if ep_idx in bad_episodes:
                 if verbose:
                     print(f"    Episode {ep_idx}: SKIPPED (marked as bad)")
-                stats["episodes_skipped"] += 1
-                stats["skipped_episode_indices"].append(ep_idx)
                 continue
 
             ep_df = df[df["episode_index"] == ep_idx].copy()
+
+            # Get new contiguous index for this episode
+            new_ep_idx = old_to_new_ep_idx[ep_idx]
 
             cleaned_df, removed_frames, orig_count, new_count, preprocess_info = clean_episode(
                 ep_df,
@@ -552,11 +701,12 @@ def clean_dataset(
             # removed_frames are row indices (0, 1, 2, ...), same as frame_index values
             orig_frames = ep_df["frame_index"].values
             keep_frames = [f for f in orig_frames if f not in removed_frames]
-            episode_frame_maps[ep_idx] = keep_frames
-            episode_orig_lengths[ep_idx] = orig_count  # Store original length for offset
+            episode_frame_maps[new_ep_idx] = keep_frames  # Use new index for output mapping
+            episode_orig_lengths[ep_idx] = orig_count  # Store original length for offset (keyed by orig idx)
 
-            # Update indices for cleaned frames
+            # Update indices for cleaned frames - use new contiguous episode index
             cleaned_df = cleaned_df.reset_index(drop=True)
+            cleaned_df["episode_index"] = new_ep_idx  # Remap to new contiguous index
             cleaned_df["frame_index"] = range(len(cleaned_df))
             cleaned_df["index"] = range(global_new_index, global_new_index + len(cleaned_df))
 
@@ -572,7 +722,7 @@ def clean_dataset(
                     # Include full path from working directory for HuggingFace datasets compatibility
                     paths = []
                     for frame_idx in range(len(cleaned_df)):
-                        path = f"{output_path}/images/{cam_key}/episode-{ep_idx:06d}/frame-{frame_idx:06d}.png"
+                        path = f"{output_path}/images/{cam_key}/episode-{new_ep_idx:06d}/frame-{frame_idx:06d}.png"
                         paths.append({"path": path, "bytes": None})
                     cleaned_df[cam_key] = paths
 
@@ -587,7 +737,8 @@ def clean_dataset(
             stats["unwrap_fixes_state"] = stats.get("unwrap_fixes_state", 0) + preprocess_info["unwrap_fixes_state"]
             stats["unwrap_fixes_action"] = stats.get("unwrap_fixes_action", 0) + preprocess_info["unwrap_fixes_action"]
             stats["per_episode"].append({
-                "episode": ep_idx,
+                "episode": new_ep_idx,  # Use new contiguous index
+                "original_episode": ep_idx,  # Keep original for reference
                 "original": orig_count,
                 "cleaned": new_count,
                 "removed": orig_count - new_count,
@@ -600,7 +751,8 @@ def clean_dataset(
                 unwrap_info = ""
                 if preprocess_info["unwrap_fixes_state"] + preprocess_info["unwrap_fixes_action"] > 0:
                     unwrap_info = f" [{preprocess_info['unwrap_fixes_state'] + preprocess_info['unwrap_fixes_action']} unwrap fixes]"
-                print(f"    Episode {ep_idx}: {orig_count} -> {new_count} frames ({reduction:.1f}% reduction){unwrap_info}")
+                reindex_info = f" (-> {new_ep_idx})" if new_ep_idx != ep_idx else ""
+                print(f"    Episode {ep_idx}{reindex_info}: {orig_count} -> {new_count} frames ({reduction:.1f}% reduction){unwrap_info}")
 
     # Combine all cleaned data
     if all_cleaned_dfs:
@@ -632,22 +784,30 @@ def clean_dataset(
         file_idx += 1
 
     # Determine which episodes are in which video file (needed for both formats)
-    # This requires reading the meta/episodes parquet
+    # Read the actual video file index from episode metadata, not from the parquet filename
+    # IMPORTANT: Build separate mappings per camera, as different cameras may have different file indices
     episodes_meta_dir = input_dir / "meta" / "episodes" / "chunk-000"
 
-    ep_to_video = {}  # episode_idx -> video_file_idx
-    video_to_eps = {}  # video_file_idx -> list of episode_idx
+    camera_keys = ["observation.images.global", "observation.images.gripper"]
+    ep_to_video_per_camera = {cam: {} for cam in camera_keys}  # {camera: {episode_idx -> video_file_idx}}
+    video_to_eps_per_camera = {cam: {} for cam in camera_keys}  # {camera: {video_file_idx -> [episode_idx, ...]}}
 
     for meta_file in sorted(episodes_meta_dir.glob("file-*.parquet")):
-        file_idx_str = meta_file.stem.split("-")[-1]
-        file_idx_int = int(file_idx_str)
-
         ep_meta = pq.read_table(meta_file).to_pandas()
-        for ep_idx in ep_meta["episode_index"].unique():
-            ep_to_video[ep_idx] = file_idx_int
-            if file_idx_int not in video_to_eps:
-                video_to_eps[file_idx_int] = []
-            video_to_eps[file_idx_int].append(ep_idx)
+        for _, row in ep_meta.iterrows():
+            ep_idx = int(row["episode_index"])
+            # Get video file index for each camera separately
+            for cam_key in camera_keys:
+                col_name = f"videos/{cam_key}/file_index"
+                if col_name in row:
+                    vid_file_idx = int(row[col_name])
+                else:
+                    # Fallback to global camera index if column doesn't exist
+                    vid_file_idx = int(row.get("videos/observation.images.global/file_index", 0))
+                ep_to_video_per_camera[cam_key][ep_idx] = vid_file_idx
+                if vid_file_idx not in video_to_eps_per_camera[cam_key]:
+                    video_to_eps_per_camera[cam_key][vid_file_idx] = []
+                video_to_eps_per_camera[cam_key][vid_file_idx].append(ep_idx)
 
     # Process videos/images based on output format
     for video_key in ["observation.images.global", "observation.images.gripper"]:
@@ -655,6 +815,10 @@ def clean_dataset(
 
         if not video_in_dir.exists():
             continue
+
+        # Get camera-specific mappings
+        ep_to_video = ep_to_video_per_camera[video_key]
+        video_to_eps = video_to_eps_per_camera[video_key]
 
         if output_format == "png":
             # PNG output: Extract frames to images/ directory
@@ -668,7 +832,10 @@ def clean_dataset(
             video_files = sorted(video_in_dir.glob("file-*.mp4"))
 
             # Process each input video file
-            for vid_file_idx, video_file in enumerate(video_files):
+            for video_file in video_files:
+                # Extract actual file index from filename (file-006.mp4 -> 6)
+                vid_file_idx = int(video_file.stem.split("-")[-1])
+
                 if vid_file_idx not in video_to_eps:
                     continue
 
@@ -677,16 +844,25 @@ def clean_dataset(
                 # Process each episode in this video separately
                 frame_offset = 0
 
-                for ep_idx in sorted(eps_in_video):
-                    if ep_idx not in episode_frame_maps:
-                        # Still need to track offset
-                        orig_length = episode_orig_lengths.get(ep_idx, 0)
+                for orig_ep_idx in sorted(eps_in_video):
+                    # Check if this episode was kept (not skipped as bad)
+                    if orig_ep_idx not in old_to_new_ep_idx:
+                        # Episode was skipped (bad), but still need to track offset
+                        orig_length = episode_orig_lengths.get(orig_ep_idx, 0)
                         frame_offset += orig_length
                         continue
 
-                    ep_frames = episode_frame_maps[ep_idx]
+                    new_ep_idx = old_to_new_ep_idx[orig_ep_idx]
+
+                    if new_ep_idx not in episode_frame_maps:
+                        # Still need to track offset
+                        orig_length = episode_orig_lengths.get(orig_ep_idx, 0)
+                        frame_offset += orig_length
+                        continue
+
+                    ep_frames = episode_frame_maps[new_ep_idx]
                     if not ep_frames:
-                        orig_length = episode_orig_lengths.get(ep_idx, 0)
+                        orig_length = episode_orig_lengths.get(orig_ep_idx, 0)
                         frame_offset += orig_length
                         continue
 
@@ -694,19 +870,21 @@ def clean_dataset(
                     abs_frames = [f + frame_offset for f in ep_frames]
 
                     if verbose:
-                        print(f"    Episode {ep_idx}: extracting {len(abs_frames)} frames to PNG...")
+                        reindex_info = f" (-> {new_ep_idx})" if new_ep_idx != orig_ep_idx else ""
+                        print(f"    Episode {orig_ep_idx}{reindex_info}: extracting {len(abs_frames)} frames to PNG...")
 
+                    # Use NEW episode index for output directory
                     success = extract_frames_to_png(
-                        video_file, image_out_dir, abs_frames, ep_idx
+                        video_file, image_out_dir, abs_frames, new_ep_idx
                     )
 
                     if success and verbose:
-                        print(f"    [OK] Created: episode_{ep_idx:06d}/")
+                        print(f"    [OK] Created: episode-{new_ep_idx:06d}/")
                     elif not success:
-                        print(f"    [WARN] Failed to extract episode {ep_idx}")
+                        print(f"    [WARN] Failed to extract episode {new_ep_idx}")
 
-                    # Update offset for next episode
-                    orig_length = episode_orig_lengths.get(ep_idx, 0)
+                    # Update offset for next episode (use original length)
+                    orig_length = episode_orig_lengths.get(orig_ep_idx, 0)
                     frame_offset += orig_length
 
         else:
@@ -721,7 +899,10 @@ def clean_dataset(
             video_files = sorted(video_in_dir.glob("file-*.mp4"))
 
             # Process each input video file
-            for vid_file_idx, video_file in enumerate(video_files):
+            for video_file in video_files:
+                # Extract actual file index from filename (file-006.mp4 -> 6)
+                vid_file_idx = int(video_file.stem.split("-")[-1])
+
                 if vid_file_idx not in video_to_eps:
                     continue
 
@@ -732,15 +913,18 @@ def clean_dataset(
                 all_keep_frames = []
                 frame_offset = 0
 
-                for ep_idx in sorted(eps_in_video):
-                    if ep_idx in episode_frame_maps:
-                        # Offset by previous episodes' frames
-                        ep_frames = episode_frame_maps[ep_idx]
-                        all_keep_frames.extend([f + frame_offset for f in ep_frames])
+                for orig_ep_idx in sorted(eps_in_video):
+                    # Check if this episode was kept (not skipped as bad)
+                    if orig_ep_idx in old_to_new_ep_idx:
+                        new_ep_idx = old_to_new_ep_idx[orig_ep_idx]
+                        if new_ep_idx in episode_frame_maps:
+                            # Offset by previous episodes' frames
+                            ep_frames = episode_frame_maps[new_ep_idx]
+                            all_keep_frames.extend([f + frame_offset for f in ep_frames])
 
-                        # Use original episode length for offset (not max of kept frames)
-                        orig_length = episode_orig_lengths.get(ep_idx, 0)
-                        frame_offset += orig_length
+                    # Always track offset using original episode length
+                    orig_length = episode_orig_lengths.get(orig_ep_idx, 0)
+                    frame_offset += orig_length
 
                 if not all_keep_frames:
                     continue
@@ -773,8 +957,9 @@ def clean_dataset(
     # Update info.json
     new_info = info.copy()
     new_info["total_frames"] = stats["cleaned_frames"]
-    # Update splits
-    new_info["splits"] = {"train": f"0:{info['total_episodes']}"}
+    new_info["total_episodes"] = len(kept_episodes)  # Update to new contiguous count
+    # Update splits to reflect new contiguous episode count
+    new_info["splits"] = {"train": f"0:{len(kept_episodes)}"}
 
     # Update dtype for image features based on output format
     if output_format == "png":
@@ -816,42 +1001,31 @@ def clean_dataset(
     else:
         orig_ep_meta = pd.DataFrame()
 
+    # Build a mapping of new_ep_idx -> orig_ep_idx for video timestamp calculation
+    new_to_orig_ep_idx = {ep_stat["episode"]: ep_stat["original_episode"] for ep_stat in stats["per_episode"]}
+
     # Build updated episodes metadata preserving original columns
     updated_records = []
     dataset_from = 0  # Running counter for dataset indices
 
     for ep_stat in stats["per_episode"]:
-        ep_idx = ep_stat["episode"]
+        new_ep_idx = ep_stat["episode"]  # New contiguous index
+        orig_ep_idx = ep_stat["original_episode"]  # Original index for metadata lookup
         new_length = ep_stat["cleaned"]
 
-        # Get original record for this episode
-        if len(orig_ep_meta) > 0 and ep_idx in orig_ep_meta["episode_index"].values:
-            orig_row = orig_ep_meta[orig_ep_meta["episode_index"] == ep_idx].iloc[0].to_dict()
+        # Get original record for this episode (using original index)
+        if len(orig_ep_meta) > 0 and orig_ep_idx in orig_ep_meta["episode_index"].values:
+            orig_row = orig_ep_meta[orig_ep_meta["episode_index"] == orig_ep_idx].iloc[0].to_dict()
         else:
             orig_row = {}
 
-        # Find which data file this episode is in (based on our output structure)
-        ep_file_idx = ep_idx // episodes_per_file
+        # Find which data file this episode is in (based on NEW index and output structure)
+        ep_file_idx = new_ep_idx // episodes_per_file
 
-        # Find which video file this episode belongs to (from original mapping)
-        vid_file_idx = ep_to_video.get(ep_idx, 0)
-
-        # Compute video timestamps for this episode in the cleaned video
-        # This requires knowing the frame offset within the output video
-        video_frame_start = 0
-        for prev_ep in sorted(episode_frame_maps.keys()):
-            if prev_ep < ep_idx and ep_to_video.get(prev_ep, -1) == vid_file_idx:
-                video_frame_start += len(episode_frame_maps.get(prev_ep, []))
-            elif prev_ep >= ep_idx:
-                break
-
-        from_ts = video_frame_start / fps
-        to_ts = (video_frame_start + new_length) / fps
-
-        # Build record with all required columns
+        # Build record with all required columns (using NEW contiguous index)
         record = {
-            "episode_index": ep_idx,
-            "tasks": orig_row.get("tasks", [f"Episode {ep_idx}"]),
+            "episode_index": new_ep_idx,
+            "tasks": orig_row.get("tasks", [f"Episode {new_ep_idx}"]),
             "length": new_length,
             "data/chunk_index": 0,
             "data/file_index": ep_file_idx,
@@ -859,16 +1033,35 @@ def clean_dataset(
             "dataset_to_index": dataset_from + new_length,
         }
 
-        # Add video/image metadata for each camera key
+        # Add video/image metadata for each camera key (using NEW index)
+        # Each camera may have different video file indices, so compute per-camera
         for vid_key in ["observation.images.global", "observation.images.gripper"]:
             if output_format == "png":
                 # Image-based metadata: no timestamp info, just chunk/file indices
                 record[f"images/{vid_key}/chunk_index"] = 0
-                record[f"images/{vid_key}/episode_index"] = ep_idx
+                record[f"images/{vid_key}/episode_index"] = new_ep_idx
             else:
                 # Video-based metadata: includes timestamps
+                # Get camera-specific video file index
+                cam_ep_to_video = ep_to_video_per_camera[vid_key]
+                cam_vid_file_idx = cam_ep_to_video.get(orig_ep_idx, 0)
+
+                # Compute video timestamps for this episode in the cleaned video
+                # Only count frames from episodes in the SAME video file for this camera
+                video_frame_start = 0
+                for prev_new_ep in sorted(episode_frame_maps.keys()):
+                    if prev_new_ep >= new_ep_idx:
+                        break
+                    # Check if this previous episode is in the same video file for this camera
+                    prev_orig_ep = new_to_orig_ep_idx.get(prev_new_ep)
+                    if prev_orig_ep is not None and cam_ep_to_video.get(prev_orig_ep) == cam_vid_file_idx:
+                        video_frame_start += len(episode_frame_maps.get(prev_new_ep, []))
+
+                from_ts = video_frame_start / fps
+                to_ts = (video_frame_start + new_length) / fps
+
                 record[f"videos/{vid_key}/chunk_index"] = 0
-                record[f"videos/{vid_key}/file_index"] = vid_file_idx
+                record[f"videos/{vid_key}/file_index"] = cam_vid_file_idx
                 record[f"videos/{vid_key}/from_timestamp"] = from_ts
                 record[f"videos/{vid_key}/to_timestamp"] = to_ts
 
@@ -878,7 +1071,7 @@ def clean_dataset(
                 record[col] = orig_row[col]
 
         # Add meta/episodes file index (which metadata file this episode is in)
-        meta_file_idx = ep_idx // episodes_per_file
+        meta_file_idx = new_ep_idx // episodes_per_file
         record["meta/episodes/chunk_index"] = 0
         record["meta/episodes/file_index"] = meta_file_idx
 
@@ -901,14 +1094,51 @@ def clean_dataset(
     if (input_dir / "norm_stats.json").exists():
         shutil.copy(input_dir / "norm_stats.json", output_dir / "norm_stats.json")
 
+    # Copy episode_qualities.json with reindexed keys (only kept episodes)
+    if quality_annotations:
+        new_qualities = {}
+        for orig_idx, quality in quality_annotations.items():
+            if orig_idx in old_to_new_ep_idx:
+                new_idx = old_to_new_ep_idx[orig_idx]
+                new_qualities[str(new_idx)] = quality
+        if new_qualities:
+            with open(output_dir / "episode_qualities.json", "w") as f:
+                json.dump(new_qualities, f, indent=2)
+            if verbose:
+                print(f"[*] Copied episode_qualities.json with {len(new_qualities)} entries")
+
+    # Copy and reindex robot_configs per-episode files
+    robot_configs_in = input_dir / "robot_configs"
+    if robot_configs_in.exists():
+        robot_configs_out = output_dir / "robot_configs"
+        robot_configs_out.mkdir(parents=True, exist_ok=True)
+
+        if verbose:
+            print(f"[*] Copying robot configs with reindexing...")
+
+        for config_file in sorted(robot_configs_in.glob("episode_*.csv")):
+            try:
+                orig_idx = int(config_file.stem.replace("episode_", ""))
+            except ValueError:
+                continue
+
+            # Only copy if episode was kept (not bad) and remap to new index
+            if orig_idx in old_to_new_ep_idx:
+                new_idx = old_to_new_ep_idx[orig_idx]
+                new_name = f"episode_{new_idx:06d}.csv"
+                shutil.copy(config_file, robot_configs_out / new_name)
+                if verbose and new_idx != orig_idx:
+                    print(f"    Copied: {config_file.name} -> {new_name}")
+
     if verbose:
         print()
         print("=" * 50)
         print("[OK] Dataset cleaning complete!")
         print("=" * 50)
-        print(f"    Episodes processed: {stats['episodes_processed']}")
-        if stats['episodes_skipped'] > 0:
-            print(f"    Episodes skipped (bad): {stats['episodes_skipped']} {stats['skipped_episode_indices']}")
+        print(f"    Original episodes: {info['total_episodes']}")
+        print(f"    Cleaned episodes: {len(kept_episodes)}")
+        if bad_episodes:
+            print(f"    Skipped episodes (bad): {len(bad_episodes)}")
         print(f"    Original frames: {stats['original_frames']}")
         print(f"    Cleaned frames: {stats['cleaned_frames']}")
         print(f"    Removed frames: {stats['removed_frames']}")
@@ -917,6 +1147,7 @@ def clean_dataset(
         total_unwrap_fixes = stats.get("unwrap_fixes_state", 0) + stats.get("unwrap_fixes_action", 0)
         if total_unwrap_fixes > 0:
             print(f"    Angle unwrap fixes: {total_unwrap_fixes} (state: {stats.get('unwrap_fixes_state', 0)}, action: {stats.get('unwrap_fixes_action', 0)})")
+        print(f"    Output indices: 0-{len(kept_episodes)-1} (contiguous)")
         print(f"    Output: {output_dir}")
 
     return stats
@@ -960,11 +1191,7 @@ def main():
         epilog="""
 Examples:
     # Default: PNG frame extraction (fast training, larger storage)
-    # Episodes marked as 'bad' in episode_qualities.json are skipped by default
     python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes
-
-    # Include bad episodes (override default skip behavior)
-    python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes --include-bad
 
     # Use video format instead (compact, slower training)
     python scripts/clean_lerobot_dataset.py -i data/lerobot_episodes -o data/clean_lerobot_episodes --no-png
@@ -975,7 +1202,7 @@ Examples:
     # Backward compatible: position-based filtering
     python scripts/clean_lerobot_dataset.py --mode position --tolerance 0.01
 
-    # Dry run to preview changes (shows which episodes would be skipped)
+    # Dry run to preview changes
     python scripts/clean_lerobot_dataset.py --dry-run
 
 Based on OpenPI, VLA-Cache, and OpenVLA best practices.
@@ -1055,20 +1282,20 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         help="Output format: 'video' (AV1 re-encode) or 'png' (frame extraction, default)"
     )
     parser.add_argument(
-        "--skip-bad",
+        "--no-png",
+        action="store_true",
+        help="Disable PNG frame extraction, use video format instead (shortcut for --output-format video)"
+    )
+    parser.add_argument(
+        "--skip-bad-episodes",
         action="store_true",
         default=True,
         help="Skip episodes marked as 'bad' in episode_qualities.json (default: True)"
     )
     parser.add_argument(
-        "--include-bad",
+        "--no-skip-bad",
         action="store_true",
-        help="Include episodes marked as 'bad' (overrides --skip-bad)"
-    )
-    parser.add_argument(
-        "--no-png",
-        action="store_true",
-        help="Disable PNG frame extraction, use video format instead (shortcut for --output-format video)"
+        help="Include all episodes, even those marked as 'bad'"
     )
     parser.add_argument(
         "--dry-run",
@@ -1091,9 +1318,9 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
     if args.no_png:
         args.output_format = "video"
 
-    # Handle --include-bad flag (overrides --skip-bad)
-    if args.include_bad:
-        args.skip_bad = False
+    # Handle --no-skip-bad flag
+    if args.no_skip_bad:
+        args.skip_bad_episodes = False
 
     if args.dry_run:
         print("[DRY RUN] Analyzing dataset without creating output...")
@@ -1104,22 +1331,19 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
             print(f"    Position tolerance: {args.tolerance}")
         print(f"    Angle unwrapping: {args.unwrap_angles}")
         print(f"    Action smoothing: {args.smooth_actions}")
-        print(f"    Skip bad episodes: {args.skip_bad}")
+        print(f"    Skip bad episodes: {args.skip_bad_episodes}")
         print()
 
         input_dir = Path(args.input)
         data_dir = input_dir / "data"
 
-        # Load quality annotations for dry run
-        quality_annotations = {}
+        # Load quality annotations for skipping
         bad_episodes = set()
-        if args.skip_bad:
+        if args.skip_bad_episodes:
             quality_annotations = load_quality_annotations(input_dir)
             bad_episodes = {idx for idx, quality in quality_annotations.items() if quality == "bad"}
-            if quality_annotations:
-                print(f"Quality annotations: {len(quality_annotations)} episodes annotated")
-                if bad_episodes:
-                    print(f"Bad episodes to skip: {sorted(bad_episodes)}")
+            if bad_episodes:
+                print(f"[*] Found {len(bad_episodes)} bad episodes to skip: {sorted(bad_episodes)}")
                 print()
 
         total_orig = 0
@@ -1131,7 +1355,6 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
             df = pq.read_table(pq_file).to_pandas()
 
             for ep_idx in df["episode_index"].unique():
-                # Skip bad episodes in dry run
                 if ep_idx in bad_episodes:
                     print(f"Episode {ep_idx}: SKIPPED (marked as bad)")
                     total_skipped += 1
@@ -1171,7 +1394,7 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         print(f"Total: {total_orig} -> {total_keep} frames")
         print(f"Would remove: {total_orig - total_keep} frames ({100*(total_orig-total_keep)/total_orig:.1f}%)")
         if total_skipped > 0:
-            print(f"Episodes skipped (bad): {total_skipped}")
+            print(f"Skipped episodes (bad): {total_skipped}")
         if args.unwrap_angles and total_unwrap_fixes > 0:
             print(f"Angle unwrap fixes: {total_unwrap_fixes} corrections")
         return
@@ -1187,7 +1410,7 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         smooth_actions=args.smooth_actions,
         smooth_sigma=args.smooth_sigma,
         output_format=args.output_format,
-        skip_bad=args.skip_bad,
+        skip_bad_episodes=args.skip_bad_episodes,
         verbose=not args.quiet,
     )
 
