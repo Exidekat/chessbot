@@ -29,32 +29,15 @@ import pyarrow.parquet as pq
 # Add parent directory to path for utils import
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.angle_utils import fix_angle_spikes, smooth_actions
-
-
-def load_quality_annotations(dataset_path: Path) -> Dict[int, str]:
-    """
-    Load episode quality annotations from dataset.
-
-    Quality annotations are saved by validate_vla_episodes.py to:
-    {dataset_path}/episode_qualities.json
-
-    Args:
-        dataset_path: Path to the dataset directory
-
-    Returns:
-        Dict mapping episode_index -> quality ("good", "bad", or "unreviewed")
-    """
-    quality_file = dataset_path / "episode_qualities.json"
-    if not quality_file.exists():
-        return {}
-
-    try:
-        with open(quality_file, 'r') as f:
-            loaded = json.load(f)
-            return {int(k): v for k, v in loaded.items()}
-    except Exception as e:
-        print(f"[WARN] Failed to load quality annotations: {e}")
-        return {}
+from utils.lerobot_helpers import (
+    load_quality_annotations,
+    get_bad_episodes,
+    save_quality_annotations,
+    remap_quality_annotations,
+    load_info_json,
+    save_info_json,
+    build_index_mapping,
+)
 
 
 class FilterMode(Enum):
@@ -246,10 +229,12 @@ def extract_frames_to_video(
     output_video.parent.mkdir(parents=True, exist_ok=True)
 
     # Codec settings
+    # IMPORTANT: -g 15 sets keyframe interval to 1 second at 15fps
+    # Without this, random frame access requires decoding ALL preceding frames (5x slowdown)
     if codec == "av1":
-        codec_args = ["-c:v", "libaom-av1", "-crf", "30", "-cpu-used", "8"]
+        codec_args = ["-c:v", "libaom-av1", "-crf", "30", "-cpu-used", "8", "-g", str(fps)]
     else:
-        codec_args = ["-c:v", "libx264", "-crf", "23", "-preset", "fast"]
+        codec_args = ["-c:v", "libx264", "-crf", "23", "-preset", "fast", "-g", str(fps)]
 
     # For large frame lists, extract to PNG first then encode to video
     # This avoids shell argument length limits and ffmpeg filter issues
@@ -611,7 +596,7 @@ def clean_dataset(
     bad_episodes = set()
     if skip_bad_episodes:
         quality_annotations = load_quality_annotations(input_dir)
-        bad_episodes = {idx for idx, quality in quality_annotations.items() if quality == "bad"}
+        bad_episodes = get_bad_episodes(quality_annotations)
         if verbose and bad_episodes:
             print(f"[*] Found {len(bad_episodes)} bad episodes to skip: {sorted(bad_episodes)}")
 
@@ -657,8 +642,8 @@ def clean_dataset(
                 kept_episodes.append(ep_idx)
     kept_episodes = sorted(kept_episodes)
 
-    # Create old->new index mapping for contiguous output
-    old_to_new_ep_idx = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_episodes)}
+    # Create old->new index mapping for contiguous output using helper
+    old_to_new_ep_idx = build_index_mapping(kept_episodes)
 
     if verbose and bad_episodes:
         print(f"    Episodes after filtering: {len(kept_episodes)} (skipped {len(bad_episodes)} bad)")
@@ -978,8 +963,7 @@ def clean_dataset(
         if verbose:
             print(f"[*] Updated feature dtype to 'image' for PNG output")
 
-    with open(out_meta_dir / "info.json", "w") as f:
-        json.dump(new_info, f, indent=4)
+    save_info_json(output_dir, new_info)
 
     # Copy tasks.parquet
     if (input_dir / "meta" / "tasks.parquet").exists():
@@ -1096,14 +1080,9 @@ def clean_dataset(
 
     # Copy episode_qualities.json with reindexed keys (only kept episodes)
     if quality_annotations:
-        new_qualities = {}
-        for orig_idx, quality in quality_annotations.items():
-            if orig_idx in old_to_new_ep_idx:
-                new_idx = old_to_new_ep_idx[orig_idx]
-                new_qualities[str(new_idx)] = quality
+        new_qualities = remap_quality_annotations(quality_annotations, old_to_new_ep_idx)
         if new_qualities:
-            with open(output_dir / "episode_qualities.json", "w") as f:
-                json.dump(new_qualities, f, indent=2)
+            save_quality_annotations(output_dir, new_qualities)
             if verbose:
                 print(f"[*] Copied episode_qualities.json with {len(new_qualities)} entries")
 
@@ -1341,7 +1320,7 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         bad_episodes = set()
         if args.skip_bad_episodes:
             quality_annotations = load_quality_annotations(input_dir)
-            bad_episodes = {idx for idx, quality in quality_annotations.items() if quality == "bad"}
+            bad_episodes = get_bad_episodes(quality_annotations)
             if bad_episodes:
                 print(f"[*] Found {len(bad_episodes)} bad episodes to skip: {sorted(bad_episodes)}")
                 print()

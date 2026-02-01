@@ -19,30 +19,18 @@ Usage:
 """
 
 import argparse
-import json
 import shutil
 import sys
 from pathlib import Path
 
-try:
-    import pyarrow.parquet as pq
-except ImportError:
-    print("[X] pyarrow not installed. Install with: pip install pyarrow")
-    sys.exit(1)
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-def check_parquet_valid(path: Path) -> tuple[bool, int]:
-    """
-    Check if a parquet file is valid.
-
-    Returns:
-        (is_valid, row_count) - row_count is 0 if invalid
-    """
-    try:
-        table = pq.read_table(str(path))
-        return True, len(table)
-    except Exception as e:
-        return False, 0
+from utils.lerobot_helpers import (
+    validate_parquet_file,
+    load_info_json,
+    save_info_json,
+)
 
 
 def scan_dataset(dataset_path: Path) -> dict:
@@ -62,12 +50,9 @@ def scan_dataset(dataset_path: Path) -> dict:
     }
 
     # Check info.json
-    info_path = dataset_path / "meta" / "info.json"
-    if info_path.exists():
-        with open(info_path) as f:
-            results["info_json"] = json.load(f)
-    else:
-        print(f"[X] No info.json found at {info_path}")
+    results["info_json"] = load_info_json(dataset_path)
+    if not results["info_json"]:
+        print(f"[X] No info.json found at {dataset_path / 'meta' / 'info.json'}")
         return results
 
     # Scan data files
@@ -75,7 +60,7 @@ def scan_dataset(dataset_path: Path) -> dict:
     if data_dir.exists():
         for chunk_dir in sorted(data_dir.glob("chunk-*")):
             for parquet_file in sorted(chunk_dir.glob("*.parquet")):
-                is_valid, row_count = check_parquet_valid(parquet_file)
+                is_valid, row_count = validate_parquet_file(parquet_file)
                 file_info = {
                     "path": parquet_file,
                     "valid": is_valid,
@@ -93,7 +78,7 @@ def scan_dataset(dataset_path: Path) -> dict:
     if episodes_dir.exists():
         for chunk_dir in sorted(episodes_dir.glob("chunk-*")):
             for parquet_file in sorted(chunk_dir.glob("*.parquet")):
-                is_valid, row_count = check_parquet_valid(parquet_file)
+                is_valid, row_count = validate_parquet_file(parquet_file)
                 file_info = {
                     "path": parquet_file,
                     "valid": is_valid,
@@ -182,10 +167,8 @@ def repair_dataset(dataset_path: Path, results: dict, create_backup: bool = Fals
         corrupted_file.unlink()
         print(f"[OK] Removed {corrupted_file.name}")
 
-    # Update info.json
-    info_path = dataset_path / "meta" / "info.json"
+    # Update info.json using helper
     info = results["info_json"]
-
     old_episodes = info.get("total_episodes", 0)
     old_frames = info.get("total_frames", 0)
 
@@ -202,10 +185,8 @@ def repair_dataset(dataset_path: Path, results: dict, create_backup: bool = Fals
     print(f"  total_episodes: {old_episodes} -> {results['valid_episodes']}")
     print(f"  total_frames: {old_frames} -> {results['valid_frames']}")
 
-    with open(info_path, "w") as f:
-        json.dump(info, f, indent=4)
-
-    print(f"[OK] Updated {info_path}")
+    save_info_json(dataset_path, info)
+    print(f"[OK] Updated {dataset_path / 'meta' / 'info.json'}")
 
     print("\n" + "=" * 60)
     print("[OK] Dataset repair complete!")

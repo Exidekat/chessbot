@@ -67,6 +67,22 @@ except ImportError:
 
 import csv
 
+from utils.lerobot_helpers import (
+    load_quality_annotations,
+    save_quality_annotations,
+    get_episode_indices,
+    build_index_mapping,
+    remap_episode_indices,
+    rename_video_files,
+    rename_robot_configs,
+    delete_episode_files,
+    load_info_json,
+    save_info_json,
+    calculate_total_frames,
+    remove_empty_directories,
+    load_robot_config,
+)
+
 
 class EpisodeValidator:
     """
@@ -123,12 +139,9 @@ class EpisodeValidator:
         else:
             self._load_raw_dataset()
 
-        # Load quality annotations if they exist
-        quality_file = self.dataset_path / "episode_qualities.json"
-        if quality_file.exists():
-            with open(quality_file, 'r') as f:
-                loaded = json.load(f)
-                self.episode_qualities = {int(k): v for k, v in loaded.items()}
+        # Load quality annotations if they exist using helper
+        self.episode_qualities = load_quality_annotations(self.dataset_path)
+        if self.episode_qualities:
             print(f"[INFO] Loaded quality annotations for {len(self.episode_qualities)} episodes")
 
         # Check for per-episode robot configs (for home-relative normalization)
@@ -250,29 +263,14 @@ class EpisodeValidator:
         if episode_index in self.robot_configs_cache:
             return self.robot_configs_cache[episode_index]
 
-        # Load from per-episode config file
+        # Load from per-episode config file using helper
         config_path = self.dataset_path / "robot_configs" / f"episode_{episode_index:06d}.csv"
-        if not config_path.exists():
-            return None
+        home_array = load_robot_config(config_path)
 
-        try:
-            home_positions = []
-            with open(config_path, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    home_positions.append(float(row['home_rad']))
-
-            if len(home_positions) != 6:
-                print(f"[WARN] Invalid robot config (expected 6 joints): {config_path}")
-                return None
-
-            home_array = np.array(home_positions, dtype=np.float32)
+        if home_array is not None:
             self.robot_configs_cache[episode_index] = home_array
-            return home_array
 
-        except Exception as e:
-            print(f"[WARN] Failed to load robot config for episode {episode_index}: {e}")
-            return None
+        return home_array
 
     def _get_playback_home(self) -> Optional[np.ndarray]:
         """
@@ -1218,9 +1216,7 @@ class EpisodeValidator:
 
     def _save_qualities(self):
         """Save quality annotations to file."""
-        quality_file = self.dataset_path / "episode_qualities.json"
-        with open(quality_file, 'w') as f:
-            json.dump(self.episode_qualities, f, indent=2)
+        save_quality_annotations(self.dataset_path, self.episode_qualities)
 
     def _rebuild_lerobot_after_deletion(self, deleted_indices: List[int]):
         """
@@ -1241,7 +1237,6 @@ class EpisodeValidator:
             deleted_indices: List of episode indices that were deleted
         """
         import pandas as pd
-        import shutil
 
         if not deleted_indices:
             return
@@ -1252,25 +1247,16 @@ class EpisodeValidator:
         data_dir = self.dataset_path / "data"
         episodes_dir = self.dataset_path / "meta" / "episodes"
 
-        # Step 1: Get all remaining episode indices and create mapping to new contiguous indices
-        remaining_episodes = set()
-        for data_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
-            try:
-                df = pd.read_parquet(data_file)
-                remaining_episodes.update(df["episode_index"].unique())
-            except Exception as e:
-                print(f"[WARNING] Failed to read {data_file}: {e}")
-
-        # Remove deleted episodes from the set
-        remaining_episodes -= deleted_set
-        remaining_episodes = sorted(remaining_episodes)
+        # Step 1: Get all remaining episode indices using helper
+        all_episodes = get_episode_indices(self.dataset_path)
+        remaining_episodes = [ep for ep in all_episodes if ep not in deleted_set]
 
         if not remaining_episodes:
             print("[WARNING] No episodes remaining after deletion!")
             return
 
-        # Create old_index -> new_index mapping
-        index_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(remaining_episodes)}
+        # Create old_index -> new_index mapping using helper
+        index_mapping = build_index_mapping(remaining_episodes)
         print(f"[INFO] Re-indexing {len(remaining_episodes)} episodes: {min(remaining_episodes)}-{max(remaining_episodes)} -> 0-{len(remaining_episodes)-1}")
 
         # Step 2: Update data parquet files (filter deleted + remap indices)
@@ -1287,8 +1273,8 @@ class EpisodeValidator:
                     data_file.unlink()
                     print(f"  Removed empty: {data_file.name}")
                 else:
-                    # Remap episode indices to contiguous
-                    df["episode_index"] = df["episode_index"].map(index_mapping)
+                    # Remap episode indices to contiguous using helper
+                    df = remap_episode_indices(df, index_mapping)
                     df.to_parquet(data_file, index=False)
                     if len(df) < original_len:
                         print(f"  Updated {data_file.name}: {original_len} -> {len(df)} rows")
@@ -1309,103 +1295,46 @@ class EpisodeValidator:
                     ep_file.unlink()
                     print(f"  Removed empty: {ep_file.name}")
                 else:
-                    # Remap episode indices
-                    df["episode_index"] = df["episode_index"].map(index_mapping)
+                    # Remap episode indices using helper
+                    df = remap_episode_indices(df, index_mapping)
                     df.to_parquet(ep_file, index=False)
                     if len(df) < original_len:
                         print(f"  Updated {ep_file.name}: {original_len} -> {len(df)} episodes")
             except Exception as e:
                 print(f"[WARNING] Failed to update {ep_file}: {e}")
 
-        # Step 4: Rename video files to match new indices
+        # Step 4: Delete files for deleted episodes using helper
+        print("[INFO] Deleting files for removed episodes...")
+        delete_episode_files(self.dataset_path, deleted_indices)
+
+        # Step 5: Rename video and robot config files to match new indices using helpers
         print("[INFO] Renaming video files...")
-        for video_key in ["observation.images.global", "observation.images.gripper"]:
-            video_dir = self.dataset_path / "videos" / video_key
-            if not video_dir.exists():
-                continue
+        rename_video_files(self.dataset_path, index_mapping)
 
-            for chunk_dir in sorted(video_dir.glob("chunk-*")):
-                for video_file in sorted(chunk_dir.glob("file-*.mp4")):
-                    # Extract old episode index from filename (file-NNNNNN.mp4)
-                    try:
-                        old_idx = int(video_file.stem.replace("file-", ""))
-                    except ValueError:
-                        continue
-
-                    if old_idx in deleted_set:
-                        # Delete video for deleted episode
-                        video_file.unlink()
-                        print(f"  Deleted: {video_key}/{chunk_dir.name}/{video_file.name}")
-                    elif old_idx in index_mapping:
-                        new_idx = index_mapping[old_idx]
-                        if old_idx != new_idx:
-                            # Rename to new index
-                            new_name = f"file-{new_idx:06d}.mp4"
-                            new_path = chunk_dir / new_name
-                            video_file.rename(new_path)
-                            print(f"  Renamed: {video_file.name} -> {new_name}")
-
-        # Step 5: Rename robot_configs per-episode files
         robot_configs_dir = self.dataset_path / "robot_configs"
         if robot_configs_dir.exists():
             print("[INFO] Renaming robot config files...")
-            for config_file in sorted(robot_configs_dir.glob("episode_*.csv")):
-                try:
-                    old_idx = int(config_file.stem.replace("episode_", ""))
-                except ValueError:
-                    continue
+            rename_robot_configs(self.dataset_path, index_mapping)
 
-                if old_idx in deleted_set:
-                    config_file.unlink()
-                    print(f"  Deleted: {config_file.name}")
-                elif old_idx in index_mapping:
-                    new_idx = index_mapping[old_idx]
-                    if old_idx != new_idx:
-                        new_name = f"episode_{new_idx:06d}.csv"
-                        new_path = robot_configs_dir / new_name
-                        config_file.rename(new_path)
-                        print(f"  Renamed: {config_file.name} -> {new_name}")
+        # Step 6: Update meta/info.json using helpers
+        info = load_info_json(self.dataset_path)
+        if info:
+            old_total = info.get("total_episodes", 0)
+            new_total = len(remaining_episodes)
+            info["total_episodes"] = new_total
 
-        # Step 6: Update meta/info.json
-        info_path = self.dataset_path / "meta" / "info.json"
-        if info_path.exists():
-            try:
-                with open(info_path, 'r') as f:
-                    info = json.load(f)
+            # Recalculate total frames using helper
+            total_frames = calculate_total_frames(self.dataset_path)
+            info["total_frames"] = total_frames
 
-                old_total = info.get("total_episodes", 0)
-                new_total = len(remaining_episodes)
-                info["total_episodes"] = new_total
+            # Set splits to contiguous range (0:N format)
+            info["splits"] = {"train": f"0:{new_total}"}
 
-                # Recalculate total frames
-                total_frames = 0
-                for data_file in data_dir.glob("chunk-*/file-*.parquet"):
-                    try:
-                        df = pd.read_parquet(data_file)
-                        total_frames += len(df)
-                    except:
-                        pass
-                info["total_frames"] = total_frames
+            save_info_json(self.dataset_path, info)
+            print(f"[INFO] Updated info.json: {old_total} -> {new_total} episodes, splits: 0:{new_total}")
 
-                # Set splits to contiguous range (0:N format)
-                info["splits"] = {"train": f"0:{new_total}"}
-
-                with open(info_path, 'w') as f:
-                    json.dump(info, f, indent=2)
-
-                print(f"[INFO] Updated info.json: {old_total} -> {new_total} episodes, splits: 0:{new_total}")
-
-            except Exception as e:
-                print(f"[WARNING] Failed to update info.json: {e}")
-
-        # Step 7: Clean up empty chunk directories
-        for subdir in ["data", "videos/observation.images.global", "videos/observation.images.gripper", "meta/episodes"]:
-            target_dir = self.dataset_path / subdir
-            if target_dir.exists():
-                for chunk_dir in target_dir.glob("chunk-*"):
-                    if chunk_dir.is_dir() and not any(chunk_dir.iterdir()):
-                        chunk_dir.rmdir()
-                        print(f"[INFO] Removed empty directory: {chunk_dir}")
+        # Step 7: Clean up empty chunk directories using helper
+        remove_empty_directories(self.dataset_path)
 
         print(f"[OK] LeRobot dataset rebuild complete: {len(remaining_episodes)} episodes (indices 0-{len(remaining_episodes)-1})")
 
