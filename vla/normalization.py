@@ -337,6 +337,7 @@ def compute_dataset_stats(
     dataset_path: str,
     output_path: Optional[str] = None,
     feature_keys: List[str] = ["action", "observation.state"],
+    max_samples: int = 10000,
 ) -> ActionNormalizer:
     """
     Convenience function to compute and save normalization statistics.
@@ -345,10 +346,15 @@ def compute_dataset_stats(
     1. Custom ChessBot format (PNG files + metadata.json per episode)
     2. LeRobot format (parquet files + HuggingFace metadata)
 
+    For large LeRobot datasets, samples are randomly selected to avoid loading
+    all frames into memory while still getting representative statistics.
+
     Args:
         dataset_path: Path to dataset directory
         output_path: Path to save stats JSON (default: dataset_path/norm_stats.json)
         feature_keys: Features to compute statistics for
+        max_samples: Maximum samples to use for stats computation (default 10000).
+                    Set to None to use all samples (not recommended for large datasets).
 
     Returns:
         ActionNormalizer with computed statistics
@@ -365,7 +371,7 @@ def compute_dataset_stats(
         print(f"[NormStats] Detected custom ChessBot format")
         samples = load_episodes_from_custom_format(dataset_path)
     else:
-        # Try LeRobot format
+        # Try LeRobot format with streaming approach to save memory
         print(f"[NormStats] Trying LeRobot format...")
         try:
             from vla.chess_dataloader import ChessEpisodeDataset
@@ -373,9 +379,25 @@ def compute_dataset_stats(
                 dataset_path=dataset_path,
                 split="all",
                 normalize_actions=False,  # Don't normalize during stats computation
+                video_backend="pyav",  # Use CPU backend for compatibility
             )
-            # Convert to list of dicts
-            samples = [dataset[i] for i in range(len(dataset))]
+
+            # Sample evenly across the dataset to get representative stats
+            n_total = len(dataset)
+            if max_samples is not None and n_total > max_samples:
+                # Evenly spaced sampling for representative coverage
+                step = n_total / max_samples
+                indices = [int(i * step) for i in range(max_samples)]
+                print(f"[NormStats] Sampling {max_samples} of {n_total} frames for stats...")
+            else:
+                indices = list(range(n_total))
+                print(f"[NormStats] Loading all {n_total} frames...")
+
+            samples = []
+            for i, idx in enumerate(indices):
+                samples.append(dataset[idx])
+                if (i + 1) % 1000 == 0:
+                    print(f"[NormStats] Loaded {i + 1}/{len(indices)} samples...")
         except Exception as e:
             raise ValueError(f"Could not load dataset: {e}")
 

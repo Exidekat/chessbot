@@ -1074,9 +1074,11 @@ def clean_dataset(
     # Recompute stats.json
     recompute_stats(output_dir)
 
-    # Copy norm_stats.json if exists
-    if (input_dir / "norm_stats.json").exists():
-        shutil.copy(input_dir / "norm_stats.json", output_dir / "norm_stats.json")
+    # Regenerate norm_stats.json (must use fresh dataloader to get home-relative values)
+    from vla.normalization import compute_dataset_stats
+    if verbose:
+        print("[*] Regenerating norm_stats.json with home-relative values...")
+    compute_dataset_stats(str(output_dir))
 
     # Copy episode_qualities.json with reindexed keys (only kept episodes)
     if quality_annotations:

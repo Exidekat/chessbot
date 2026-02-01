@@ -11,6 +11,7 @@ Key features:
 - Multi-model support (PI0, SmolVLA)
 """
 
+import csv
 import json
 import math
 import os
@@ -137,6 +138,9 @@ class ChessEpisodeDataset(Dataset):
         # Pre-compute ImageNet normalization tensors (avoid creating in __getitem__)
         self._norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self._norm_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+        # Cache for per-episode home positions (avoid repeated file reads)
+        self._episode_homes: Dict[int, Optional[np.ndarray]] = {}
 
         # Setup normalizer
         if normalizer is not None:
@@ -291,6 +295,26 @@ class ChessEpisodeDataset(Dataset):
         n_split = n_train if split == "train" else (n_val if split == "val" else n_episodes)
         print(f"[{split}] Using {len(self.indices)} frames from {n_split} episodes")
 
+    def _load_episode_home(self, episode_index: int) -> Optional[np.ndarray]:
+        """Load recording home positions for an episode from robot_configs/."""
+        config_path = self.dataset_path / "robot_configs" / f"episode_{episode_index:06d}.csv"
+        if not config_path.exists():
+            return None
+
+        home_positions = []
+        with open(config_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                home_positions.append(float(row['home_rad']))
+
+        return np.array(home_positions, dtype=np.float32) if home_positions else None
+
+    def _get_episode_home(self, episode_index: int) -> Optional[np.ndarray]:
+        """Get cached home positions for an episode, loading if needed."""
+        if episode_index not in self._episode_homes:
+            self._episode_homes[episode_index] = self._load_episode_home(episode_index)
+        return self._episode_homes[episode_index]
+
     def _default_transform(self) -> T.Compose:
         """
         Default image preprocessing (fallback for PIL images only).
@@ -364,6 +388,12 @@ class ChessEpisodeDataset(Dataset):
         dataset_idx = self.indices[idx]
         sample = self.lerobot_dataset[dataset_idx]
 
+        # Get episode index for home-relative normalization
+        episode_index = sample.get("episode_index", 0)
+        if isinstance(episode_index, torch.Tensor):
+            episode_index = episode_index.item()
+        recording_home = self._get_episode_home(episode_index)
+
         result = {}
 
         # Dataset camera key -> Model camera key
@@ -422,6 +452,12 @@ class ChessEpisodeDataset(Dataset):
                 joint_pos = torch.from_numpy(joint_pos).float()
             elif not isinstance(joint_pos, torch.Tensor):
                 joint_pos = torch.tensor(joint_pos, dtype=torch.float32)
+
+            # Subtract recording home for home-relative normalization
+            if recording_home is not None:
+                home_tensor = torch.from_numpy(recording_home[:len(joint_pos)]).float()
+                joint_pos = joint_pos - home_tensor
+
             # Pad/truncate to model's expected state dimension
             state_vector = torch.zeros(self.state_dim)
             n_joints = min(len(joint_pos), self.state_dim)
@@ -431,15 +467,21 @@ class ChessEpisodeDataset(Dataset):
         # Process action (target)
         # Pretrained PI05 expects action chunks: (chunk_size, action_dim) = (50, 32)
         # We have a single 6-joint action, so we:
-        # 1. Pad the action dimension to 32
-        # 2. Apply quantile normalization to [-1, 1] range
-        # 3. Repeat the action 50 times (for action chunking during training)
+        # 1. Subtract recording home for home-relative values
+        # 2. Pad the action dimension to 32
+        # 3. Apply quantile normalization to [-1, 1] range
+        # 4. Repeat the action 50 times (for action chunking during training)
         if "action" in sample:
             action = sample["action"]
             if isinstance(action, np.ndarray):
                 action = torch.from_numpy(action).float()
             elif not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32)
+
+            # Subtract recording home for home-relative normalization
+            if recording_home is not None:
+                home_tensor = torch.from_numpy(recording_home[:len(action)]).float()
+                action = action - home_tensor
 
             # Pad to 32 dimensions first
             padded_action = torch.zeros(32)
