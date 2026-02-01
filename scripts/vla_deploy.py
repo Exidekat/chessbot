@@ -335,8 +335,13 @@ class VLAWrapper:
             # Apply spike filter for consistency with training data preprocessing
             # This fixes encoder glitches that would confuse the model
             current_state = self.spike_filter.process(raw_state).astype(np.float32)
+
+            # Convert to home-relative for model input (matches training data)
+            # Training data uses: state - recording_home, so we do: state - playback_home
+            if self.playback_home is not None:
+                current_state = current_state - self.playback_home
         else:
-            # Placeholder state when no robot connected
+            # Placeholder state when no robot connected (already home-relative: zeros)
             current_state = np.zeros(6, dtype=np.float32)
             current_state[5] = 0.5  # Gripper at 50% open
 
@@ -490,7 +495,7 @@ def vla_control_loop(
     perspective_matrix: Optional[np.ndarray],
     camera_rotation: str,
     virtual_cam: Optional[VirtualCamera],
-    duration: float = 50.0
+    timeout: Optional[float] = None
 ):
     """
     Run VLA control loop for a single stage.
@@ -505,7 +510,7 @@ def vla_control_loop(
         perspective_matrix: Perspective transform matrix from detection
         camera_rotation: Camera rotation setting
         virtual_cam: VirtualCamera instance for overlay streaming
-        duration: Maximum duration for control (seconds)
+        timeout: Maximum duration for control in seconds (None for no timeout)
     """
     print("\n" + "=" * 60)
     print("VLA CONTROL ACTIVE")
@@ -540,6 +545,11 @@ def vla_control_loop(
     frame_count = 0
     action_count = 0
 
+    # Trajectory tracking
+    initial_position = None  # Set on first valid robot state
+    position_history = []    # Track positions for velocity calculation
+    total_distance = 0.0     # Total joint-space distance traveled
+
     # Path to transformed board image (generated during detection)
     transformed_image_path = "data/chessboard_transformed.png"
 
@@ -547,8 +557,8 @@ def vla_control_loop(
         while not stop_event.is_set():
             loop_start = time.time()
 
-            # Check timeout
-            if time.time() - start_time > duration:
+            # Check timeout (only if timeout is set)
+            if timeout is not None and time.time() - start_time > timeout:
                 print("\n[VLA] Control timeout reached")
                 break
 
@@ -595,6 +605,17 @@ def vla_control_loop(
             # Get current robot state
             robot_state = vla.get_robot_state()
 
+            # Track trajectory
+            if robot_state:
+                curr_pos = robot_state.joint_positions.copy()
+                if initial_position is None:
+                    initial_position = curr_pos.copy()
+                if len(position_history) > 0:
+                    # Calculate incremental distance (L2 norm in joint space)
+                    delta = curr_pos - position_history[-1]
+                    total_distance += np.linalg.norm(delta)
+                position_history.append(curr_pos)
+
             # Get VLA action prediction using overlayed frame (matches training data)
             action = vla.predict_action(
                 vla_input_frame,  # Use overlayed frame, not raw
@@ -607,18 +628,39 @@ def vla_control_loop(
             if vla.execute_action(action, speed=0.5):
                 action_count += 1
 
-            # Print status every 30 frames (reduced from every frame)
+            # Print status every 30 frames with trajectory info
             if frame_count % 30 == 0:
                 elapsed = time.time() - start_time
                 hz = frame_count / elapsed if elapsed > 0 else 0
                 pred_joints = action["joint_positions"]
                 if robot_state:
                     curr_joints = robot_state.joint_positions
-                    print(f"[VLA] Frame {frame_count}: {hz:.1f} Hz")
-                    print(f"  Current: [{curr_joints[0]:.2f}, {curr_joints[1]:.2f}, {curr_joints[2]:.2f}, "
+
+                    # Calculate displacement from start
+                    if initial_position is not None:
+                        displacement = curr_joints - initial_position
+                        disp_norm = np.linalg.norm(displacement)
+                    else:
+                        disp_norm = 0.0
+
+                    # Calculate recent velocity (last 10 frames)
+                    velocity = 0.0
+                    if len(position_history) >= 2:
+                        recent_count = min(10, len(position_history) - 1)
+                        recent_dist = sum(
+                            np.linalg.norm(position_history[-i] - position_history[-i-1])
+                            for i in range(1, recent_count + 1)
+                        )
+                        recent_time = recent_count / hz if hz > 0 else 1.0
+                        velocity = recent_dist / recent_time if recent_time > 0 else 0.0
+
+                    print(f"[VLA] Frame {frame_count} | {elapsed:.1f}s | {hz:.1f} Hz")
+                    print(f"  Position: [{curr_joints[0]:.2f}, {curr_joints[1]:.2f}, {curr_joints[2]:.2f}, "
                           f"{curr_joints[3]:.2f}, {curr_joints[4]:.2f}, {curr_joints[5]:.2f}]")
-                    print(f"  Target:  [{pred_joints[0]:.2f}, {pred_joints[1]:.2f}, {pred_joints[2]:.2f}, "
-                          f"{pred_joints[3]:.2f}, {pred_joints[4]:.2f}, {pred_joints[5]:.2f}]")
+                    print(f"  Target Δ: [{pred_joints[0]:.3f}, {pred_joints[1]:.3f}, {pred_joints[2]:.3f}, "
+                          f"{pred_joints[3]:.3f}, {pred_joints[4]:.3f}, {pred_joints[5]:.3f}]")
+                    print(f"  Trajectory: dist={disp_norm:.3f} rad from start | "
+                          f"total={total_distance:.3f} rad | vel={velocity:.3f} rad/s")
 
             frame_count += 1
 
@@ -670,7 +712,8 @@ def execute_move(
     corner_conf: float,
     min_corner_dist: float,
     time_limit: float,
-    use_yuyv: bool = False
+    use_yuyv: bool = False,
+    timeout: Optional[float] = None
 ) -> MoveResult:
     """
     Execute a single chess move: detect board, calculate best move, execute all stages.
@@ -687,6 +730,7 @@ def execute_move(
         corner_conf: Corner detection confidence threshold
         min_corner_dist: Minimum corner distance in pixels
         time_limit: Engine time limit in seconds
+        timeout: VLA control timeout in seconds (None for no timeout)
 
     Returns:
         MoveResult with success and restart_requested flags
@@ -809,7 +853,7 @@ def execute_move(
                 perspective_matrix=perspective_matrix,
                 camera_rotation=camera_rotation,
                 virtual_cam=virtual_cam,
-                duration=50.0  # 50 second timeout per stage
+                timeout=timeout
             )
 
             print()
@@ -946,6 +990,12 @@ def main():
         "--piece-grayscale",
         action="store_true",
         help="Use grayscale+CLAHE for piece detection (default is RGB)"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="VLA control timeout in seconds (default: no timeout, press ENTER to stop)"
     )
 
     args = parser.parse_args()
@@ -1268,7 +1318,8 @@ def main():
                     corner_conf=args.corner_conf,
                     min_corner_dist=args.min_corner_dist,
                     time_limit=args.time,
-                    use_yuyv=args.yuyv
+                    use_yuyv=args.yuyv,
+                    timeout=args.timeout
                 )
 
                 if result.restart_requested:
