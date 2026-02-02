@@ -9,6 +9,10 @@ This script deploys VLA models (PI0 or SmolVLA) for real-time chess robot contro
 5. User presses ENTER to hand control to VLA, ENTER again to stop
 6. Repeats for all stages of the best move
 
+Speed Enhancement Options:
+  --action-scale: Multiply predicted action deltas by a scale factor (1.5-3.0x recommended)
+  --lookahead: Execute action from N steps ahead in chunk (proleptic temporal ensemble, 3-10 recommended)
+
 Usage:
     # Deploy PI0 base model
     python scripts/vla_deploy.py --model pi0
@@ -21,6 +25,18 @@ Usage:
 
     # Deploy with specific cameras
     python scripts/vla_deploy.py --model pi0 --global-camera /dev/video2 --robot-port /dev/ttyACM0
+
+    # Speed enhancement: action scaling (1.5x faster movements)
+    python scripts/vla_deploy.py --model smolvla --action-scale 1.5
+
+    # Speed enhancement: proleptic lookahead (skip ahead 5 timesteps)
+    python scripts/vla_deploy.py --model smolvla --lookahead 5
+
+    # Combined speed enhancements (recommended starting point)
+    python scripts/vla_deploy.py --model smolvla --action-scale 1.5 --lookahead 3
+
+    # Aggressive speed enhancements
+    python scripts/vla_deploy.py --model smolvla --action-scale 2.0 --lookahead 5
 """
 
 import argparse
@@ -235,6 +251,8 @@ class VLAWrapper:
         control_freq: float = 50.0,
         tile_mode: str = "multi_tile",
         playback_home: Optional[np.ndarray] = None,
+        action_scale: float = 1.0,
+        lookahead: int = 0,
     ):
         """
         Initialize VLA model.
@@ -251,6 +269,10 @@ class VLAWrapper:
             tile_mode: Global camera tiling mode ("multi_tile" or "letterbox")
             playback_home: Home positions of playback robot for home-relative normalization
                           If provided, model outputs (home-relative) are converted to absolute
+            action_scale: Scale factor for action magnitudes (1.0=normal, 2.0=2x speed)
+                         Amplifies movement deltas for faster execution
+            lookahead: Execute action from N steps ahead in action chunk (proleptic temporal ensemble)
+                      0=current timestep, 5=skip 5 steps ahead. Achieves ~3x speedup without retraining.
         """
         self.model_name = model_name
         self.device = device
@@ -262,6 +284,8 @@ class VLAWrapper:
         self.control_dt = 1.0 / control_freq
         self.tile_mode = tile_mode
         self.playback_home = playback_home
+        self.action_scale = action_scale
+        self.lookahead = lookahead
 
         # Initialize real-time spike filter for observation.state
         # Uses same threshold as training data preprocessing for consistency
@@ -291,6 +315,12 @@ class VLAWrapper:
         print(f"Spike filter: ENABLED (threshold={self.spike_filter.threshold} rad)")
         if playback_home is not None:
             print(f"Home-relative norm: ENABLED (will add playback home to outputs)")
+
+        # Speed enhancement parameters
+        if action_scale != 1.0:
+            print(f"Action scale: {action_scale}x (amplifying movement deltas)")
+        if lookahead > 0:
+            print(f"Lookahead: {lookahead} steps (proleptic temporal ensemble)")
 
         if robot_controller:
             print(f"Robot: SO-100 via RobotController (position-controlled)")
@@ -361,12 +391,24 @@ class VLAWrapper:
             current_state=current_state
         )
 
-        predicted_joints = result["joint_positions"]
+        # Apply proleptic temporal ensemble (lookahead) if enabled
+        # Instead of executing action_chunk[0], execute action_chunk[lookahead]
+        # Reference: https://arxiv.org/abs/2410.16981 - achieves ~3x speedup
+        if self.lookahead > 0 and "action_chunk" in result:
+            chunk = result["action_chunk"]
+            idx = min(self.lookahead, len(chunk) - 1)
+            predicted_joints = chunk[idx]
+        else:
+            predicted_joints = result["joint_positions"]
 
         predicted_action = {
             "joint_positions": predicted_joints,
-            "confidence": 1.0
+            "confidence": 1.0,
         }
+
+        # Pass through action_chunk for chunk execution mode
+        if "action_chunk" in result:
+            predicted_action["action_chunk"] = result["action_chunk"]
 
         return predicted_action
 
@@ -380,6 +422,8 @@ class VLAWrapper:
         If playback_home is set (for home-relative normalization), the home
         offset is added to convert model outputs to absolute positions.
 
+        If action_scale != 1.0, the movement delta is amplified for faster execution.
+
         Args:
             action: Action dict from predict_action()
                    - joint_positions: Single-step target (6D)
@@ -392,16 +436,36 @@ class VLAWrapper:
         # Apply home-relative to absolute conversion if playback_home is set
         # This enables multi-robot portability: model outputs home-relative offsets,
         # we add the playback robot's home to get correct absolute positions
-        joint_positions = action["joint_positions"]
+        joint_positions = action["joint_positions"].copy()
         if self.playback_home is not None:
             joint_positions = joint_positions + self.playback_home
 
+        # Apply action scaling (amplify movement deltas for faster execution)
+        # This multiplies the delta from current position by scale factor
+        # Reference: Simple but effective approach for slow VLA models
+        if self.action_scale != 1.0 and (self.robot_controller or self.robot_arm):
+            current_state = self.get_robot_state()
+            if current_state is not None:
+                current_pos = current_state.joint_positions
+                delta = joint_positions - current_pos
+                joint_positions = current_pos + (delta * self.action_scale)
+
         # Check for chunk-based execution
         if self.chunk_execution and "action_chunk" in action:
-            action_chunk = action["action_chunk"]
+            action_chunk = action["action_chunk"].copy()
             if self.playback_home is not None:
                 # Transform entire chunk
                 action_chunk = action_chunk + self.playback_home
+            # Apply action scaling to chunk if enabled
+            if self.action_scale != 1.0 and (self.robot_controller or self.robot_arm):
+                current_state = self.get_robot_state()
+                if current_state is not None:
+                    current_pos = current_state.joint_positions
+                    # Scale deltas relative to current position for each step
+                    # This maintains trajectory shape but amplifies movement
+                    for i in range(len(action_chunk)):
+                        delta = action_chunk[i] - current_pos
+                        action_chunk[i] = current_pos + (delta * self.action_scale)
             return self._execute_action_chunk(action_chunk)
 
         # Single-step execution (original behavior)
@@ -654,7 +718,15 @@ def vla_control_loop(
                         recent_time = recent_count / hz if hz > 0 else 1.0
                         velocity = recent_dist / recent_time if recent_time > 0 else 0.0
 
-                    print(f"[VLA] Frame {frame_count} | {elapsed:.1f}s | {hz:.1f} Hz")
+                    # Build speed enhancement info string
+                    speed_info = []
+                    if vla.action_scale != 1.0:
+                        speed_info.append(f"scale={vla.action_scale}x")
+                    if vla.lookahead > 0:
+                        speed_info.append(f"lookahead={vla.lookahead}")
+                    speed_str = f" | {' '.join(speed_info)}" if speed_info else ""
+
+                    print(f"[VLA] Frame {frame_count} | {elapsed:.1f}s | {hz:.1f} Hz{speed_str}")
                     print(f"  Position: [{curr_joints[0]:.2f}, {curr_joints[1]:.2f}, {curr_joints[2]:.2f}, "
                           f"{curr_joints[3]:.2f}, {curr_joints[4]:.2f}, {curr_joints[5]:.2f}]")
                     print(f"  Target Δ: [{pred_joints[0]:.3f}, {pred_joints[1]:.3f}, {pred_joints[2]:.3f}, "
@@ -997,6 +1069,20 @@ def main():
         default=None,
         help="VLA control timeout in seconds (default: no timeout, press ENTER to stop)"
     )
+    parser.add_argument(
+        "--action-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for action magnitudes (1.0=normal, 2.0=2x speed). "
+             "Amplifies predicted movement deltas for faster execution. Suggested range: 1.5-3.0"
+    )
+    parser.add_argument(
+        "--lookahead",
+        type=int,
+        default=0,
+        help="Execute action from N steps ahead in chunk (proleptic temporal ensemble). "
+             "0=current timestep, 5=skip 5 steps ahead. Suggested range: 3-10"
+    )
 
     args = parser.parse_args()
 
@@ -1215,6 +1301,8 @@ def main():
         control_freq=args.control_freq,
         tile_mode=tile_mode,
         playback_home=playback_home,
+        action_scale=args.action_scale,
+        lookahead=args.lookahead,
     )
 
     # Log home-relative normalization status
@@ -1289,6 +1377,16 @@ def main():
         print(f"  Robot: {args.robot_port} (holding at home position)")
     else:
         print(f"  Robot: None (--no-robot mode)")
+
+    # Show speed enhancement settings
+    if args.action_scale != 1.0 or args.lookahead > 0:
+        print()
+        print("  Speed enhancements:")
+        if args.action_scale != 1.0:
+            print(f"    Action scale: {args.action_scale}x")
+        if args.lookahead > 0:
+            print(f"    Lookahead: {args.lookahead} steps")
+
     print()
     print("  Press ENTER to capture board and calculate move")
     print("  Press Ctrl+C to exit")

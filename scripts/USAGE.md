@@ -279,6 +279,28 @@ python scripts/vla_deploy.py --model pi0 --global-camera /dev/video4 --gripper-c
 # Deploy with all custom parameters
 python scripts/vla_deploy.py --model pi0 --checkpoint checkpoints/chess_pi0/best.pt --global-camera /dev/video4 --gripper-camera /dev/video0 --turn white --rotation right --corner-conf 0.005 --min-corner-dist 30
 
+### Speed Enhancement Options
+
+# VLA models trained on teleoperation data often produce slow movements due to human hesitation.
+# Two inference-time solutions to speed up execution without retraining:
+#   --action-scale: Multiply predicted deltas by a scale factor (1.5-3.0x recommended)
+#   --lookahead: Execute action from N steps ahead in chunk (proleptic temporal ensemble, 3-10 recommended)
+
+# Speed enhancement: action scaling (1.5x faster movements)
+python scripts/vla_deploy.py --model smolvla --yuyv --robot-port /dev/ttyACM0 --action-scale 1.5
+
+# Speed enhancement: action scaling (2x faster, more aggressive)
+python scripts/vla_deploy.py --model smolvla --yuyv --robot-port /dev/ttyACM0 --action-scale 2.0
+
+# Speed enhancement: proleptic lookahead only (skip ahead 5 timesteps)
+python scripts/vla_deploy.py --model smolvla --yuyv --robot-port /dev/ttyACM0 --lookahead 5
+
+# Combined speed enhancements (recommended starting point)
+python scripts/vla_deploy.py --model smolvla --yuyv --robot-port /dev/ttyACM0 --action-scale 1.5 --lookahead 3
+
+# Aggressive combined speed enhancements
+python scripts/vla_deploy.py --model smolvla --yuyv --robot-port /dev/ttyACM0 --action-scale 2.0 --lookahead 5
+
 ## Overlay Generation
 
 # Generate guidance overlay from current state cache
