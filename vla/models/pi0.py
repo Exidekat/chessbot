@@ -371,8 +371,9 @@ class PI0Model(VLAModelMixin):
         observation["observation.language.tokens"] = token_dict["tokens"]
         observation["observation.language.attention_mask"] = token_dict["attention_mask"]
 
-        # Run inference
-        with torch.inference_mode():
+        # Run inference (autocast needed: model is bfloat16 but lerobot's
+        # sample_noise() creates float32 tensors internally)
+        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
             action_tensor = self.policy.select_action(observation)
 
         # Extract action as numpy
