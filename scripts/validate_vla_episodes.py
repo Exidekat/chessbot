@@ -70,16 +70,8 @@ import csv
 from utils.lerobot_helpers import (
     load_quality_annotations,
     save_quality_annotations,
-    get_episode_indices,
-    build_index_mapping,
-    remap_episode_indices,
-    rename_video_files,
-    rename_robot_configs,
-    delete_episode_files,
     load_info_json,
     save_info_json,
-    calculate_total_frames,
-    remove_empty_directories,
     load_robot_config,
 )
 
@@ -1219,134 +1211,28 @@ class EpisodeValidator:
         save_quality_annotations(self.dataset_path, self.episode_qualities)
 
     def _rebuild_lerobot_after_deletion(self, deleted_indices: List[int]):
-        """
-        Rebuild LeRobot parquet files after episode deletion.
-
-        This removes deleted episodes and RE-INDEXES remaining episodes to maintain
-        contiguous indices (0, 1, 2, ...). This is critical because LeRobot cannot
-        handle datasets with gaps in episode indices.
-
-        Updates:
-        - data/chunk-*/file-*.parquet (frame data - episode_index column)
-        - meta/episodes/chunk-*/file-*.parquet (episode metadata - episode_index column)
-        - videos/*/chunk-*/file-*.mp4 (renamed to match new indices)
-        - robot_configs/episode_*.csv (renamed to match new indices)
-        - meta/info.json (totals and splits)
-
-        Args:
-            deleted_indices: List of episode indices that were deleted
-        """
-        import pandas as pd
-
-        if not deleted_indices:
-            return
-
-        deleted_set = set(deleted_indices)
-        print(f"[INFO] Rebuilding LeRobot dataset (removing {len(deleted_indices)} episodes and re-indexing)...")
-
-        data_dir = self.dataset_path / "data"
-        episodes_dir = self.dataset_path / "meta" / "episodes"
-
-        # Step 1: Get all remaining episode indices using helper
-        all_episodes = get_episode_indices(self.dataset_path)
-        remaining_episodes = [ep for ep in all_episodes if ep not in deleted_set]
-
-        if not remaining_episodes:
-            print("[WARNING] No episodes remaining after deletion!")
-            return
-
-        # Create old_index -> new_index mapping using helper
-        index_mapping = build_index_mapping(remaining_episodes)
-        print(f"[INFO] Re-indexing {len(remaining_episodes)} episodes: {min(remaining_episodes)}-{max(remaining_episodes)} -> 0-{len(remaining_episodes)-1}")
-
-        # Step 2: Update data parquet files (filter deleted + remap indices)
-        print("[INFO] Updating data parquet files...")
-        for data_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
-            try:
-                df = pd.read_parquet(data_file)
-                original_len = len(df)
-
-                # Filter out deleted episodes
-                df = df[~df["episode_index"].isin(deleted_set)]
-
-                if len(df) == 0:
-                    data_file.unlink()
-                    print(f"  Removed empty: {data_file.name}")
-                else:
-                    # Remap episode indices to contiguous using helper
-                    df = remap_episode_indices(df, index_mapping)
-                    df.to_parquet(data_file, index=False)
-                    if len(df) < original_len:
-                        print(f"  Updated {data_file.name}: {original_len} -> {len(df)} rows")
-            except Exception as e:
-                print(f"[WARNING] Failed to update {data_file}: {e}")
-
-        # Step 3: Update meta/episodes parquet files
-        print("[INFO] Updating episode metadata...")
-        for ep_file in sorted(episodes_dir.glob("chunk-*/file-*.parquet")):
-            try:
-                df = pd.read_parquet(ep_file)
-                original_len = len(df)
-
-                # Filter out deleted episodes
-                df = df[~df["episode_index"].isin(deleted_set)]
-
-                if len(df) == 0:
-                    ep_file.unlink()
-                    print(f"  Removed empty: {ep_file.name}")
-                else:
-                    # Remap episode indices using helper
-                    df = remap_episode_indices(df, index_mapping)
-                    df.to_parquet(ep_file, index=False)
-                    if len(df) < original_len:
-                        print(f"  Updated {ep_file.name}: {original_len} -> {len(df)} episodes")
-            except Exception as e:
-                print(f"[WARNING] Failed to update {ep_file}: {e}")
-
-        # Step 4: Delete files for deleted episodes using helper
-        print("[INFO] Deleting files for removed episodes...")
-        delete_episode_files(self.dataset_path, deleted_indices)
-
-        # Step 5: Rename video and robot config files to match new indices using helpers
-        print("[INFO] Renaming video files...")
-        rename_video_files(self.dataset_path, index_mapping)
-
-        robot_configs_dir = self.dataset_path / "robot_configs"
-        if robot_configs_dir.exists():
-            print("[INFO] Renaming robot config files...")
-            rename_robot_configs(self.dataset_path, index_mapping)
-
-        # Step 6: Update meta/info.json using helpers
-        info = load_info_json(self.dataset_path)
-        if info:
-            old_total = info.get("total_episodes", 0)
-            new_total = len(remaining_episodes)
-            info["total_episodes"] = new_total
-
-            # Recalculate total frames using helper
-            total_frames = calculate_total_frames(self.dataset_path)
-            info["total_frames"] = total_frames
-
-            # Set splits to contiguous range (0:N format)
-            info["splits"] = {"train": f"0:{new_total}"}
-
-            save_info_json(self.dataset_path, info)
-            print(f"[INFO] Updated info.json: {old_total} -> {new_total} episodes, splits: 0:{new_total}")
-
-        # Step 7: Clean up empty chunk directories using helper
-        remove_empty_directories(self.dataset_path)
-
-        print(f"[OK] LeRobot dataset rebuild complete: {len(remaining_episodes)} episodes (indices 0-{len(remaining_episodes)-1})")
+        """DEPRECATED: Do not use. In-place LeRobot dataset modification corrupts
+        shared video files and episode metadata. Use clean_lerobot_dataset.py instead."""
+        raise NotImplementedError(
+            "In-place LeRobot dataset rebuild is disabled due to data corruption bugs. "
+            "Use clean_lerobot_dataset.py to rebuild the dataset safely."
+        )
 
     def delete_bad_episodes(self, confirm: bool = True) -> int:
         """
-        Delete all episodes marked as bad.
+        Mark bad episodes for exclusion from cleaned output.
+
+        For raw format episodes, deletes the episode directory directly.
+        For LeRobot format episodes, marks them as bad in episode_qualities.json.
+        LeRobot datasets use shared video files across episodes, so in-place
+        deletion would corrupt the dataset. Use clean_lerobot_dataset.py to
+        rebuild the dataset without bad episodes.
 
         Args:
             confirm: Whether to ask for confirmation
 
         Returns:
-            Number of episodes deleted
+            Number of episodes marked/deleted
         """
         bad_episodes = [idx for idx, q in self.episode_qualities.items() if q == "bad"]
 
@@ -1354,75 +1240,74 @@ class EpisodeValidator:
             print("[INFO] No bad episodes to delete")
             return 0
 
-        print(f"\n[WARNING] About to delete {len(bad_episodes)} episode(s): {bad_episodes}")
-
-        if confirm:
-            response = input("Are you sure? (yes/no): ")
-            if response.lower() != "yes":
-                print("[INFO] Deletion cancelled")
-                return 0
-
-        deleted = 0
-        deleted_lerobot_indices = []  # Track LeRobot episodes for parquet rebuild
-
+        # Check if any are LeRobot format
+        has_lerobot = False
+        has_raw = False
         for ep_idx in bad_episodes:
-            # Find episode
-            episode = None
             for ep in self.episodes:
                 if ep["index"] == ep_idx:
-                    episode = ep
+                    if ep["format"] == "lerobot":
+                        has_lerobot = True
+                    elif ep["format"] == "raw":
+                        has_raw = True
                     break
 
-            if episode is None:
-                continue
+        print(f"\n[INFO] {len(bad_episodes)} episode(s) marked as bad: {bad_episodes}")
 
-            if episode["format"] == "raw":
+        if has_lerobot:
+            print()
+            print("[INFO] LeRobot episodes use shared video files across episodes.")
+            print("       In-place deletion would corrupt the dataset.")
+            print("       Bad episodes are saved in episode_qualities.json and will be")
+            print("       excluded when you run clean_lerobot_dataset.py.")
+            print()
+            print(f"  To rebuild without bad episodes:")
+            print(f"    python scripts/clean_lerobot_dataset.py -i {self.dataset_path} -o data/clean_lerobot_episodes")
+
+        deleted = 0
+
+        if has_raw and confirm:
+            response = input("\nDelete raw-format bad episodes from disk? (yes/no): ")
+            if response.lower() != "yes":
+                print("[INFO] Raw episode deletion cancelled")
+                has_raw = False
+
+        if has_raw:
+            for ep_idx in bad_episodes:
+                episode = None
+                for ep in self.episodes:
+                    if ep["index"] == ep_idx:
+                        episode = ep
+                        break
+                if episode is None or episode["format"] != "raw":
+                    continue
+
                 ep_dir = episode["path"]
                 try:
                     shutil.rmtree(ep_dir)
-                    print(f"[OK] Deleted episode {ep_idx}: {ep_dir}")
+                    print(f"[OK] Deleted raw episode {ep_idx}: {ep_dir}")
+                    del self.episode_qualities[ep_idx]
                     deleted += 1
                 except Exception as e:
                     print(f"[ERROR] Failed to delete {ep_dir}: {e}")
 
-            elif episode["format"] == "lerobot":
-                # For LeRobot format, delete the video files for this episode
-                try:
-                    videos_deleted = 0
-                    for video_key in ["observation.images.global", "observation.images.gripper"]:
-                        chunk_key = f"videos/{video_key}/chunk_index"
-                        file_key = f"videos/{video_key}/file_index"
-                        chunk_idx = episode.get(chunk_key, 0)
-                        file_idx = episode.get(file_key, 0)
-
-                        video_path = self.dataset_path / "videos" / video_key / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mp4"
-                        if video_path.exists():
-                            video_path.unlink()
-                            videos_deleted += 1
-
-                    print(f"[OK] Deleted episode {ep_idx} ({videos_deleted} video files)")
-                    deleted += 1
-                    deleted_lerobot_indices.append(ep_idx)
-
-                except Exception as e:
-                    print(f"[ERROR] Failed to delete LeRobot episode {ep_idx}: {e}")
-
-            # Remove from qualities
-            del self.episode_qualities[ep_idx]
-
-        # Save updated qualities
+        # Save quality annotations (marks are preserved for the cleaner)
         self._save_qualities()
 
-        # Rebuild LeRobot parquet files if any LeRobot episodes were deleted
-        if deleted_lerobot_indices:
-            self._rebuild_lerobot_after_deletion(deleted_lerobot_indices)
+        if has_raw and deleted > 0:
+            # Reload only if raw episodes were actually deleted from disk
+            self.episodes = []
+            self._load_dataset()
 
-        # Reload dataset
-        self.episodes = []
-        self._load_dataset()
+        n_lerobot = len([idx for idx in bad_episodes
+                         if any(ep["index"] == idx and ep["format"] == "lerobot"
+                                for ep in self.episodes)])
+        if n_lerobot > 0:
+            print(f"\n[OK] {n_lerobot} LeRobot episode(s) marked for exclusion in episode_qualities.json")
+        if deleted > 0:
+            print(f"[OK] {deleted} raw episode(s) deleted from disk")
 
-        print(f"\n[OK] Deleted {deleted} episode(s)")
-        return deleted
+        return deleted + n_lerobot
 
     def export_filtered_dataset(self, output_path: str, quality_filter: str = "good") -> int:
         """

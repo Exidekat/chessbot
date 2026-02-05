@@ -40,6 +40,49 @@ from utils.lerobot_helpers import (
 )
 
 
+_av1_encoder_cache = None
+
+def _test_av1_encoder(encoder_args):
+    """Test if an AV1 encoder actually works by encoding a single frame."""
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1:r=15",
+        *encoder_args, "-pix_fmt", "yuv420p",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    return result.returncode == 0
+
+def _get_best_av1_encoder():
+    """Detect the fastest available AV1 encoder. Cached after first call.
+
+    Preference: av1_nvenc (HW) > libsvtav1 (fast CPU) > libaom-av1 (slow reference)
+    Each candidate is tested with a real encode to verify it works.
+    """
+    global _av1_encoder_cache
+    if _av1_encoder_cache is not None:
+        return _av1_encoder_cache
+
+    candidates = [
+        (("-c:v", "av1_nvenc", "-cq", "30", "-preset", "p4"), "av1_nvenc (GPU)"),
+        (("-c:v", "libsvtav1", "-crf", "30", "-preset", "6"), "libsvtav1 (CPU)"),
+        (("-c:v", "libaom-av1", "-crf", "30", "-cpu-used", "8"), "libaom-av1 (CPU, slow)"),
+    ]
+
+    for args, name in candidates:
+        try:
+            if _test_av1_encoder(args):
+                print(f"[*] AV1 encoder: {name}")
+                _av1_encoder_cache = args
+                return _av1_encoder_cache
+        except (subprocess.TimeoutExpired, Exception):
+            continue
+
+    # Ultimate fallback
+    _av1_encoder_cache = ("-c:v", "libaom-av1", "-crf", "30", "-cpu-used", "8")
+    return _av1_encoder_cache
+
+
 class FilterMode(Enum):
     """Filtering mode for removing idle frames."""
     POSITION = "position"      # Original: position-based comparison
@@ -203,6 +246,42 @@ def get_video_frame_count(video_path: Path) -> int:
         return int(result.stdout.strip())
 
 
+def _frames_to_select_expr(keep_frames: List[int]) -> str:
+    """Convert frame indices to an optimized ffmpeg select expression.
+
+    Uses between(n,a,b) for contiguous ranges instead of individual eq(n,X)
+    terms. This reduces filter expression size and evaluation cost dramatically.
+
+    Example: frames [0,1,2,5,6,10] -> "between(n\\,0\\,2)+between(n\\,5\\,6)+eq(n\\,10)"
+    """
+    if not keep_frames:
+        return ""
+
+    sorted_frames = sorted(keep_frames)
+    terms = []
+    start = sorted_frames[0]
+    end = sorted_frames[0]
+
+    for f in sorted_frames[1:]:
+        if f == end + 1:
+            end = f
+        else:
+            if start == end:
+                terms.append(f"eq(n\\,{start})")
+            else:
+                terms.append(f"between(n\\,{start}\\,{end})")
+            start = f
+            end = f
+
+    # Final range
+    if start == end:
+        terms.append(f"eq(n\\,{start})")
+    else:
+        terms.append(f"between(n\\,{start}\\,{end})")
+
+    return "+".join(terms)
+
+
 def extract_frames_to_video(
     input_video: Path,
     output_video: Path,
@@ -212,6 +291,8 @@ def extract_frames_to_video(
 ) -> bool:
     """
     Extract specific frames from input video and create new video.
+
+    Uses a single-pass ffmpeg pipeline with optimized select filter.
 
     Args:
         input_video: Source video path
@@ -232,97 +313,25 @@ def extract_frames_to_video(
     # IMPORTANT: -g 15 sets keyframe interval to 1 second at 15fps
     # Without this, random frame access requires decoding ALL preceding frames (5x slowdown)
     if codec == "av1":
-        codec_args = ["-c:v", "libaom-av1", "-crf", "30", "-cpu-used", "8", "-g", str(fps)]
+        av1_encoder = _get_best_av1_encoder()
+        codec_args = list(av1_encoder) + ["-g", str(fps)]
     else:
         codec_args = ["-c:v", "libx264", "-crf", "23", "-preset", "fast", "-g", str(fps)]
 
-    # For large frame lists, extract to PNG first then encode to video
-    # This avoids shell argument length limits and ffmpeg filter issues
-    if len(keep_frames) > 500:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-            extracted_idx = 0
+    # Build optimized select expression using contiguous ranges
+    select_expr = _frames_to_select_expr(keep_frames)
 
-            # Try PyAV first (supports AV1 codec)
-            try:
-                import av
-                container = av.open(str(input_video))
-                stream = container.streams.video[0]
+    # Single-pass: decode -> select -> encode (no intermediate PNGs)
+    # Write filter to temp file to avoid any shell argument length issues
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(f"select='{select_expr}',setpts=N/{fps}/TB")
+        filter_file = f.name
 
-                frame_set = set(keep_frames)
-                frame_num = 0
-
-                for frame in container.decode(stream):
-                    if frame_num in frame_set:
-                        img = frame.to_ndarray(format='bgr24')
-                        out_path = tmpdir / f"frame_{extracted_idx:06d}.png"
-                        import cv2
-                        cv2.imwrite(str(out_path), img)
-                        extracted_idx += 1
-                    frame_num += 1
-                    # Early exit if we've extracted all needed frames
-                    if extracted_idx >= len(keep_frames):
-                        break
-
-                container.close()
-
-            except ImportError:
-                # PyAV not available, fall back to ffmpeg batching
-                batch_size = 400
-                for batch_start in range(0, len(keep_frames), batch_size):
-                    batch_frames = keep_frames[batch_start:batch_start + batch_size]
-                    select_expr = "+".join([f"eq(n\\,{f})" for f in batch_frames])
-
-                    batch_dir = tmpdir / f"batch_{batch_start:06d}"
-                    batch_dir.mkdir(parents=True, exist_ok=True)
-
-                    cmd = [
-                        "ffmpeg", "-y", "-v", "error",
-                        "-i", str(input_video),
-                        "-vf", f"select='{select_expr}'",
-                        "-vsync", "vfr",
-                        str(batch_dir / "frame_%06d.png")
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        print(f"[WARN] FFmpeg batch error: {result.stderr}")
-                        continue
-
-                    # Collect extracted frames
-                    batch_pngs = sorted(batch_dir.glob("frame_*.png"))
-                    for png in batch_pngs:
-                        new_name = tmpdir / f"frame_{extracted_idx:06d}.png"
-                        shutil.move(str(png), str(new_name))
-                        extracted_idx += 1
-
-            if extracted_idx != len(keep_frames):
-                print(f"[WARN] Expected {len(keep_frames)} frames, extracted {extracted_idx}")
-
-            if extracted_idx == 0:
-                print(f"[WARN] No frames extracted!")
-                return False
-
-            # Encode PNGs to video
-            cmd = [
-                "ffmpeg", "-y", "-v", "error",
-                "-framerate", str(fps),
-                "-i", str(tmpdir / "frame_%06d.png"),
-                *codec_args,
-                "-pix_fmt", "yuv420p",
-                str(output_video)
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"[WARN] FFmpeg encode error: {result.stderr}")
-                return False
-    else:
-        # For smaller frame lists, use inline select filter
-        select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
-
+    try:
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-i", str(input_video),
-            "-vf", f"select='{select_expr}',setpts=N/{fps}/TB",
+            "-filter_script:v", filter_file,
             *codec_args,
             "-pix_fmt", "yuv420p",
             "-r", str(fps),
@@ -333,6 +342,8 @@ def extract_frames_to_video(
         if result.returncode != 0:
             print(f"[WARN] FFmpeg error: {result.stderr}")
             return False
+    finally:
+        Path(filter_file).unlink(missing_ok=True)
 
     return output_video.exists()
 
@@ -370,95 +381,68 @@ def extract_frames_to_png(
     episode_dir = output_dir / f"episode-{episode_idx:06d}"
     episode_dir.mkdir(parents=True, exist_ok=True)
 
-    # For large frame lists, use PyAV to avoid ffmpeg command line limits
-    # PyAV supports AV1 codec while OpenCV may not
-    if len(keep_frames) > 500:
+    # Try PyAV first for single-pass decode (supports AV1, early exit optimization)
+    try:
+        import av
+        import cv2
+        container = av.open(str(input_video))
+        stream = container.streams.video[0]
+
+        frame_set = set(keep_frames)
         extracted_idx = 0
+        frame_num = 0
 
-        try:
-            import av
-            import cv2
-            container = av.open(str(input_video))
-            stream = container.streams.video[0]
-
-            frame_set = set(keep_frames)
-            frame_num = 0
-
-            for frame in container.decode(stream):
-                if frame_num in frame_set:
-                    img = frame.to_ndarray(format='bgr24')
-                    out_path = episode_dir / f"frame-{extracted_idx:06d}.png"
-                    cv2.imwrite(str(out_path), img)
-                    extracted_idx += 1
-                frame_num += 1
-                # Early exit if we've extracted all needed frames
+        for frame in container.decode(stream):
+            if frame_num in frame_set:
+                img = frame.to_ndarray(format='bgr24')
+                out_path = episode_dir / f"frame-{extracted_idx:06d}.png"
+                cv2.imwrite(str(out_path), img)
+                extracted_idx += 1
                 if extracted_idx >= len(keep_frames):
                     break
+            frame_num += 1
 
-            container.close()
+        container.close()
 
-            if extracted_idx != len(keep_frames):
-                print(f"[WARN] Expected {len(keep_frames)} frames, extracted {extracted_idx}")
+        if extracted_idx != len(keep_frames):
+            print(f"[WARN] Expected {len(keep_frames)} frames, extracted {extracted_idx}")
 
-            return episode_dir.exists() and extracted_idx > 0
+        return episode_dir.exists() and extracted_idx > 0
 
-        except ImportError:
-            # PyAV not available - fall back to ffmpeg batching
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir = Path(tmpdir)
-                batch_size = 400
+    except ImportError:
+        pass
 
-                for batch_start in range(0, len(keep_frames), batch_size):
-                    batch_frames = keep_frames[batch_start:batch_start + batch_size]
-                    select_expr = "+".join([f"eq(n\\,{f})" for f in batch_frames])
+    # Fallback: single-pass ffmpeg with optimized select filter
+    select_expr = _frames_to_select_expr(keep_frames)
 
-                    cmd = [
-                        "ffmpeg", "-y", "-v", "error",
-                        "-i", str(input_video),
-                        "-vf", f"select='{select_expr}'",
-                        "-vsync", "vfr",
-                        str(tmpdir / "frame_%06d.png")
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        print(f"[WARN] FFmpeg batch error: {result.stderr}")
-                        continue
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(f"select='{select_expr}'")
+        filter_file = f.name
 
-                    # Move extracted frames to episode directory
-                    batch_pngs = sorted(tmpdir.glob("frame_*.png"))
-                    for png in batch_pngs:
-                        dst_path = episode_dir / f"frame-{extracted_idx:06d}.png"
-                        shutil.move(str(png), str(dst_path))
-                        extracted_idx += 1
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(input_video),
+                "-filter_script:v", filter_file,
+                "-vsync", "vfr",
+                str(Path(tmpdir) / "frame_%06d.png")
+            ]
 
-                return episode_dir.exists() and extracted_idx > 0
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[WARN] FFmpeg PNG extraction error: {result.stderr}")
+                return False
 
-    # For smaller frame lists, use ffmpeg's select filter
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        select_expr = "+".join([f"eq(n\\,{f})" for f in keep_frames])
+            extracted_frames = sorted(Path(tmpdir).glob("frame_*.png"))
+            if len(extracted_frames) != len(keep_frames):
+                print(f"[WARN] Expected {len(keep_frames)} frames, got {len(extracted_frames)}")
 
-        cmd = [
-            "ffmpeg", "-y", "-v", "error",
-            "-i", str(input_video),
-            "-vf", f"select='{select_expr}'",
-            "-vsync", "vfr",
-            str(tmpdir / "frame_%06d.png")
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[WARN] FFmpeg PNG extraction error: {result.stderr}")
-            return False
-
-        # Rename extracted frames to sequential numbering (0-indexed)
-        extracted_frames = sorted(tmpdir.glob("frame_*.png"))
-        if len(extracted_frames) != len(keep_frames):
-            print(f"[WARN] Expected {len(keep_frames)} frames, got {len(extracted_frames)}")
-
-        for new_idx, src_path in enumerate(extracted_frames):
-            dst_path = episode_dir / f"frame-{new_idx:06d}.png"
-            shutil.move(str(src_path), str(dst_path))
+            for new_idx, src_path in enumerate(extracted_frames):
+                dst_path = episode_dir / f"frame-{new_idx:06d}.png"
+                shutil.move(str(src_path), str(dst_path))
+    finally:
+        Path(filter_file).unlink(missing_ok=True)
 
     return episode_dir.exists() and len(list(episode_dir.glob("*.png"))) > 0
 
@@ -613,6 +597,41 @@ def clean_dataset(
         print(f"    Action smoothing: {smooth_actions}")
         print(f"    Output format: {output_format}")
 
+    # Validate media availability per episode
+    # Episodes with missing media are unrecoverable and will be excluded from output
+    media_features = {}  # cam_key -> dtype ("video" or "image")
+    for key, feat in info.get("features", {}).items():
+        if "images" in key:
+            media_features[key] = feat.get("dtype", "video")
+
+    unrecoverable_episodes = set()
+    if media_features:
+        episodes_meta_dir_check = input_dir / "meta" / "episodes" / "chunk-000"
+        for meta_file in sorted(episodes_meta_dir_check.glob("file-*.parquet")):
+            ep_meta = pq.read_table(meta_file).to_pandas()
+            for _, row in ep_meta.iterrows():
+                ep_idx = int(row["episode_index"])
+                for cam_key, dtype in media_features.items():
+                    if dtype == "video":
+                        col_name = f"videos/{cam_key}/file_index"
+                        chunk_col = f"videos/{cam_key}/chunk_index"
+                        if col_name in row.index:
+                            vid_file_idx = int(row[col_name])
+                            vid_chunk_idx = int(row.get(chunk_col, 0))
+                            video_path = (input_dir / "videos" / cam_key /
+                                          f"chunk-{vid_chunk_idx:03d}" / f"file-{vid_file_idx:03d}.mp4")
+                            if not video_path.exists():
+                                unrecoverable_episodes.add(ep_idx)
+                                break
+                    elif dtype == "image":
+                        episode_img_dir = input_dir / "images" / cam_key / f"episode-{ep_idx:06d}"
+                        if not episode_img_dir.exists() or not list(episode_img_dir.glob("*.png")):
+                            unrecoverable_episodes.add(ep_idx)
+                            break
+
+    if verbose and unrecoverable_episodes:
+        print(f"[*] Found {len(unrecoverable_episodes)} unrecoverable episodes (missing media)")
+
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -634,19 +653,39 @@ def clean_dataset(
 
     # Build mapping from original episode index to new contiguous index
     # First pass: collect all episode indices that will be kept
+    # Combine all skip sets
+    skip_episodes = bad_episodes | unrecoverable_episodes
+
     kept_episodes = []
     for pq_file in parquet_files:
         df = pq.read_table(pq_file).to_pandas()
         for ep_idx in df["episode_index"].unique():
-            if ep_idx not in bad_episodes and ep_idx not in kept_episodes:
+            if ep_idx not in skip_episodes and ep_idx not in kept_episodes:
                 kept_episodes.append(ep_idx)
     kept_episodes = sorted(kept_episodes)
+
+    if not kept_episodes:
+        n_bad = len(bad_episodes)
+        n_unrecoverable = len(unrecoverable_episodes - bad_episodes)
+        print(f"[X] No recoverable episodes found!")
+        if n_bad:
+            print(f"    {n_bad} marked as bad")
+        if n_unrecoverable:
+            print(f"    {n_unrecoverable} missing media files")
+        print(f"    Fix the source dataset or re-collect episodes.")
+        return stats
 
     # Create old->new index mapping for contiguous output using helper
     old_to_new_ep_idx = build_index_mapping(kept_episodes)
 
-    if verbose and bad_episodes:
-        print(f"    Episodes after filtering: {len(kept_episodes)} (skipped {len(bad_episodes)} bad)")
+    n_skipped = len(skip_episodes)
+    if verbose and n_skipped:
+        reasons = []
+        if bad_episodes:
+            reasons.append(f"{len(bad_episodes)} bad")
+        if unrecoverable_episodes - bad_episodes:
+            reasons.append(f"{len(unrecoverable_episodes - bad_episodes)} missing media")
+        print(f"    Episodes after filtering: {len(kept_episodes)} (skipped {n_skipped}: {', '.join(reasons)})")
         print(f"    Reindexing: {min(kept_episodes)}-{max(kept_episodes)} -> 0-{len(kept_episodes)-1}")
 
     all_cleaned_dfs = []
@@ -660,10 +699,11 @@ def clean_dataset(
 
         # Process each episode in this file
         for ep_idx in df["episode_index"].unique():
-            # Skip bad episodes
-            if ep_idx in bad_episodes:
+            # Skip bad or unrecoverable episodes
+            if ep_idx in skip_episodes:
                 if verbose:
-                    print(f"    Episode {ep_idx}: SKIPPED (marked as bad)")
+                    reason = "marked as bad" if ep_idx in bad_episodes else "missing media"
+                    print(f"    Episode {ep_idx}: SKIPPED ({reason})")
                 continue
 
             ep_df = df[df["episode_index"] == ep_idx].copy()
@@ -1074,11 +1114,18 @@ def clean_dataset(
     # Recompute stats.json
     recompute_stats(output_dir)
 
-    # Regenerate norm_stats.json (must use fresh dataloader to get home-relative values)
-    from vla.normalization import compute_dataset_stats
-    if verbose:
-        print("[*] Regenerating norm_stats.json with home-relative values...")
-    compute_dataset_stats(str(output_dir))
+    # Regenerate norm_stats.json
+    # Try full dataloader (home-relative values), fall back to raw parquet computation
+    try:
+        from vla.normalization import compute_dataset_stats
+        if verbose:
+            print("[*] Regenerating norm_stats.json with home-relative values...")
+        compute_dataset_stats(str(output_dir))
+    except (ValueError, FileNotFoundError, OSError) as e:
+        if verbose:
+            print(f"[WARN] Dataloader-based norm_stats failed: {e}")
+            print("[*] Computing norm_stats.json from parquet data...")
+        recompute_norm_stats(output_dir)
 
     # Copy episode_qualities.json with reindexed keys (only kept episodes)
     if quality_annotations:
@@ -1120,6 +1167,9 @@ def clean_dataset(
         print(f"    Cleaned episodes: {len(kept_episodes)}")
         if bad_episodes:
             print(f"    Skipped episodes (bad): {len(bad_episodes)}")
+        n_unrecoverable = len(unrecoverable_episodes - bad_episodes)
+        if n_unrecoverable:
+            print(f"    Skipped episodes (missing media): {n_unrecoverable}")
         print(f"    Original frames: {stats['original_frames']}")
         print(f"    Cleaned frames: {stats['cleaned_frames']}")
         print(f"    Removed frames: {stats['removed_frames']}")
@@ -1163,6 +1213,44 @@ def recompute_stats(dataset_path: Path):
 
     with open(dataset_path / "meta" / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
+
+
+def recompute_norm_stats(dataset_path: Path):
+    """Compute norm_stats.json directly from parquet data.
+
+    Fallback for when the full dataloader can't be used (e.g. missing images).
+    Computes quantile-based stats from raw state/action values.
+    """
+    data_dir = dataset_path / "data"
+
+    all_dfs = []
+    for pq_file in sorted(data_dir.glob("chunk-*/file-*.parquet")):
+        df = pq.read_table(pq_file).to_pandas()
+        all_dfs.append(df)
+
+    if not all_dfs:
+        return
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    stats = {}
+    for col in ["observation.state", "action"]:
+        if col in combined.columns:
+            values = np.array(combined[col].tolist())
+            stats[col] = {
+                "q01": np.percentile(values, 1, axis=0).tolist(),
+                "q99": np.percentile(values, 99, axis=0).tolist(),
+                "mean": np.mean(values, axis=0).tolist(),
+                "std": np.std(values, axis=0).tolist(),
+                "min": np.min(values, axis=0).tolist(),
+                "max": np.max(values, axis=0).tolist(),
+            }
+
+    output_path = dataset_path / "norm_stats.json"
+    with open(output_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"[OK] Wrote {output_path}")
 
 
 def main():
@@ -1318,6 +1406,11 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
         input_dir = Path(args.input)
         data_dir = input_dir / "data"
 
+        # Load info.json for media feature check
+        info_path = input_dir / "meta" / "info.json"
+        with open(info_path) as f:
+            dry_info = json.load(f)
+
         # Load quality annotations for skipping
         bad_episodes = set()
         if args.skip_bad_episodes:
@@ -1325,7 +1418,44 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
             bad_episodes = get_bad_episodes(quality_annotations)
             if bad_episodes:
                 print(f"[*] Found {len(bad_episodes)} bad episodes to skip: {sorted(bad_episodes)}")
-                print()
+
+        # Check media availability per episode
+        media_features = {}
+        for key, feat in dry_info.get("features", {}).items():
+            if "images" in key:
+                media_features[key] = feat.get("dtype", "video")
+
+        unrecoverable_episodes = set()
+        if media_features:
+            episodes_meta_dir_check = input_dir / "meta" / "episodes" / "chunk-000"
+            for meta_file in sorted(episodes_meta_dir_check.glob("file-*.parquet")):
+                ep_meta = pq.read_table(meta_file).to_pandas()
+                for _, row in ep_meta.iterrows():
+                    ep_idx = int(row["episode_index"])
+                    for cam_key, dtype in media_features.items():
+                        if dtype == "video":
+                            col_name = f"videos/{cam_key}/file_index"
+                            chunk_col = f"videos/{cam_key}/chunk_index"
+                            if col_name in row.index:
+                                vid_file_idx = int(row[col_name])
+                                vid_chunk_idx = int(row.get(chunk_col, 0))
+                                video_path = (input_dir / "videos" / cam_key /
+                                              f"chunk-{vid_chunk_idx:03d}" / f"file-{vid_file_idx:03d}.mp4")
+                                if not video_path.exists():
+                                    unrecoverable_episodes.add(ep_idx)
+                                    break
+                        elif dtype == "image":
+                            episode_img_dir = input_dir / "images" / cam_key / f"episode-{ep_idx:06d}"
+                            if not episode_img_dir.exists() or not list(episode_img_dir.glob("*.png")):
+                                unrecoverable_episodes.add(ep_idx)
+                                break
+
+        if unrecoverable_episodes:
+            print(f"[*] Found {len(unrecoverable_episodes)} unrecoverable episodes (missing media)")
+
+        skip_episodes = bad_episodes | unrecoverable_episodes
+        if skip_episodes:
+            print()
 
         total_orig = 0
         total_keep = 0
@@ -1336,8 +1466,9 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
             df = pq.read_table(pq_file).to_pandas()
 
             for ep_idx in df["episode_index"].unique():
-                if ep_idx in bad_episodes:
-                    print(f"Episode {ep_idx}: SKIPPED (marked as bad)")
+                if ep_idx in skip_episodes:
+                    reason = "marked as bad" if ep_idx in bad_episodes else "missing media"
+                    print(f"Episode {ep_idx}: SKIPPED ({reason})")
                     total_skipped += 1
                     continue
 
@@ -1373,9 +1504,16 @@ Based on OpenPI, VLA-Cache, and OpenVLA best practices.
 
         print()
         print(f"Total: {total_orig} -> {total_keep} frames")
-        print(f"Would remove: {total_orig - total_keep} frames ({100*(total_orig-total_keep)/total_orig:.1f}%)")
+        if total_orig > 0:
+            print(f"Would remove: {total_orig - total_keep} frames ({100*(total_orig-total_keep)/total_orig:.1f}%)")
         if total_skipped > 0:
-            print(f"Skipped episodes (bad): {total_skipped}")
+            reasons = []
+            if bad_episodes:
+                reasons.append(f"{len(bad_episodes)} bad")
+            n_unrecoverable = len(unrecoverable_episodes - bad_episodes)
+            if n_unrecoverable:
+                reasons.append(f"{n_unrecoverable} missing media")
+            print(f"Skipped episodes: {total_skipped} ({', '.join(reasons)})")
         if args.unwrap_angles and total_unwrap_fixes > 0:
             print(f"Angle unwrap fixes: {total_unwrap_fixes} corrections")
         return
