@@ -5,7 +5,7 @@ This script deploys VLA models (PI0 or SmolVLA) for real-time chess robot contro
 1. Loads base π₀.₅ weights (or fine-tuned checkpoint if provided)
 2. Performs board detection and move calculation (same as virtual_overlay_demo.py)
 3. Generates color-conditioned VLM prompts for each move stage
-4. Uses ChessBot Virtual Cam (720p) + Gripper Cam (224x224) as video input
+4. Uses ChessBot Virtual Cam (720p) + Gripper Cam (native 640x480) as video input
 5. User presses ENTER to hand control to VLA, ENTER again to stop
 6. Repeats for all stages of the best move
 
@@ -182,17 +182,21 @@ def capture_720p_frame(device_path):
 
 def capture_gripper_frame(device_path):
     """
-    Capture a single 224x224 frame from gripper camera.
+    Capture a single frame from gripper camera at native resolution.
+
+    The frame is returned at native 640x480 resolution. Model-specific
+    resizing (height-first + center crop) is handled by the model wrapper's
+    preprocess_observation() method, matching the training pipeline.
 
     Args:
         device_path: Camera device path
 
     Returns:
-        numpy.ndarray: Captured frame (224x224)
+        numpy.ndarray: Captured frame at native resolution (e.g. 640x480)
     """
     camera_index = get_camera_index_from_device(device_path)
 
-    # Configure camera for 640x480 (we'll resize to 224x224)
+    # Configure camera for native 640x480
     try:
         subprocess.run([
             "v4l2-ctl",
@@ -223,9 +227,7 @@ def capture_gripper_frame(device_path):
         print(f"[X] Failed to capture frame from gripper camera")
         return None
 
-    # Resize to 224x224 for VLA input
-    frame_224 = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
-    return frame_224
+    return frame
 
 
 class VLAWrapper:
@@ -349,7 +351,7 @@ class VLAWrapper:
 
         Args:
             global_frame: Global camera frame (720p, with overlay applied)
-            gripper_frame: Gripper camera frame (224x224)
+            gripper_frame: Gripper camera frame (any resolution, e.g. 640x480)
             language_prompt: Natural language instruction (VLM prompt)
             robot_state: Current SO-100 state
 
@@ -662,9 +664,6 @@ def vla_control_loop(
             # Stream to virtual camera for visualization
             if virtual_cam:
                 virtual_cam.write_frame(vla_input_frame)
-
-            # Resize gripper to 224x224
-            gripper_frame = cv2.resize(gripper_frame, (224, 224))
 
             # Get current robot state
             robot_state = vla.get_robot_state()

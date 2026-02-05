@@ -233,8 +233,8 @@ class SmolVLAModel(VLAModelMixin):
             right_tile = global_frame[:, mid - overlap:]
 
             # Resize each tile to img_size x img_size
-            left_resized = cv2.resize(left_tile, (img_size, img_size), interpolation=cv2.INTER_AREA)
-            right_resized = cv2.resize(right_tile, (img_size, img_size), interpolation=cv2.INTER_AREA)
+            left_resized = cv2.resize(left_tile, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+            right_resized = cv2.resize(right_tile, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
 
             # Convert BGR to RGB
             left_rgb = cv2.cvtColor(left_resized, cv2.COLOR_BGR2RGB)
@@ -249,7 +249,7 @@ class SmolVLAModel(VLAModelMixin):
             scale = min(img_size / gh, img_size / gw)
             new_h, new_w = int(gh * scale), int(gw * scale)
 
-            global_resized = cv2.resize(global_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            global_resized = cv2.resize(global_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
             # Create padded output (black padding)
             global_padded = np.zeros((img_size, img_size, 3), dtype=np.uint8)
@@ -267,7 +267,7 @@ class SmolVLAModel(VLAModelMixin):
         gh, gw = gripper_frame.shape[:2]
         scale = img_size / gh
         new_w = int(gw * scale)
-        gripper_resized = cv2.resize(gripper_frame, (new_w, img_size), interpolation=cv2.INTER_AREA)
+        gripper_resized = cv2.resize(gripper_frame, (new_w, img_size), interpolation=cv2.INTER_LINEAR)
 
         # Center crop width to img_size
         if new_w > img_size:
