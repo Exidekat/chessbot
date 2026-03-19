@@ -16,6 +16,7 @@ Functions:
 - capture_4k_downscale(): Capture 4K MJPEG and downscale to 720p
 """
 
+import os
 import sys
 import subprocess
 import time
@@ -37,6 +38,9 @@ except ImportError:
 # Set to False to use 4K MJPEG -> 720p downscale (supersampled, 30fps)
 # This can be overridden per-script with --yuyv or --mjpeg flags
 DEFAULT_USE_YUYV = True
+
+# Environment variable for resource daemon URL (set by claw/scripts/start.sh)
+RESOURCE_DAEMON_URL_ENV = "RESOURCE_DAEMON_URL"
 
 
 def get_available_cameras() -> List[Tuple[str, str]]:
@@ -278,6 +282,83 @@ def get_camera_index_from_device(device_path: str) -> int:
         sys.exit(1)
 
 
+def capture_from_daemon(device_path: str, output_path: Path, daemon_url: str) -> bool:
+    """
+    Fetch the latest frame from the resource daemon HTTP API.
+
+    Fallback capture method used when the resource daemon holds exclusive V4L2
+    access to camera devices. Fetches a JPEG frame via HTTP, decodes it, resizes
+    to 1280x720 if needed (YOLO models expect this resolution), and saves as PNG.
+
+    Args:
+        device_path: Camera device path (e.g., "/dev/video3") -- used to derive device_id
+        output_path: Path to save the captured image
+        daemon_url: Resource daemon base URL (e.g., "http://127.0.0.1:8419")
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import urllib.request
+    import numpy as np
+
+    device_id = get_camera_index_from_device(device_path)
+    url = f"{daemon_url.rstrip('/')}/camera/{device_id}/frame"
+
+    print(f"[CameraCapture] Fetching frame from daemon: {url}")
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            jpeg_bytes = resp.read()
+    except Exception as e:
+        print(f"[CameraCapture] [X] Daemon request failed: {e}")
+        return False
+
+    # Decode JPEG to numpy array
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        print("[CameraCapture] [X] Failed to decode JPEG from daemon")
+        return False
+
+    h, w = frame.shape[:2]
+    print(f"[CameraCapture] Daemon frame: {w}x{h}")
+
+    # Resize to 1280x720 if needed (YOLO models expect this)
+    if w != 1280 or h != 720:
+        print(f"[CameraCapture] Resizing {w}x{h} -> 1280x720")
+        frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LANCZOS4)
+
+    cv2.imwrite(str(output_path), frame)
+    print(f"[CameraCapture] [OK] Photo saved (via daemon): {output_path}")
+    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
+    return True
+
+
+DEFAULT_DAEMON_URL = "http://127.0.0.1:8419"
+
+
+def _try_daemon_fallback(device_path: str, output_path: Path) -> bool:
+    """Check for resource daemon and attempt fallback capture.
+
+    Checks RESOURCE_DAEMON_URL env var first, then probes the default daemon
+    port (8419) as a last resort. This handles the common case where the daemon
+    is running but the script was launched outside of start.sh.
+
+    Returns True if daemon fallback succeeded, False if unavailable or failed.
+    """
+    daemon_url = os.environ.get(RESOURCE_DAEMON_URL_ENV, "").strip()
+    if not daemon_url:
+        # Probe default daemon URL before giving up
+        import urllib.request
+        try:
+            urllib.request.urlopen(f"{DEFAULT_DAEMON_URL}/health", timeout=1).read()
+            daemon_url = DEFAULT_DAEMON_URL
+        except Exception:
+            return False
+    print("[CameraCapture] Device locked, falling back to resource daemon...")
+    return capture_from_daemon(device_path, output_path, daemon_url)
+
+
 def capture_4k_downscale(device_path: str, output_path: Path) -> bool:
     """
     Capture 4K MJPEG video for 1 second, then downscale best frame to 1280x720.
@@ -344,7 +425,7 @@ def capture_4k_downscale(device_path: str, output_path: Path) -> bool:
 
     if not cap.isOpened():
         print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
-        return False
+        return _try_daemon_fallback(device_path, output_path)
 
     # Explicitly set resolution and FPS in OpenCV
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
@@ -471,7 +552,7 @@ def capture_720p_yuyv(device_path: str, output_path: Path) -> bool:
 
     if not cap.isOpened():
         print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
-        return False
+        return _try_daemon_fallback(device_path, output_path)
 
     # Explicitly set resolution and FPS in OpenCV
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)

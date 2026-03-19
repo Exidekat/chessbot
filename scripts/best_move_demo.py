@@ -18,10 +18,8 @@ import sys
 from pathlib import Path
 import chess
 import cv2
-import subprocess
 from datetime import datetime
 import time
-import gc
 
 # Add parent directory to path for module imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -49,87 +47,6 @@ def print_board(board: chess.Board):
     print("=" * 40)
     print(board)
     print("=" * 40)
-
-
-def capture_yuyv_720p(device_path, output_path):
-    """
-    DEPRECATED: Direct 720p YUYV capture (kept for fallback).
-    Use capture_4k_downscale() instead for better quality.
-
-    Capture a 1280x720 YUYV photo from the specified camera.
-
-    Args:
-        device_path: Camera device path
-        output_path: Path to save the captured image
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    camera_index = get_camera_index_from_device(device_path)
-
-    print(f"\n[CameraCapture] Opening camera: {device_path} (index: {camera_index})")
-
-    # Configure camera for YUYV 1280x720 (uncompressed)
-    print(f"[CameraCapture] Setting YUYV 1280x720 @ 10fps format...")
-    try:
-        subprocess.run([
-            "v4l2-ctl",
-            f"--device={device_path}",
-            "--set-fmt-video=width=1280,height=720,pixelformat=YUYV",
-            "--set-parm=10"
-        ], check=True, capture_output=True, text=True)
-        print(f"[CameraCapture] [OK] Format set to YUYV 1280x720 @ 10fps")
-    except subprocess.CalledProcessError as e:
-        print(f"[CameraCapture] Warning: Could not set format via v4l2-ctl: {e}")
-        print(f"[CameraCapture] Continuing with OpenCV defaults...")
-
-    # Open camera with V4L2 backend
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-
-    if not cap.isOpened():
-        print(f"[CameraCapture] [X] Failed to open camera: {device_path}")
-        return False
-
-    # Explicitly set resolution and FPS in OpenCV (v4l2-ctl may not persist)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 10)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
-
-    # Verify resolution and FPS
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    print(f"[CameraCapture] Camera resolution: {width}x{height} @ {fps}fps")
-
-    if width != 1280 or height != 720:
-        print(f"[CameraCapture] Warning: Expected 1280x720, got {width}x{height}")
-        print(f"[CameraCapture] Camera may not support YUYV at 720p, using available resolution")
-
-    # Capture 2 frames (1 for warmup, use the 2nd frame)
-    # Reduced to minimize time before power-cycle with YUYV
-    print("[CameraCapture] Warming up camera and capturing...")
-    frame = None
-    for i in range(2):
-        ret, frame = cap.read()
-        if not ret:
-            print(f"[CameraCapture] [X] Failed to read frame {i+1}/2")
-            # Note: Not calling cap.release() due to WBC-0E01 quirk
-            del cap
-            gc.collect()
-            return False
-
-    # Save image directly (no transformations - same as training scripts)
-    cv2.imwrite(str(output_path), frame)
-    print(f"[CameraCapture] [OK] Photo captured: {output_path}")
-    print(f"[CameraCapture] Size: {output_path.stat().st_size / 1024:.1f} KB")
-
-    # Note: Not calling cap.release() due to WBC-0E01 quirk causing errno=19
-    # Instead, delete reference and force garbage collection
-    del cap
-    gc.collect()
-    print("[CameraCapture] [OK] Camera capture complete (GC release)")
-    return True
 
 
 def main():
