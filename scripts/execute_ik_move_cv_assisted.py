@@ -4,7 +4,8 @@ Execute a chess move using IK pick-and-place -- CV-assisted.
 
 Uses the full vision pipeline (camera capture -> board detection -> Stockfish ->
 move decomposition) to determine the best move, then executes it physically
-using direct serial control of the SO-100 arm via two-plane IK.
+using RobotController (stability system + 20Hz control loop) with 10Hz
+trajectory interpolation for smooth two-plane IK pick-and-place.
 
 Usage:
     python scripts/execute_ik_move_cv_assisted.py
@@ -19,6 +20,7 @@ import argparse
 import glob
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,8 +29,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
-from controls.so100_arm import SO100Arm
-from controls.robot_controller import RobotController
+from controls.robot_controller import (
+    RobotController, JointConfig, load_joint_configs_for_port,
+)
 
 try:
     import requests
@@ -46,177 +49,169 @@ ARM_JOINT_NAMES = [
     "wrist_flex", "wrist_roll",
 ]
 
-# All joints including gripper, indexed 0-5
-ALL_JOINT_NAMES = ARM_JOINT_NAMES + ["gripper"]
-
-# Motor IDs by joint name (1-indexed to match Feetech protocol)
-JOINT_MOTOR_IDS = {
-    "shoulder_pan": 1, "shoulder_lift": 2, "elbow_flex": 3,
-    "wrist_flex": 4, "wrist_roll": 5, "gripper": 6,
-}
-
-# Encoder constants (from so101.py)
+# Encoder constants
 COUNTS_PER_REV = 4096
 ENCODER_MIDPOINT = COUNTS_PER_REV // 2
-COUNTS_PER_DEG = COUNTS_PER_REV / 360.0
 
-# Per-joint motor parameters -- read from RobotController class constants
-# so they stay in sync with tele-op and other control code.
-def _load_joint_params():
-    """Build joint params dict from RobotController class constants."""
-    params = {}
-    for idx, name in enumerate(ALL_JOINT_NAMES):
-        params[name] = {
-            "speed": getattr(RobotController, f"JOINT_{idx}_SPEED_LIMIT", 1000),
-            "accel": getattr(RobotController, f"JOINT_{idx}_ACCEL", 0),
-            "torque": getattr(RobotController, f"JOINT_{idx}_TORQUE", 100),
-            "deadband": getattr(RobotController, f"JOINT_{idx}_DEADBAND", 0.0),
-            "smoothing": getattr(RobotController, f"JOINT_{idx}_SMOOTHING_ALPHA", 1.0),
-        }
-    return params
-
-JOINT_PARAMS = _load_joint_params()
-
-# Gripper positions (encoder counts, from calibration)
-GRIPPER_OPEN_COUNTS = ENCODER_MIDPOINT
-GRIPPER_CLOSED_COUNTS = ENCODER_MIDPOINT - 1400
-
-# Register addresses
-REG_GOAL_POSITION = 0x2A
-REG_SPEED = 0x2E
-REG_ACCEL = 0x29
-REG_TORQUE_LIMIT = 0x30
-REG_TORQUE_ENABLE = 0x28
+# Trajectory interpolation rate.
+# Must be slower than the control loop (~9Hz actual) to avoid feeding
+# targets faster than the arm can process them.
+TRAJECTORY_HZ = 5
+TRAJECTORY_DT = 1.0 / TRAJECTORY_HZ
 
 
-def _deg_to_counts(degrees: float) -> int:
-    """Convert degrees (IK output) to encoder counts. 0 deg = midpoint."""
-    counts = int(ENCODER_MIDPOINT + degrees * COUNTS_PER_DEG)
-    return max(0, min(COUNTS_PER_REV - 1, counts))
+# ---------------------------------------------------------------------------
+# Coordinate conversions
+# ---------------------------------------------------------------------------
+# IK (kinematics.py) uses degrees in "midpoint convention": 0 deg = 2048 counts
+# RobotController uses radians in "raw convention": 0 rad = 0 counts
+# Conversion: midpoint_deg -> counts -> raw_rad
+
+def ik_deg_to_raw_rad(degrees: float) -> float:
+    """Convert IK midpoint-convention degrees to RobotController raw radians."""
+    counts = ENCODER_MIDPOINT + degrees * (COUNTS_PER_REV / 360.0)
+    return counts * (2.0 * np.pi / COUNTS_PER_REV)
 
 
-def _counts_to_deg(counts: int) -> float:
-    """Convert encoder counts to degrees."""
+def raw_rad_to_ik_deg(radians: float) -> float:
+    """Convert RobotController raw radians to IK midpoint-convention degrees."""
+    counts = radians / (2.0 * np.pi / COUNTS_PER_REV)
     return (counts - ENCODER_MIDPOINT) * (360.0 / COUNTS_PER_REV)
 
 
-def _checksum(data):
-    return (~sum(data)) & 0xFF
+def ik_angles_to_raw_6(ik_angles_deg: dict) -> np.ndarray:
+    """Convert IK joint angles dict (5 arm joints, degrees) to a 6-element
+    raw-radian array for RobotController (index 5 = gripper, unchanged)."""
+    result = np.zeros(6)
+    for i, name in enumerate(ARM_JOINT_NAMES):
+        result[i] = ik_deg_to_raw_rad(ik_angles_deg.get(name, 0.0))
+    # result[5] = gripper, left at 0 (set separately)
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Direct arm control helpers
-# ---------------------------------------------------------------------------
-
-def write_register(arm: SO100Arm, motor_id: int, reg: int, value: int, nbytes: int = 2):
-    """Write a value to a motor register."""
-    if nbytes == 1:
-        data = [motor_id, 0x04, arm.INSTR_WRITE, reg, value & 0xFF]
-    else:
-        data = [motor_id, 0x05, arm.INSTR_WRITE, reg, value & 0xFF, (value >> 8) & 0xFF]
-    cs = arm._calculate_checksum(data)
-    arm.serial.write(bytes([*arm.HEADER] + data + [cs]))
-    time.sleep(0.003)
-
-
-def enable_torque_all(arm: SO100Arm):
-    """Enable torque on all motors with per-joint params."""
-    for joint, mid in JOINT_MOTOR_IDS.items():
-        params = JOINT_PARAMS[joint]
-        write_register(arm, mid, REG_TORQUE_ENABLE, 1, nbytes=1)
-        write_register(arm, mid, REG_SPEED, params["speed"])
-        write_register(arm, mid, REG_ACCEL, params["accel"], nbytes=1)
-        write_register(arm, mid, REG_TORQUE_LIMIT, params["torque"])
-
-
-def disable_torque_all(arm: SO100Arm):
-    """Disable torque on all motors."""
-    for mid in JOINT_MOTOR_IDS.values():
-        write_register(arm, mid, REG_TORQUE_LIMIT, 0)
-        write_register(arm, mid, REG_TORQUE_ENABLE, 0, nbytes=1)
-
-
-def move_arm(arm: SO100Arm, joint_angles_deg: dict, duration_ms: int = 1000):
-    """Move arm joints to target angles (degrees).
-
-    Applies the RobotController stability system:
-    - Per-joint speed limits, acceleration, torque limits
-    - Deadband: skips move if error is within deadband (prevents oscillation)
-    - Smoothing: low-pass filter on target (alpha=1.0 means no smoothing)
-    """
-    # Duration -> speed conversion (from SO101Controller)
-    base_speed = int(1500 * (500.0 / max(duration_ms, 100)))
-    base_speed = max(50, min(1500, base_speed))
-
-    # Read current positions for deadband check
-    current = read_arm_deg(arm)
-
-    for joint, target_deg in joint_angles_deg.items():
-        mid = JOINT_MOTOR_IDS.get(joint)
-        if mid is None:
-            continue
-        params = JOINT_PARAMS[joint]
-        speed = min(base_speed, params["speed"])
-
-        # Deadband check: skip if error is within deadband
-        deadband_deg = math.degrees(params["deadband"]) if params["deadband"] > 0 else 0
-        current_deg = current.get(joint, 0.0)
-        if deadband_deg > 0 and abs(target_deg - current_deg) < deadband_deg:
-            # Inside deadband -- disable torque on this joint to stop oscillation
-            write_register(arm, mid, REG_TORQUE_ENABLE, 0, nbytes=1)
-            continue
-
-        # Outside deadband -- ensure torque is enabled if deadband is active
-        if deadband_deg > 0:
-            write_register(arm, mid, REG_TORQUE_ENABLE, 1, nbytes=1)
-
-        # Apply smoothing (low-pass filter)
-        alpha = params["smoothing"]
-        if alpha < 1.0:
-            # Blend target with current: smoothed = alpha*target + (1-alpha)*current
-            target_deg = alpha * target_deg + (1.0 - alpha) * current_deg
-
-        counts = _deg_to_counts(target_deg)
-        write_register(arm, mid, REG_SPEED, speed)
-        write_register(arm, mid, REG_ACCEL, params["accel"], nbytes=1)
-        write_register(arm, mid, REG_TORQUE_LIMIT, params["torque"])
-        write_register(arm, mid, REG_GOAL_POSITION, counts)
-
-    # Wait for motion
-    time.sleep(duration_ms / 1000.0 + 0.2)
-
-
-def gripper_open(arm: SO100Arm):
-    """Open gripper."""
-    write_register(arm, JOINT_MOTOR_IDS["gripper"], REG_GOAL_POSITION, GRIPPER_OPEN_COUNTS)
-    time.sleep(0.5)
-
-
-def gripper_close(arm: SO100Arm):
-    """Close gripper."""
-    write_register(arm, JOINT_MOTOR_IDS["gripper"], REG_GOAL_POSITION, GRIPPER_CLOSED_COUNTS)
-    time.sleep(0.5)
-
-
-def read_arm_deg(arm: SO100Arm) -> dict:
-    """Read current arm joint angles in degrees (kinematics convention).
-
-    SO100Arm returns radians where 0 counts = 0 rad (raw encoder).
-    Kinematics uses degrees where 2048 counts = 0 deg (midpoint convention).
-    Convert: counts -> _counts_to_deg (accounts for midpoint offset).
-    """
-    state = arm.get_state()
+def read_arm_ik_deg(robot: RobotController) -> dict:
+    """Read current arm positions as IK-convention degrees."""
+    state = robot.arm.get_state()
     result = {}
     for i, name in enumerate(ARM_JOINT_NAMES):
-        # Convert raw radians back to counts, then to kinematics degrees
-        raw_rad = float(state.joint_positions[i])
-        counts = int(raw_rad / (2 * np.pi / COUNTS_PER_REV))
-        result[name] = round(_counts_to_deg(counts), 2)
+        result[name] = round(raw_rad_to_ik_deg(float(state.joint_positions[i])), 2)
     return result
 
 
 # ---------------------------------------------------------------------------
-# Bridge helpers (FK, calibration load, disconnect/reconnect)
+# Trajectory execution via RobotController
+# ---------------------------------------------------------------------------
+
+# Defaults (overridden by calibration if available)
+GRIPPER_OPEN_RAD = ENCODER_MIDPOINT * (2.0 * np.pi / COUNTS_PER_REV)
+GRIPPER_CLOSED_RAD = (ENCODER_MIDPOINT - 1400) * (2.0 * np.pi / COUNTS_PER_REV)
+HOME_RAD = None  # 6-element raw-radian array, loaded from calibration
+
+# Debug pause between motion steps (seconds)
+STEP_PAUSE_S = 1.0
+
+
+def interpolate_trajectory(start: np.ndarray, end: np.ndarray,
+                           duration_s: float) -> list:
+    """Generate interpolated waypoints at TRAJECTORY_HZ between start and end.
+
+    Returns list of (target_6dof, dt) tuples. Each target is a 6-element
+    raw-radian array. dt is the time to wait after setting this target.
+    """
+    n_steps = max(1, int(duration_s * TRAJECTORY_HZ))
+    waypoints = []
+    for step in range(1, n_steps + 1):
+        t = step / n_steps  # 0..1
+        target = start + t * (end - start)
+        waypoints.append((target, TRAJECTORY_DT))
+    return waypoints
+
+
+def execute_trajectory(robot: RobotController, target_6: np.ndarray,
+                       duration_s: float):
+    """Move arm from current position to target over duration_s at 10Hz.
+
+    Reads current position, generates linear interpolation, and feeds
+    intermediate targets to RobotController's 20Hz control loop.
+    """
+    state = robot.arm.get_state()
+    current = state.joint_positions.copy()
+
+    # Preserve gripper position during arm moves
+    target_6[5] = current[5]
+
+    waypoints = interpolate_trajectory(current, target_6, duration_s)
+
+    loop_times = []
+    for wp, dt in waypoints:
+        t0 = time.monotonic()
+        robot.set_target_positions(wp)
+        elapsed = time.monotonic() - t0
+        sleep_remaining = max(0, dt - elapsed)
+        time.sleep(sleep_remaining)
+        loop_times.append(time.monotonic() - t0)
+
+    # Report trajectory timing
+    if loop_times:
+        avg_ms = np.mean(loop_times) * 1000
+        max_ms = np.max(loop_times) * 1000
+        actual_hz = 1000.0 / avg_ms if avg_ms > 0 else 0
+        print(f"      traj: {len(loop_times)} steps, "
+              f"avg={avg_ms:.0f}ms max={max_ms:.0f}ms ({actual_hz:.1f}Hz)")
+
+    # Settle: wait for control loop to converge
+    time.sleep(0.3)
+
+
+def execute_gripper(robot: RobotController, open_: bool):
+    """Open or close the gripper via trajectory.
+
+    Only changes joint index 5 (gripper); arm joints hold their current
+    control-loop targets to prevent jitter.
+    """
+    target_rad = GRIPPER_OPEN_RAD if open_ else GRIPPER_CLOSED_RAD
+    label = "open" if open_ else "close"
+
+    # Read actual gripper position for delta reporting
+    state = robot.arm.get_state()
+    current_gripper = float(state.joint_positions[5])
+    delta = abs(target_rad - current_gripper)
+
+    print(f"      gripper {label}: {current_gripper:.3f} -> {target_rad:.3f} rad "
+          f"(delta={delta:.3f})")
+
+    # Update only the gripper target, keep arm targets as-is in the control loop
+    targets = robot.target_positions.copy()
+    targets[5] = target_rad
+
+    # Interpolate over 1.5s for the large range this gripper servo covers
+    waypoints = interpolate_trajectory(robot.target_positions.copy(), targets, 1.5)
+
+    loop_times = []
+    for wp, dt in waypoints:
+        t0 = time.monotonic()
+        robot.set_target_positions(wp)
+        elapsed = time.monotonic() - t0
+        time.sleep(max(0, dt - elapsed))
+        loop_times.append(time.monotonic() - t0)
+
+    if loop_times:
+        avg_ms = np.mean(loop_times) * 1000
+        print(f"      traj: {len(loop_times)} steps, avg={avg_ms:.0f}ms "
+              f"({1000.0/avg_ms:.1f}Hz)")
+
+    time.sleep(0.5)  # Settle
+
+
+def go_home(robot: RobotController):
+    """Move arm to calibrated home position."""
+    if HOME_RAD is None:
+        return  # No home position calibrated
+    execute_trajectory(robot, HOME_RAD.copy(), 2.5)
+
+
+# ---------------------------------------------------------------------------
+# Bridge helpers (disconnect/reconnect)
 # ---------------------------------------------------------------------------
 
 def check_health(bridge: str) -> bool:
@@ -232,7 +227,7 @@ def disconnect_bridge_robot(bridge: str):
         if r.status_code == 200:
             print(f"  [OK] {r.json().get('message', 'Bridge robot disconnected')}")
     except Exception:
-        pass  # Bridge may not have robot connected
+        pass
 
 
 def reconnect_bridge_robot(bridge: str):
@@ -259,15 +254,14 @@ def resolve_port(port: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_calibration(bridge: str):
-    """Load BoardCalibration from the bridge's calibration path."""
-    # Import from gen-int claw
+    """Load BoardCalibration and gripper/home settings from calibration file."""
+    global GRIPPER_OPEN_RAD, GRIPPER_CLOSED_RAD, HOME_RAD
+
     claw_dir = Path(__file__).resolve().parent.parent.parent.parent / "claw"
     sys.path.insert(0, str(claw_dir.parent))
 
     from claw.bridge.kinematics import BoardCalibration, SO101Kinematics
 
-    # Determine calibration file path (same logic as bridge)
-    import os
     agent_name = os.environ.get("AGENT_NAME", "")
     if agent_name:
         ws = claw_dir / "agents" / agent_name / "workspace"
@@ -286,13 +280,28 @@ def load_calibration(bridge: str):
         print("[X] Calibration not finalized", file=sys.stderr)
         return None, None
 
+    # Load gripper and home from raw calibration JSON
+    with open(cal_path) as f:
+        raw_cal = json.load(f)
+
+    if "gripper_open_rad" in raw_cal and "gripper_closed_rad" in raw_cal:
+        GRIPPER_OPEN_RAD = raw_cal["gripper_open_rad"]
+        GRIPPER_CLOSED_RAD = raw_cal["gripper_closed_rad"]
+        print(f"  Gripper open:  {GRIPPER_OPEN_RAD:.4f} rad")
+        print(f"  Gripper closed: {GRIPPER_CLOSED_RAD:.4f} rad")
+    if "home_rad" in raw_cal:
+        home = raw_cal["home_rad"]
+        all_names = ARM_JOINT_NAMES + ["gripper"]
+        HOME_RAD = np.array([home[n] for n in all_names])
+        print(f"  Home position loaded ({len(HOME_RAD)} joints)")
+
     print(f"[OK] Loaded calibration: z_bottom={cal.z_bottom*1000:.1f}mm, "
           f"z_top={cal.z_top*1000:.1f}mm")
     return kin, cal
 
 
 # ---------------------------------------------------------------------------
-# CV detection + move computation (unchanged from original)
+# CV detection + move computation
 # ---------------------------------------------------------------------------
 
 def detect_and_compute(args) -> dict:
@@ -370,21 +379,29 @@ def detect_and_compute(args) -> dict:
 # Two-plane pick-and-place execution
 # ---------------------------------------------------------------------------
 
-def execute_stages(arm: SO100Arm, cal, kin, stages: list) -> dict:
-    """Execute chess move stages using direct serial + two-plane IK.
+# Duration for each motion step (seconds)
+MOVE_LATERAL_S = 2.0   # top-plane lateral moves
+MOVE_VERTICAL_S = 1.5  # ascend/descend between planes
+
+
+def execute_stages(robot: RobotController, cal, stages: list) -> dict:
+    """Execute chess move stages using RobotController + trajectory interpolation.
 
     Each stage is a pick-and-place sequence:
-    1. Move to top plane over pickup square
-    2. Open gripper
-    3. Descend to bottom plane (grasp)
-    4. Close gripper
-    5. Ascend to top plane
-    6. Move to top plane over place square
-    7. Descend to bottom plane
-    8. Open gripper
-    9. Ascend to top plane
+     1. Move to top plane over pickup square
+     2. Open gripper
+     3. Descend to bottom plane (grasp)
+     4. Close gripper
+     5. Ascend to top plane
+     6. Move to top plane over place square
+     7. Descend to bottom plane
+     8. Open gripper
+     9. Ascend to top plane (travel up after place)
+    10. Return to home position
+
+    A 1-second debug pause is inserted between every step.
     """
-    seed = read_arm_deg(arm)
+    seed = None
     results = []
 
     for i, stage in enumerate(stages):
@@ -393,10 +410,22 @@ def execute_stages(arm: SO100Arm, cal, kin, stages: list) -> dict:
         print(f"  Stage {i+1}: {pick_sq} -> {place_sq}")
 
         try:
-            # IK solve 4 waypoints with seed chaining
-            pick_top = cal.get_joint_angles(pick_sq, "top", seed)
+            try:
+                pick_top = cal.get_joint_angles(pick_sq, "top", seed)
+            except ValueError as ik_err:
+                xyz = cal.square_to_xyz(pick_sq, "top")
+                print(f"    [WARN] Top-plane IK failed for {pick_sq}: {ik_err}")
+                print(f"           target={xyz.round(4).tolist()}, falling back to bottom")
+                pick_top = cal.get_joint_angles(pick_sq, "bottom", seed)
             pick_bottom = cal.get_joint_angles(pick_sq, "bottom", pick_top)
-            place_top = cal.get_joint_angles(place_sq, "top", pick_top)
+
+            try:
+                place_top = cal.get_joint_angles(place_sq, "top", pick_top)
+            except ValueError as ik_err:
+                xyz = cal.square_to_xyz(place_sq, "top")
+                print(f"    [WARN] Top-plane IK failed for {place_sq}: {ik_err}")
+                print(f"           target={xyz.round(4).tolist()}, falling back to bottom")
+                place_top = cal.get_joint_angles(place_sq, "bottom", pick_top)
             place_bottom = cal.get_joint_angles(place_sq, "bottom", place_top)
         except ValueError as e:
             print(f"    [X] IK failed: {e}")
@@ -404,37 +433,41 @@ def execute_stages(arm: SO100Arm, cal, kin, stages: list) -> dict:
             return {"success": False, "stages_completed": i, "stages_total": len(stages),
                     "error": str(e), "stage_results": results}
 
-        # Execute sequence
+        # Convert IK degrees to raw radians for RobotController
+        pick_top_6 = ik_angles_to_raw_6(pick_top)
+        pick_bot_6 = ik_angles_to_raw_6(pick_bottom)
+        place_top_6 = ik_angles_to_raw_6(place_top)
+        place_bot_6 = ik_angles_to_raw_6(place_bottom)
+
+        # Execute step sequence with 1s debug pause between each
         steps = [
-            ("move top(pick)",    pick_top,     1000),
-            ("gripper open",      None,         0),
-            ("descend pick",      pick_bottom,  800),
-            ("gripper close",     None,         0),
-            ("ascend pick",       pick_top,     800),
-            ("move top(place)",   place_top,    1000),
-            ("descend place",     place_bottom, 800),
-            ("gripper open",      None,         0),
-            ("ascend place",      place_top,    800),
+            ("move top(pick)",    lambda: execute_trajectory(robot, pick_top_6.copy(), MOVE_LATERAL_S)),
+            ("gripper open",      lambda: execute_gripper(robot, True)),
+            ("descend pick",      lambda: execute_trajectory(robot, pick_bot_6.copy(), MOVE_VERTICAL_S)),
+            ("gripper close",     lambda: execute_gripper(robot, False)),
+            ("ascend pick",       lambda: execute_trajectory(robot, pick_top_6.copy(), MOVE_VERTICAL_S)),
+            ("move top(place)",   lambda: execute_trajectory(robot, place_top_6.copy(), MOVE_LATERAL_S)),
+            ("descend place",     lambda: execute_trajectory(robot, place_bot_6.copy(), MOVE_VERTICAL_S)),
+            ("gripper open",      lambda: execute_gripper(robot, True)),
+            ("travel up",         lambda: execute_trajectory(robot, place_top_6.copy(), MOVE_VERTICAL_S)),
+            ("home",              lambda: go_home(robot)),
         ]
 
         step_results = []
-        for label, angles, dur in steps:
+        for label, action in steps:
             try:
-                if "gripper open" in label:
-                    print(f"    [>>] {label}")
-                    gripper_open(arm)
-                elif "gripper close" in label:
-                    print(f"    [>>] {label}")
-                    gripper_close(arm)
-                else:
-                    print(f"    [>>] {label}")
-                    move_arm(arm, angles, dur)
+                print(f"    [>>] {label}")
+                action()
                 step_results.append({"action": label, "success": True})
             except Exception as e:
                 print(f"    [X] {label}: {e}")
                 step_results.append({"action": label, "success": False, "error": str(e)})
+            # Debug pause between steps
+            time.sleep(STEP_PAUSE_S)
 
-        seed = place_top  # Chain seed to next stage
+        # Reset seed to None so next stage uses nearest calibration corner,
+        # not the home position (which is far from any board square).
+        seed = None
         results.append({"stage": i, "success": True, "steps": step_results})
 
     return {
@@ -513,34 +546,49 @@ def main():
     if cal is None:
         return 1
 
-    # Step 3: Get serial port and connect directly
+    # Step 3: Connect RobotController
     port = resolve_port(args.port)
 
     print(f"[Setup] Disconnecting bridge robot, connecting to {port}...")
     disconnect_bridge_robot(args.bridge)
     time.sleep(0.2)
 
-    arm = SO100Arm(port=port, baudrate=1000000)
-    if not arm.connect():
+    # Load joint configs for this port (3-tier fallback: port-specific > generic > defaults)
+    configs, config_source = load_joint_configs_for_port(port)
+    robot = RobotController(port, configs, config_source, enable_stability_system=True)
+
+    if not robot.connect():
         print(f"[X] Failed to connect to arm on {port}", file=sys.stderr)
         reconnect_bridge_robot(args.bridge)
         return 1
 
     def cleanup():
-        disable_torque_all(arm)
-        arm.disconnect()
+        robot.stop_control_loop()
+        robot.release_torque()
+        robot.disconnect()
         time.sleep(0.2)
-        print("  Reconnecting bridge robot...")
         reconnect_bridge_robot(args.bridge)
+        # Relax via bridge so the arm stays limp after reconnect
+        try:
+            requests.post(f"{args.bridge}/robot/relax", timeout=5)
+            print("  [OK] Arm relaxed")
+        except Exception:
+            pass
 
     try:
-        # Enable torque with per-joint params
-        enable_torque_all(arm)
+        # Enable torque and start the 20Hz stability control loop
+        robot.enable_torque()
+        robot.start_control_loop()
+
+        # Set initial target to current position (prevent jump on start)
+        state = robot.arm.get_state()
+        robot.set_target_positions(state.joint_positions.copy())
+        time.sleep(0.2)  # Let control loop stabilize
 
         # Step 4: Execute
-        print(f"\n[Execute] {best_move['san']} via direct serial on {port}...")
+        print(f"\n[Execute] {best_move['san']} via RobotController on {port}...")
         start = time.time()
-        result = execute_stages(arm, cal, kin, stages)
+        result = execute_stages(robot, cal, stages)
         elapsed = time.time() - start
 
         success = result.get("success", False)
@@ -556,7 +604,6 @@ def main():
                 stage_status = "[OK]" if sr["success"] else "[X]"
                 print(f"  Stage {sr['stage']}: {stage_status}")
 
-        # Release arm and reconnect bridge
         cleanup()
 
         # Step 5: Optional verification

@@ -214,7 +214,10 @@ class RobotController:
 
     def enable_torque(self) -> bool:
         """
-        Enable torque on all motors.
+        Enable torque on all motors with per-joint torque limits.
+
+        Sets each joint's torque limit, speed limit, and acceleration
+        before enabling torque, so motors never run at full power.
 
         Returns:
             bool: True if successful
@@ -223,15 +226,49 @@ class RobotController:
             return False
 
         try:
-            # Send torque enable command to each motor
-            for motor_id in self.arm.MOTOR_IDS:
+            for joint_idx, motor_id in enumerate(self.arm.MOTOR_IDS):
+                torque = self._get_joint_torque(joint_idx)
+                speed = self._get_joint_speed_limit(joint_idx)
+                accel = self._get_joint_accel(joint_idx)
+
+                # Set torque limit BEFORE enabling torque
                 packet = [
-                    *self.arm.HEADER,
-                    motor_id,
-                    0x04,  # Length
-                    self.arm.INSTR_WRITE,
-                    self.arm.REG_TORQUE_ENABLE,
-                    0x01  # Enable torque
+                    *self.arm.HEADER, motor_id, 0x05,
+                    self.arm.INSTR_WRITE, 0x30,  # REG_TORQUE_LIMIT
+                    torque & 0xFF, (torque >> 8) & 0xFF,
+                ]
+                checksum = self.arm._calculate_checksum(packet[2:])
+                packet.append(checksum)
+                self.arm.serial.write(bytes(packet))
+                time.sleep(0.005)
+
+                # Set speed limit
+                packet = [
+                    *self.arm.HEADER, motor_id, 0x05,
+                    self.arm.INSTR_WRITE, 0x2E,  # REG_SPEED
+                    speed & 0xFF, (speed >> 8) & 0xFF,
+                ]
+                checksum = self.arm._calculate_checksum(packet[2:])
+                packet.append(checksum)
+                self.arm.serial.write(bytes(packet))
+                time.sleep(0.005)
+
+                # Set acceleration limit
+                packet = [
+                    *self.arm.HEADER, motor_id, 0x04,
+                    self.arm.INSTR_WRITE, 0x29,  # REG_ACCEL
+                    accel & 0xFF,
+                ]
+                checksum = self.arm._calculate_checksum(packet[2:])
+                packet.append(checksum)
+                self.arm.serial.write(bytes(packet))
+                time.sleep(0.005)
+
+                # Now enable torque
+                packet = [
+                    *self.arm.HEADER, motor_id, 0x04,
+                    self.arm.INSTR_WRITE, self.arm.REG_TORQUE_ENABLE,
+                    0x01,
                 ]
                 checksum = self.arm._calculate_checksum(packet[2:])
                 packet.append(checksum)
@@ -239,7 +276,7 @@ class RobotController:
                 time.sleep(0.005)
 
             self.torque_enabled = True
-            print(f"[{self.port}] Torque enabled")
+            print(f"[{self.port}] Torque enabled (per-joint limits applied)")
             return True
         except Exception as e:
             print(f"[{self.port}] Failed to enable torque: {e}")
@@ -412,10 +449,20 @@ class RobotController:
         self.control_thread.start()
 
     def stop_control_loop(self):
-        """Stop the control loop."""
+        """Stop the control loop and report timing diagnostics."""
         self.running = False
         if self.control_thread:
             self.control_thread.join(timeout=2.0)
+
+        if hasattr(self, '_loop_times') and self._loop_times:
+            import numpy as _np
+            times_ms = _np.array(self._loop_times) * 1000
+            avg = _np.mean(times_ms)
+            p95 = _np.percentile(times_ms, 95)
+            mx = _np.max(times_ms)
+            hz = 1000.0 / avg if avg > 0 else 0
+            print(f"  [ControlLoop] {len(times_ms)} iters, "
+                  f"avg={avg:.0f}ms p95={p95:.0f}ms max={mx:.0f}ms ({hz:.1f}Hz)")
 
     def _control_loop(self):
         """
@@ -429,8 +476,12 @@ class RobotController:
         When stability system is disabled, all joints use simple position control.
         """
         first_iteration = True
+        # Timing diagnostics
+        self._loop_times = []
+        self._loop_timing_start = time.time()
 
         while self.running and self.connected:
+            iter_start = time.time()
             try:
                 if self.enable_stability_system:
                     # Stability mode: special handling for joints 0 and 1
@@ -628,7 +679,11 @@ class RobotController:
             except Exception as e:
                 pass  # Silently continue on errors
 
-            time.sleep(0.05)  # 20 Hz control rate
+            # Timing-aware sleep: target 50ms period (20Hz) minus work time
+            iter_elapsed = time.time() - iter_start
+            self._loop_times.append(iter_elapsed)
+            sleep_remaining = max(0, 0.05 - iter_elapsed)
+            time.sleep(sleep_remaining)
 
     def get_positions_deg(self) -> np.ndarray:
         """

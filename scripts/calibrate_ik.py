@@ -122,12 +122,21 @@ def compute_fk(bridge: str, joint_angles_deg: dict) -> list:
 def read_positions(arm: SO100Arm) -> dict:
     """Read current arm joint positions via direct serial.
 
-    Returns dict of joint_name -> angle in degrees (arm joints only).
+    Returns dict of joint_name -> angle in degrees using the midpoint
+    convention (2048 counts = 0 deg) matching SO101Kinematics/URDF.
+    SO100Arm returns raw radians (0 counts = 0 rad), so we convert
+    through encoder counts to apply the midpoint offset.
     """
+    COUNTS_PER_REV = 4096
+    ENCODER_MIDPOINT = COUNTS_PER_REV // 2
+
     state = arm.get_state()
     positions = {}
     for i, name in enumerate(ARM_JOINT_NAMES):
-        positions[name] = round(np.degrees(float(state.joint_positions[i])), 2)
+        raw_rad = float(state.joint_positions[i])
+        counts = int(raw_rad / (2.0 * np.pi / COUNTS_PER_REV))
+        deg = (counts - ENCODER_MIDPOINT) * (360.0 / COUNTS_PER_REV)
+        positions[name] = round(deg, 2)
     return positions
 
 
@@ -182,6 +191,10 @@ def main():
         "--no-reload", action="store_true",
         help="Skip auto-reloading bridge calibration after saving"
     )
+    parser.add_argument(
+        "--gripper-only", action="store_true",
+        help="Only recalibrate gripper open/closed and home position (skip corners/graveyard)"
+    )
     args = parser.parse_args()
 
     output_path = args.output or default_output_path()
@@ -220,20 +233,35 @@ def main():
     print(f"[OK] Direct serial connection to {port}")
     print()
 
-    # Collect calibration data
-    calibration = {
-        "version": 3,
-        "type": "two_plane_ik_explicit",
-        "corners": {},
-        "graveyard": None,
-        "computed": None,
-    }
+    # Load existing calibration or start fresh
+    if args.gripper_only:
+        # Load existing file and merge gripper/home into it
+        if not Path(output_path).exists():
+            print(f"[X] No existing calibration at {output_path}", file=sys.stderr)
+            print("    Run full calibration first (without --gripper-only)")
+            arm.disconnect()
+            reconnect_bridge_robot(args.bridge)
+            return 1
+        with open(output_path) as f:
+            calibration = json.load(f)
+        print(f"[OK] Loaded existing calibration (v{calibration.get('version')})")
+    else:
+        calibration = {
+            "version": 3,
+            "type": "two_plane_ik_explicit",
+            "corners": {},
+            "graveyard": None,
+            "computed": None,
+        }
 
     print("-" * 60)
-    print("INSTRUCTIONS:")
-    print("  For each corner you will position the gripper twice:")
-    print("  1. BOTTOM: gripper tip touching the board surface at the corner")
-    print("  2. TOP: gripper raised to safe transit height above that corner")
+    if args.gripper_only:
+        print("GRIPPER-ONLY MODE: Recording gripper open, closed, and home.")
+    else:
+        print("INSTRUCTIONS:")
+        print("  For each corner you will position the gripper twice:")
+        print("  1. BOTTOM: gripper tip touching the board surface at the corner")
+        print("  2. TOP: gripper raised to safe transit height above that corner")
     print()
     print("  The arm is torque-free -- move it by hand.")
     print("  Press Enter after positioning to record each point.")
@@ -248,7 +276,8 @@ def main():
         reconnect_bridge_robot(args.bridge)
 
     try:
-        for corner in CORNERS:
+        if not args.gripper_only:
+          for corner in CORNERS:
             print(f"{'=' * 60}")
             print(f"CORNER: {corner}")
             print(f"{'=' * 60}")
@@ -287,7 +316,7 @@ def main():
             print()
 
         # --- Graveyard ---
-        if not args.skip_graveyard:
+        if not args.skip_graveyard and not args.gripper_only:
             print(f"{'=' * 60}")
             print("GRAVEYARD")
             print(f"{'=' * 60}")
@@ -300,65 +329,104 @@ def main():
             print(f"  [OK] Graveyard: XYZ = {graveyard['xyz_meters']}")
             print()
 
+        # --- Gripper open ---
+        print(f"{'=' * 60}")
+        print("GRIPPER OPEN")
+        print(f"{'=' * 60}")
+
+        input("  Open the gripper fully by hand. Press Enter...")
+        state = arm.get_state()
+        gripper_open_rad = round(float(state.joint_positions[5]), 4)
+        print(f"  [OK] Gripper open: {gripper_open_rad:.4f} rad")
+        calibration["gripper_open_rad"] = gripper_open_rad
+        print()
+
+        # --- Gripper closed ---
+        print(f"{'=' * 60}")
+        print("GRIPPER CLOSED")
+        print(f"{'=' * 60}")
+
+        input("  Close the gripper on a chess piece. Press Enter...")
+        state = arm.get_state()
+        gripper_closed_rad = round(float(state.joint_positions[5]), 4)
+        print(f"  [OK] Gripper closed: {gripper_closed_rad:.4f} rad")
+        calibration["gripper_closed_rad"] = gripper_closed_rad
+        print()
+
+        # --- Home position ---
+        print(f"{'=' * 60}")
+        print("HOME POSITION")
+        print(f"{'=' * 60}")
+
+        input("  Move arm to a safe home/rest position. Press Enter...")
+        state = arm.get_state()
+        home_rad = [round(float(state.joint_positions[i]), 4) for i in range(6)]
+        home_names = ARM_JOINT_NAMES + ["gripper"]
+        home_dict = {name: home_rad[i] for i, name in enumerate(home_names)}
+        print(f"  [OK] Home (rad): {json.dumps(home_dict)}")
+        calibration["home_rad"] = home_dict
+        print()
+
         # Release serial and reconnect bridge before computing/saving
         cleanup()
 
-        # --- Compute calibration ---
-        print(f"{'=' * 60}")
-        print("COMPUTING CALIBRATION")
-        print(f"{'=' * 60}")
+        # --- Compute calibration (skip if gripper-only, already has computed) ---
+        if not args.gripper_only:
+            print(f"{'=' * 60}")
+            print("COMPUTING CALIBRATION")
+            print(f"{'=' * 60}")
 
-        bottom_z = [calibration["corners"][c]["bottom"]["xyz_meters"][2]
-                     for c in CORNERS]
-        z_bottom = sum(bottom_z) / len(bottom_z)
+            bottom_z = [calibration["corners"][c]["bottom"]["xyz_meters"][2]
+                         for c in CORNERS]
+            z_bottom = sum(bottom_z) / len(bottom_z)
 
-        top_z = [calibration["corners"][c]["top"]["xyz_meters"][2]
-                  for c in CORNERS]
-        z_top = sum(top_z) / len(top_z)
+            top_z = [calibration["corners"][c]["top"]["xyz_meters"][2]
+                      for c in CORNERS]
+            z_top = sum(top_z) / len(top_z)
 
-        transit_height_mm = (z_top - z_bottom) * 1000
+            transit_height_mm = (z_top - z_bottom) * 1000
 
-        def dist_2d(p1, p2):
-            return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+            def dist_2d(p1, p2):
+                return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
-        a1_xy = calibration["corners"]["a1"]["bottom"]["xyz_meters"][:2]
-        a8_xy = calibration["corners"]["a8"]["bottom"]["xyz_meters"][:2]
-        h1_xy = calibration["corners"]["h1"]["bottom"]["xyz_meters"][:2]
-        h8_xy = calibration["corners"]["h8"]["bottom"]["xyz_meters"][:2]
+            a1_xy = calibration["corners"]["a1"]["bottom"]["xyz_meters"][:2]
+            a8_xy = calibration["corners"]["a8"]["bottom"]["xyz_meters"][:2]
+            h1_xy = calibration["corners"]["h1"]["bottom"]["xyz_meters"][:2]
+            h8_xy = calibration["corners"]["h8"]["bottom"]["xyz_meters"][:2]
 
-        near_edge = dist_2d(a1_xy, h1_xy)
-        far_edge = dist_2d(a8_xy, h8_xy)
-        left_edge = dist_2d(a1_xy, a8_xy)
-        right_edge = dist_2d(h1_xy, h8_xy)
+            near_edge = dist_2d(a1_xy, h1_xy)
+            far_edge = dist_2d(a8_xy, h8_xy)
+            left_edge = dist_2d(a1_xy, a8_xy)
+            right_edge = dist_2d(h1_xy, h8_xy)
 
-        board_width = (near_edge + far_edge) / 2
-        board_depth = (left_edge + right_edge) / 2
+            board_width = (near_edge + far_edge) / 2
+            board_depth = (left_edge + right_edge) / 2
 
-        calibration["computed"] = {
-            "z_bottom_m": round(z_bottom, 4),
-            "z_top_m": round(z_top, 4),
-            "transit_height_mm": round(transit_height_mm, 1),
-            "board_width_m": round(board_width, 4),
-            "board_depth_m": round(board_depth, 4),
-        }
+            calibration["computed"] = {
+                "z_bottom_m": round(z_bottom, 4),
+                "z_top_m": round(z_top, 4),
+                "transit_height_mm": round(transit_height_mm, 1),
+                "board_width_m": round(board_width, 4),
+                "board_depth_m": round(board_depth, 4),
+            }
 
-        z_bottom_spread = (max(bottom_z) - min(bottom_z)) * 1000
-        z_top_spread = (max(top_z) - min(top_z)) * 1000
+            z_bottom_spread = (max(bottom_z) - min(bottom_z)) * 1000
+            z_top_spread = (max(top_z) - min(top_z)) * 1000
 
-        print(f"  z_bottom: {z_bottom*1000:.1f}mm (spread: {z_bottom_spread:.1f}mm)")
-        print(f"  z_top:    {z_top*1000:.1f}mm (spread: {z_top_spread:.1f}mm)")
-        print(f"  Transit height: {transit_height_mm:.1f}mm")
-        print(f"  Board width:  {board_width*1000:.1f}mm")
-        print(f"  Board depth:  {board_depth*1000:.1f}mm")
+            print(f"  z_bottom: {z_bottom*1000:.1f}mm (spread: {z_bottom_spread:.1f}mm)")
+            print(f"  z_top:    {z_top*1000:.1f}mm (spread: {z_top_spread:.1f}mm)")
+            print(f"  Transit height: {transit_height_mm:.1f}mm")
+            print(f"  Board width:  {board_width*1000:.1f}mm")
+            print(f"  Board depth:  {board_depth*1000:.1f}mm")
 
-        if z_bottom_spread > 30:
-            print(f"  [WARN] Bottom Z spread {z_bottom_spread:.1f}mm > 30mm -- board may not be level")
-        if z_top_spread > 30:
-            print(f"  [WARN] Top Z spread {z_top_spread:.1f}mm > 30mm -- transit plane uneven")
-        if transit_height_mm < 50:
-            print(f"  [WARN] Transit height {transit_height_mm:.1f}mm seems too low (< 50mm)")
-        if transit_height_mm > 200:
-            print(f"  [WARN] Transit height {transit_height_mm:.1f}mm seems too high (> 200mm)")
+            if z_bottom_spread > 30:
+                print(f"  [WARN] Bottom Z spread {z_bottom_spread:.1f}mm > 30mm -- board may not be level")
+            if z_top_spread > 30:
+                print(f"  [WARN] Top Z spread {z_top_spread:.1f}mm > 30mm -- transit plane uneven")
+            if transit_height_mm < 50:
+                print(f"  [WARN] Transit height {transit_height_mm:.1f}mm seems too low (< 50mm)")
+            if transit_height_mm > 200:
+                print(f"  [WARN] Transit height {transit_height_mm:.1f}mm seems too high (> 200mm)")
 
         print()
 
