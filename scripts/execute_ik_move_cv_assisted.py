@@ -54,9 +54,9 @@ COUNTS_PER_REV = 4096
 ENCODER_MIDPOINT = COUNTS_PER_REV // 2
 
 # Trajectory interpolation rate.
-# Must be slower than the control loop (~9Hz actual) to avoid feeding
-# targets faster than the arm can process them.
-TRAJECTORY_HZ = 5
+# The optimized control loop runs at ~20Hz (position writes only),
+# so 10Hz trajectory feed gives 2 control iterations per waypoint.
+TRAJECTORY_HZ = 10
 TRAJECTORY_DT = 1.0 / TRAJECTORY_HZ
 
 
