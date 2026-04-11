@@ -17,62 +17,7 @@ import cv2
 from PIL import Image
 
 from guidance.board_detector import BoardDetector
-from guidance.coordinate_mapper import CoordinateMapper
-
-
-def rotate_square_for_camera(square: str, camera_position: str, inverse: bool = False) -> str:
-    """
-    Rotate a chess square notation based on camera position.
-
-    When camera is positioned at 'right', the square 'a1' (bottom-left from top view)
-    appears in a different position in the camera view. We need to map the chess
-    square to the actual physical square in the camera's perspective.
-
-    Args:
-        square: Chess square notation (e.g., "e4")
-        camera_position: Camera position ('top', 'right', 'bottom', 'left')
-        inverse: If True, convert from camera view back to chess notation
-
-    Returns:
-        Rotated square notation
-
-    Example:
-        >>> rotate_square_for_camera("e4", "right")
-        'e5'  # Camera sees square from rotated perspective
-        >>> rotate_square_for_camera("e5", "right", inverse=True)
-        'e4'  # Convert camera view back to chess notation
-    """
-    if camera_position == "top":
-        return square  # No rotation
-
-    file = ord(square[0]) - ord('a')  # 0-7
-    rank = int(square[1]) - 1  # 0-7
-
-    # Apply rotation based on camera position
-    if camera_position == "right":
-        # 90° counter-clockwise (or clockwise if inverse)
-        if not inverse:
-            new_file = rank
-            new_rank = 7 - file
-        else:
-            new_file = 7 - rank
-            new_rank = file
-    elif camera_position == "bottom":
-        # 180° rotation
-        new_file = 7 - file
-        new_rank = 7 - rank
-    elif camera_position == "left":
-        # 90° clockwise (or counter-clockwise if inverse)
-        if not inverse:
-            new_file = 7 - rank
-            new_rank = file
-        else:
-            new_file = rank
-            new_rank = 7 - file
-    else:
-        return square  # Unknown position
-
-    return chr(ord('a') + new_file) + str(new_rank + 1)
+from guidance.coordinate_mapper import CoordinateMapper, rotate_square_for_camera
 
 
 def apply_stage_overlay_to_frame(

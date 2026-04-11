@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ChessBot is a modular chess robot system with YOLO-based computer vision, multi-camera management, ROS robot control (skeleton), and future VLA integration. The system uses a two-stage YOLO pipeline for board detection and piece classification, with symbolic guidance for move calculation.
 
-**Status**: Guidance and camera modules complete. Controls and VLA are skeletal awaiting hardware integration.
+**Status**: Guidance, camera, controls, and VLA modules are all functional. Controls uses direct Feetech serial communication with SO-100 arm. VLA supports PI0 and SmolVLA model fine-tuning and deployment.
 
 ## Environment Setup
 
@@ -97,11 +97,11 @@ chessbot/
 │   ├── overlay_generator.py    # Flag-based overlay loading (resource-efficient)
 │   └── camera_manager.py       # Unified interface
 │
-├── controls/           # ROS robot control (SKELETON - awaiting hardware)
-├── vla/                # π₀ VLA integration
-│   ├── vla_deploy.py           # Deploy π₀ model for inference
-│   ├── vla_collect_episodes.py # Collect training episodes
-│   └── vla_finetune.py         # Fine-tune π₀ on chess data
+├── controls/           # SO-100 robot arm control (direct Feetech serial)
+├── vla/                # PI0 / SmolVLA model integration
+│   ├── models/                 # Multi-model factory (PI0, SmolVLA)
+│   ├── configs/                # Per-model training configs
+│   └── chess_dataloader.py     # LeRobot v3.0 dataset loader
 │
 ├── submodules/         # External dependencies (git submodules)
 │   ├── openpi/                 # Physical Intelligence π₀ VLA
@@ -116,7 +116,7 @@ chessbot/
 │   └── state_cache.py          # Thread-safe JSON state cache
 │
 └── configs/            # Configuration management
-    ├── config_schema.py        # Pydantic schema
+    ├── config_schema.py        # Configuration defaults and validation
     └── current.yaml            # Active configuration
 ```
 
@@ -193,10 +193,10 @@ This avoids wasted resources compared to polling-based approaches.
 
 ### Color Scheme for Action Highlights
 
-- 🟢 **Green**: Pickup piece (origin square)
-- 🔵 **Blue**: Place piece (destination square)
-- 🔴 **Red**: Capture opponent's piece (capture square)
-- 🟠 **Orange**: Graveyard placement (off-board)
+- RED: Pickup piece (origin square)
+- BLUE: Place piece (destination square)
+- ORANGE: Graveyard placement (captured pieces, off-board)
+- PURPLE: Graveyard source for promotion (pick up promoted piece)
 
 ## YOLO Models
 
@@ -242,7 +242,7 @@ When `debug=True` is passed to `BoardDetector.detect_board_state()`, these files
 
 ## Configuration System
 
-Configuration is managed via YAML files validated by Pydantic schemas.
+Configuration is managed via YAML files with dict-based validation (see `configs/config_schema.py`).
 
 **Active Config**: `configs/current.yaml`
 
@@ -379,8 +379,8 @@ The following files are deprecated and should NOT be used:
 **For Full System Operation**:
 - Overhead USB camera (1280x720+)
 - Gripper-mounted USB camera (640x480+)
-- ROS-compatible robot arm (UR5, Franka, etc.)
-- 2-finger or suction gripper
+- SO-100 robot arm with 6x Feetech STS3215 servos (direct serial, no ROS)
+- Built-in gripper (motor 6)
 - Stockfish chess engine (install via package manager)
 
 **Current Development** (guidance + cameras only):

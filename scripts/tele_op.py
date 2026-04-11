@@ -26,6 +26,7 @@ import time
 import csv
 import signal
 import os
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -48,6 +49,10 @@ from utils.robot_state_publisher import RobotStatePublisher
 
 # Global list of connected robots for cleanup
 _connected_robots: List[RobotController] = []
+_robots_lock = threading.Lock()
+
+# Global ZMQ publisher reference for cleanup
+_publisher: Optional[RobotStatePublisher] = None
 
 
 def clear_screen():
@@ -998,8 +1003,11 @@ def run_adjust_home_positions(robots: List[RobotController], keyboard: KeyboardI
 def cleanup_handler(signum, frame):
     """Handle cleanup on exit signal."""
     print("\n\nReceived exit signal, releasing torque...")
-    for robot in _connected_robots:
-        robot.disconnect()
+    with _robots_lock:
+        for robot in _connected_robots:
+            robot.disconnect()
+    if _publisher:
+        _publisher.stop()
     sys.exit(0)
 
 
@@ -1031,8 +1039,10 @@ def main():
     cache = StateCache("data/state_cache.json")
 
     # Initialize ZMQ publisher for low-latency position sharing with collect_vla_episodes.py
+    global _publisher
     publisher = RobotStatePublisher()
     publisher.start()
+    _publisher = publisher
 
     # Register signal handlers for cleanup
     signal.signal(signal.SIGINT, cleanup_handler)
@@ -1067,7 +1077,8 @@ def main():
                                     enable_stability_system=stability_enabled)
             if robot.connect():
                 robots.append(robot)
-                _connected_robots.append(robot)  # Track for cleanup
+                with _robots_lock:
+                    _connected_robots.append(robot)  # Track for cleanup
 
                 # Show home positions for this robot
                 print(f"  [{port}] Home positions: ", end="")

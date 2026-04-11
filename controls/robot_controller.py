@@ -50,6 +50,7 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 import numpy as np
+import serial
 from controls.so100_arm import SO100Arm, SO100State
 
 
@@ -139,7 +140,7 @@ class RobotController:
     SAFETY_ERROR_THRESHOLD = 0.2  # radians (~11 degrees) - sensitive threshold
     SAFETY_TIME_THRESHOLD = 0.5   # seconds - fast trigger to prevent board failure
     SAFETY_RECOVERY_TIME = 0.5    # seconds - error must stay low this long to auto-reset
-    SAFETY_ENABLED_JOINTS = []   # Use 5 for gripper (not needed for now)
+    SAFETY_ENABLED_JOINTS = [5]  # Gripper (joint 5) - detects stuck/stalled gripper
 
     def __init__(self, port: str, joint_configs: List[JointConfig], config_source: str = "defaults",
                  enable_stability_system: bool = True):
@@ -232,52 +233,27 @@ class RobotController:
                 accel = self._get_joint_accel(joint_idx)
 
                 # Set torque limit BEFORE enabling torque
-                packet = [
-                    *self.arm.HEADER, motor_id, 0x05,
-                    self.arm.INSTR_WRITE, 0x30,  # REG_TORQUE_LIMIT
-                    torque & 0xFF, (torque >> 8) & 0xFF,
-                ]
-                checksum = self.arm._calculate_checksum(packet[2:])
-                packet.append(checksum)
-                self.arm.serial.write(bytes(packet))
+                self._write_register_2byte(motor_id, self.arm.REG_TORQUE_LIMIT, torque)
                 time.sleep(0.005)
 
                 # Set speed limit
-                packet = [
-                    *self.arm.HEADER, motor_id, 0x05,
-                    self.arm.INSTR_WRITE, 0x2E,  # REG_SPEED
-                    speed & 0xFF, (speed >> 8) & 0xFF,
-                ]
-                checksum = self.arm._calculate_checksum(packet[2:])
-                packet.append(checksum)
-                self.arm.serial.write(bytes(packet))
+                self._write_register_2byte(motor_id, self.arm.REG_GOAL_SPEED, speed)
                 time.sleep(0.005)
 
                 # Set acceleration limit
-                packet = [
-                    *self.arm.HEADER, motor_id, 0x04,
-                    self.arm.INSTR_WRITE, 0x29,  # REG_ACCEL
-                    accel & 0xFF,
-                ]
-                checksum = self.arm._calculate_checksum(packet[2:])
-                packet.append(checksum)
-                self.arm.serial.write(bytes(packet))
+                self._write_register_1byte(motor_id, self.arm.REG_ACCEL, accel)
                 time.sleep(0.005)
 
                 # Now enable torque
-                packet = [
-                    *self.arm.HEADER, motor_id, 0x04,
-                    self.arm.INSTR_WRITE, self.arm.REG_TORQUE_ENABLE,
-                    0x01,
-                ]
-                checksum = self.arm._calculate_checksum(packet[2:])
-                packet.append(checksum)
-                self.arm.serial.write(bytes(packet))
+                self._write_torque_enable(motor_id, enable=True)
                 time.sleep(0.005)
 
             self.torque_enabled = True
             print(f"[{self.port}] Torque enabled (per-joint limits applied)")
             return True
+        except serial.SerialException as e:
+            print(f"[{self.port}] Failed to enable torque (serial error): {e}")
+            return False
         except Exception as e:
             print(f"[{self.port}] Failed to enable torque: {e}")
             return False
@@ -300,34 +276,12 @@ class RobotController:
             try:
                 # Send torque disable and zero torque limit for each motor
                 for motor_id in self.arm.MOTOR_IDS:
-                    # First, set torque limit to 0 (register 0x30, 2 bytes)
-                    # This minimizes any residual holding force
-                    packet = [
-                        *self.arm.HEADER,
-                        motor_id,
-                        0x05,  # Length: 2 byte data
-                        self.arm.INSTR_WRITE,
-                        0x30,  # Torque Limit register
-                        0x00,  # Low byte = 0
-                        0x00   # High byte = 0
-                    ]
-                    checksum = self.arm._calculate_checksum(packet[2:])
-                    packet.append(checksum)
-                    self.arm.serial.write(bytes(packet))
+                    # First, set torque limit to 0 to minimize residual holding force
+                    self._write_register_2byte(motor_id, self.arm.REG_TORQUE_LIMIT, 0)
                     time.sleep(0.005)
 
-                    # Then disable torque enable flag (register 0x28)
-                    packet = [
-                        *self.arm.HEADER,
-                        motor_id,
-                        0x04,  # Length
-                        self.arm.INSTR_WRITE,
-                        self.arm.REG_TORQUE_ENABLE,
-                        0x00  # Disable torque
-                    ]
-                    checksum = self.arm._calculate_checksum(packet[2:])
-                    packet.append(checksum)
-                    self.arm.serial.write(bytes(packet))
+                    # Then disable torque enable flag
+                    self._write_torque_enable(motor_id, enable=False)
                     time.sleep(0.005)
 
                 self.torque_enabled = False
@@ -503,12 +457,7 @@ class RobotController:
                     # Safety trigger check (uses last-read positions)
                     if self._check_safety_trigger(joint_idx, current_positions[joint_idx], target_rad):
                         self.target_positions[joint_idx] = current_positions[joint_idx]
-                        packet = [
-                            *self.arm.HEADER, motor_id, 0x04,
-                            self.arm.INSTR_WRITE, self.arm.REG_TORQUE_ENABLE, 0x00,
-                        ]
-                        checksum = self.arm._calculate_checksum(packet[2:])
-                        self.arm.serial.write(bytes([*self.arm.HEADER] + packet[2:] + [checksum]))
+                        self._write_torque_enable(motor_id, enable=False)
                         continue
 
                     # Deadband + smoothing (stability system)
@@ -523,45 +472,31 @@ class RobotController:
                         # Deadband check
                         target_error = abs(current_positions[joint_idx] - target_rad)
                         if deadband > 0 and target_error < deadband:
-                            packet = [
-                                *self.arm.HEADER, motor_id, 0x04,
-                                self.arm.INSTR_WRITE, self.arm.REG_TORQUE_ENABLE, 0x00,
-                            ]
-                            checksum = self.arm._calculate_checksum(packet[2:])
-                            self.arm.serial.write(bytes([*self.arm.HEADER] + packet[2:] + [checksum]))
+                            self._write_torque_enable(motor_id, enable=False)
                             continue
 
                         if deadband > 0:
-                            packet = [
-                                *self.arm.HEADER, motor_id, 0x04,
-                                self.arm.INSTR_WRITE, self.arm.REG_TORQUE_ENABLE, 0x01,
-                            ]
-                            checksum = self.arm._calculate_checksum(packet[2:])
-                            self.arm.serial.write(bytes([*self.arm.HEADER] + packet[2:] + [checksum]))
+                            self._write_torque_enable(motor_id, enable=True)
                             time.sleep(0.003)
 
                         final_target = smoothed
                     else:
                         final_target = target_rad
 
-                    # Convert to encoder counts and write goal position only
+                    # Convert to encoder counts and write goal position
                     # (speed/accel/torque are set once in enable_torque)
-                    encoder_value = int((final_target / (2 * np.pi)) * 4096) % 4096
-                    encoder_value = max(0, min(4095, encoder_value))
-
-                    packet = [
-                        motor_id, 0x05, self.arm.INSTR_WRITE,
-                        self.arm.REG_GOAL_POSITION,
-                        encoder_value & 0xFF, (encoder_value >> 8) & 0xFF,
-                    ]
-                    checksum = self.arm._calculate_checksum(packet)
-                    self.arm.serial.write(bytes(self.arm.HEADER + packet + [checksum]))
+                    encoder_value = int(final_target * self.arm.RAD_TO_COUNTS) % self.arm.COUNTS_PER_REV
+                    self._write_goal_position(motor_id, encoder_value)
                     time.sleep(0.003)
 
                     self.last_sent_positions[joint_idx] = final_target
 
+            except serial.SerialException as e:
+                print(f"[{self.port}] Serial error in control loop: {e}")
+                self.connected = False
+                break
             except Exception as e:
-                pass  # Silently continue on errors
+                print(f"[{self.port}] Control loop error: {e}")
 
             # Timing-aware sleep: target 50ms period (20Hz) minus work time
             iter_elapsed = time.time() - iter_start
@@ -581,6 +516,45 @@ class RobotController:
 
         state = self.arm.get_state()
         return np.degrees(state.joint_positions)
+
+    def _write_packet(self, packet_data: List[int]):
+        """Write a Feetech packet under serial lock. packet_data is ID onwards (no header)."""
+        checksum = self.arm._calculate_checksum(packet_data)
+        with self.arm.serial_lock:
+            self.arm.serial.write(bytes(self.arm.HEADER + packet_data + [checksum]))
+
+    def _write_torque_enable(self, motor_id: int, enable: bool):
+        """Enable or disable torque for a single motor."""
+        self._write_packet([
+            motor_id, 0x04,
+            self.arm.INSTR_WRITE, self.arm.REG_TORQUE_ENABLE,
+            0x01 if enable else 0x00,
+        ])
+
+    def _write_goal_position(self, motor_id: int, encoder_value: int):
+        """Write goal position for a single motor."""
+        encoder_value = max(0, min(self.arm.COUNTS_PER_REV - 1, encoder_value))
+        self._write_packet([
+            motor_id, 0x05, self.arm.INSTR_WRITE,
+            self.arm.REG_GOAL_POSITION,
+            encoder_value & 0xFF, (encoder_value >> 8) & 0xFF,
+        ])
+
+    def _write_register_2byte(self, motor_id: int, register: int, value: int):
+        """Write a 2-byte register value for a single motor."""
+        self._write_packet([
+            motor_id, 0x05,
+            self.arm.INSTR_WRITE, register,
+            value & 0xFF, (value >> 8) & 0xFF,
+        ])
+
+    def _write_register_1byte(self, motor_id: int, register: int, value: int):
+        """Write a 1-byte register value for a single motor."""
+        self._write_packet([
+            motor_id, 0x04,
+            self.arm.INSTR_WRITE, register,
+            value & 0xFF,
+        ])
 
 
 def scan_so100_ports() -> List[str]:
@@ -672,42 +646,3 @@ def load_joint_configs_for_port(port: str, config_dir: Path = Path("data")) -> T
         raise ValueError(f"Expected 6 joint configs, got {len(configs)}")
 
     return configs, config_source
-
-
-def load_joint_configs(config_path: Path) -> List[JointConfig]:
-    """
-    Load joint configurations from calibration CSV (legacy function).
-
-    Args:
-        config_path: Path to so100_config.csv
-
-    Returns:
-        List[JointConfig]: Configuration for each of 6 joints
-    """
-    configs = []
-
-    if not config_path.exists():
-        print(f"[WARN] Config file not found: {config_path}")
-        print("       Using default home positions (midpoint of range)")
-        # Default configs: full range, home at midpoint
-        for _ in range(6):
-            configs.append(JointConfig(
-                min_rad=0.0,
-                max_rad=2 * np.pi,
-                home_rad=np.pi
-            ))
-        return configs
-
-    with open(config_path, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            configs.append(JointConfig(
-                min_rad=float(row['min_rad']),
-                max_rad=float(row['max_rad']),
-                home_rad=float(row['home_rad'])
-            ))
-
-    if len(configs) != 6:
-        raise ValueError(f"Expected 6 joint configs, got {len(configs)}")
-
-    return configs

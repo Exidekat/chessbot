@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import shutil
+import threading
 import time
 
 # Suppress Qt font warnings from OpenCV before importing cv2
@@ -106,6 +107,7 @@ class EpisodeValidator:
         # Playback state
         self.current_speed_idx = 2  # Default 1.0x
         self.paused = False
+        self.playback_lock = threading.Lock()
 
         # Robot control for action playback (optional)
         self.robot_controller: Optional['RobotController'] = None
@@ -988,7 +990,8 @@ class EpisodeValidator:
 
         # Set initial speed
         self.current_speed_idx = self.SPEED_OPTIONS.index(start_speed) if start_speed in self.SPEED_OPTIONS else 2
-        self.paused = False
+        with self.playback_lock:
+            self.paused = False
 
         # Create display window
         cv2.namedWindow("Episode Playback", cv2.WINDOW_NORMAL)
@@ -1003,7 +1006,9 @@ class EpisodeValidator:
         try:
             while True:
                 current_speed = self.SPEED_OPTIONS[self.current_speed_idx]
-                frame_interval = 1.0 / (fps * current_speed) if not self.paused else 0.1
+                with self.playback_lock:
+                    is_paused = self.paused
+                frame_interval = 1.0 / (fps * current_speed) if not is_paused else 0.1
 
                 # Wait for next frame
                 elapsed = time.time() - last_frame_time
@@ -1018,8 +1023,10 @@ class EpisodeValidator:
                     print("[INFO] Playback stopped")
                     break
                 elif key == ord(' '):  # SPACE
-                    self.paused = not self.paused
-                    print(f"[INFO] {'Paused' if self.paused else 'Resumed'}")
+                    with self.playback_lock:
+                        self.paused = not self.paused
+                        is_paused = self.paused
+                    print(f"[INFO] {'Paused' if is_paused else 'Resumed'}")
                 elif key == 82 or key == ord('w'):  # UP arrow or W
                     if self.current_speed_idx < len(self.SPEED_OPTIONS) - 1:
                         self.current_speed_idx += 1
@@ -1038,7 +1045,7 @@ class EpisodeValidator:
                     print(f"[INFO] Seek: -1s (frame {frame_idx})")
 
                 # Update frame if not paused
-                if not self.paused and elapsed >= frame_interval:
+                if not is_paused and elapsed >= frame_interval:
                     frame_idx += 1
                     if frame_idx >= len(frames):
                         print("[INFO] Playback complete")
@@ -1056,7 +1063,7 @@ class EpisodeValidator:
                     len(frames),
                     fps,
                     current_speed,
-                    self.paused
+                    is_paused
                 )
 
                 cv2.imshow("Episode Playback", display)

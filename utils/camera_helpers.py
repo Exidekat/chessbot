@@ -351,7 +351,8 @@ def _try_daemon_fallback(device_path: str, output_path: Path) -> bool:
         # Probe default daemon URL before giving up
         import urllib.request
         try:
-            urllib.request.urlopen(f"{DEFAULT_DAEMON_URL}/health", timeout=1).read()
+            with urllib.request.urlopen(f"{DEFAULT_DAEMON_URL}/health", timeout=1) as resp:
+                resp.read()
             daemon_url = DEFAULT_DAEMON_URL
         except Exception:
             return False
@@ -642,7 +643,7 @@ if __name__ == "__main__":
     print(f"\nTest capture from {selected}? (y/n): ", end='')
     if input().lower() == 'y':
         test_output = Path("test_capture.png")
-        success = capture_1080p_downscale(selected, test_output)
+        success = capture_4k_downscale(selected, test_output)
         if success:
             print(f"\n[OK] Test capture successful: {test_output.absolute()}")
         else:

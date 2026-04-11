@@ -220,7 +220,11 @@ class RobotStateSubscriber:
             Or None if no message received yet
         """
         with self._state_lock:
-            return self._latest_state.copy() if self._latest_state else None
+            if self._latest_state is None:
+                return None
+            # Deep copy to prevent caller from mutating internal state
+            from copy import deepcopy
+            return deepcopy(self._latest_state)
 
     def get_joint_positions(self) -> Optional[List[float]]:
         """

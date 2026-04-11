@@ -46,9 +46,10 @@ class KeyboardInput:
                 # Check for arrow keys or plain escape
                 rlist2, _, _ = select.select([sys.stdin], [], [], 0.01)
                 if rlist2:
-                    # Arrow key or other escape sequence - consume it
-                    sys.stdin.read(2)
-                    return None
+                    # Arrow key or other escape sequence - consume and return key name
+                    seq = sys.stdin.read(2)
+                    arrow_map = {'[A': 'UP', '[B': 'DOWN', '[C': 'RIGHT', '[D': 'LEFT'}
+                    return arrow_map.get(seq, 'ESC')
                 return 'ESC'
             elif char == '\n' or char == '\r':
                 return 'ENTER'

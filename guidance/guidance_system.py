@@ -118,9 +118,17 @@ class GuidanceSystem:
                 }, source="guidance")
             return fen, None, []
 
-        # 3. Calculate best move
+        # 3. Calculate best move and evaluate position
         print(f"[GuidanceSystem] Calculating best move...")
         best_move = self.calculator.calculate_best_move(board, time_limit=1.0)
+        analysis = self.calculator.analyze_position(board, time_limit=1.0)
+        evaluation = None
+        if analysis.get("score") is not None:
+            score = analysis["score"].relative
+            if score.is_mate():
+                evaluation = f"M{score.mate()}"
+            else:
+                evaluation = score.score() / 100.0  # centipawns to pawns
 
         if best_move is None:
             print(f"[GuidanceSystem] No legal moves available")
@@ -171,7 +179,7 @@ class GuidanceSystem:
                 "guidance_state": {
                     "best_move": best_move.uci(),
                     "best_move_san": best_move_san,
-                    "evaluation": None  # TODO: Get evaluation from engine
+                    "evaluation": evaluation
                 }
             }, source="guidance")
 

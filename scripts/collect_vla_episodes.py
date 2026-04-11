@@ -1038,7 +1038,9 @@ class EpisodeRecorder:
                         # Stop live capture to release camera for 4K capture
                         print("[INFO] Stopping live capture for board detection...")
                         self.global_cam_capture.stop()
-                        time.sleep(0.5)  # Allow camera to fully release
+                        if self.global_cam_capture.thread:
+                            self.global_cam_capture.thread.join(timeout=2.0)
+                        time.sleep(0.3)
 
                         # Capture board image for detection
                         if self.use_yuyv:

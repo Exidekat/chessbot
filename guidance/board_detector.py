@@ -6,6 +6,8 @@ This module provides the core computer vision functionality for the guidance sys
 """
 
 import numpy as np
+import tempfile
+import os
 from PIL import Image
 import cv2
 from shapely.geometry import Polygon
@@ -32,6 +34,7 @@ class BoardDetector:
         camera_position: str = "right",
         use_corner_rgb: bool = True,
         use_piece_rgb: bool = True,
+        device: str = "cpu",
     ):
         """
         Initialize the BoardDetector.
@@ -44,12 +47,14 @@ class BoardDetector:
                            If False, apply grayscale+CLAHE preprocessing.
             use_piece_rgb: If True (default), use RGB for piece detection.
                           If False, apply grayscale+CLAHE preprocessing.
+            device: Device for YOLO inference (default: "cpu")
         """
         self.corner_model_path = Path(corner_model_path)
         self.piece_model_path = Path(piece_model_path)
         self.camera_position = camera_position
         self.use_corner_rgb = use_corner_rgb
         self.use_piece_rgb = use_piece_rgb
+        self.device = device
 
         # Initialize models (lazy loading)
         self._corner_model: Optional[YOLO] = None
@@ -214,6 +219,7 @@ class BoardDetector:
             ValueError: If 4 distinct corners cannot be detected
         """
         # Preprocessing depends on use_corner_rgb setting
+        _temp_file = None
         if self.use_corner_rgb:
             # RGB mode: use original image directly
             temp_preprocessed_path = image_path
@@ -224,19 +230,25 @@ class BoardDetector:
             preprocessed = preprocess_for_corner_detection(image_path)
 
             # Save preprocessed image to temp file for YOLO
-            temp_preprocessed_path = "data/temp_corner_preprocessed.png"
+            _temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            temp_preprocessed_path = _temp_file.name
+            _temp_file.close()
             cv2.imwrite(temp_preprocessed_path, preprocessed)
 
             if debug:
                 print(f"[DEBUG]   Preprocessing: grayscale + CLAHE contrast normalization")
                 print(f"[DEBUG]   Preprocessed image saved to {temp_preprocessed_path}")
 
-        results = self.corner_model.predict(
-            source=temp_preprocessed_path,
-            conf=conf_threshold,
-            verbose=False,
-            imgsz=1280  # Match training resolution
-        )
+        try:
+            results = self.corner_model.predict(
+                source=temp_preprocessed_path,
+                conf=conf_threshold,
+                verbose=False,
+                imgsz=1280  # Match training resolution
+            )
+        finally:
+            if _temp_file is not None:
+                os.unlink(temp_preprocessed_path)
 
         boxes = results[0].boxes
         # Move to CPU if on CUDA
@@ -489,7 +501,7 @@ class BoardDetector:
             augment=False,  # DISABLED - was True, causes duplicates and 2-3x slower
             verbose=False,
             imgsz=1280,  # UPDATED from 640 - match training resolution (1280x720 images)
-            device=0  # RTX A5500 GPU for fast inference
+            device=self.device
         )
 
         boxes = results[0].boxes
@@ -676,6 +688,11 @@ class BoardDetector:
         Returns:
             Tuple of (x_coordinates, y_coordinates) for the grid lines
         """
+        if self.top_margin is None:
+            raise RuntimeError(
+                "top_margin has not been set. Run perspective_transform() "
+                "before calling calculate_grid()."
+            )
         width, height = image.size
 
         # Account for top margin - the actual board starts at 'top_margin' pixels from top

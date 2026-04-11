@@ -90,39 +90,53 @@ def save_config(config: Dict, config_path: Optional[str] = None):
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
         print(f"[Config] Configuration saved to {config_file}")
+        invalidate_config_cache()
 
     except Exception as e:
         raise ValueError(f"Error saving config: {e}")
 
 
+# Cached config to avoid re-reading YAML on every call
+_cached_config = None
+
+
+def _get_cached_config() -> Dict:
+    """Get config, loading from disk only on first call."""
+    global _cached_config
+    if _cached_config is None:
+        _cached_config = load_config()
+    return _cached_config
+
+
+def invalidate_config_cache():
+    """Clear the cached config, forcing reload on next access."""
+    global _cached_config
+    _cached_config = None
+
+
 def get_camera_config() -> Dict:
     """Get camera configuration from current config."""
-    config = load_config()
-    return config.get("cameras", {})
+    return _get_cached_config().get("cameras", {})
 
 
 def get_model_config() -> Dict:
     """Get model paths from current config."""
-    config = load_config()
-    return config.get("models", {})
+    return _get_cached_config().get("models", {})
 
 
 def get_path_config() -> Dict:
     """Get file paths from current config."""
-    config = load_config()
-    return config.get("paths", {})
+    return _get_cached_config().get("paths", {})
 
 
 def get_viz_config() -> Dict:
     """Get visualization server config."""
-    config = load_config()
-    return config.get("visualization", {})
+    return _get_cached_config().get("visualization", {})
 
 
 def get_guidance_config() -> Dict:
     """Get guidance system config."""
-    config = load_config()
-    return config.get("guidance", {})
+    return _get_cached_config().get("guidance", {})
 
 
 __all__ = [

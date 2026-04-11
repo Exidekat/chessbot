@@ -25,7 +25,7 @@ except ImportError as e:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from vla.chess_dataloader import ChessEpisodeDataset, collate_fn
 from vla.losses import compute_action_accuracy
-from vla.vla_load_model import load_pi0_model
+from vla.models import load_vla_model
 
 
 def evaluate_checkpoint(
@@ -52,8 +52,8 @@ def evaluate_checkpoint(
 
     # Load model
     print(f"\nLoading model from: {checkpoint_path}")
-    model, tokenizer = load_pi0_model(checkpoint_path=checkpoint_path, device=device)
-    model.eval()
+    model = load_vla_model("pi0", checkpoint_path=checkpoint_path, device=device)
+    model.policy.eval()
 
     # Load validation data
     print(f"\nLoading validation data from: {dataset_path}")
@@ -82,23 +82,20 @@ def evaluate_checkpoint(
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             # Move to device
-            observation_image = batch.get("observation.image")
+            # Find observation image keys dynamically (supports PI0 and SmolVLA key formats)
+            image_keys = [k for k in batch.keys() if k.startswith('observation.images.')]
             observation_state = batch.get("observation.state")
             target_action = batch.get("action")
 
-            if observation_image is not None:
-                observation_image = observation_image.to(device)
+            # Build observation with all image keys
+            observation = {}
+            for key in image_keys:
+                observation[key] = batch[key].to(device)
             if observation_state is not None:
                 observation_state = observation_state.to(device)
+                observation["observation.state"] = observation_state
             if target_action is not None:
                 target_action = target_action.to(device)
-
-            # Build observation
-            observation = {}
-            if observation_image is not None:
-                observation["image"] = observation_image
-            if observation_state is not None:
-                observation["state"] = observation_state
 
             # Forward pass
             try:

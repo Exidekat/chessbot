@@ -6,7 +6,6 @@ Extracted from virtual_overlay_demo.py for reusability across VLA scripts.
 """
 
 import threading
-import gc
 import subprocess
 from typing import Optional
 
@@ -115,17 +114,20 @@ class LiveCameraCapture:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer size for lower latency
 
-        while self.running:
-            # Capture frame (no sleep - capture as fast as possible)
-            ret, frame = cap.read()
-            if ret:
-                # No downscaling needed - already 720p!
-                # Update latest frame (thread-safe)
-                with self.frame_lock:
-                    self.latest_frame = frame  # Direct assignment, no copy needed
-
-        del cap
-        gc.collect()
+        try:
+            while self.running:
+                # Capture frame (no sleep - capture as fast as possible)
+                ret, frame = cap.read()
+                if ret:
+                    # No downscaling needed - already 720p!
+                    # Update latest frame (thread-safe)
+                    with self.frame_lock:
+                        self.latest_frame = frame.copy()
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         """

@@ -24,18 +24,11 @@ Usage:
 
     model, tokenizer = load_vla_model("pi0")  # or "smolvla"
     config = get_training_config("pi0")       # or "smolvla"
-
-    # Backward compatible (deprecated)
-    from vla import load_pi0_model, ChessTrainingConfig
 """
 
 # New API (preferred) - multi-model support
 from .models import load_vla_model, list_models, get_model_class
 from .configs import get_training_config, get_config_class, list_config_models
-
-# Backward compatible (deprecated) - PI0 only
-from .vla_load_model import load_pi0_model, get_model_info
-from .training_config import ChessTrainingConfig, load_config, get_default_config
 
 # Common utilities (unchanged)
 from .chess_dataloader import ChessEpisodeDataset, create_dataloaders, collate_fn
@@ -49,12 +42,6 @@ __all__ = [
     "get_training_config",
     "get_config_class",
     "list_config_models",
-    # Backward compatible (deprecated)
-    "load_pi0_model",
-    "get_model_info",
-    "ChessTrainingConfig",
-    "load_config",
-    "get_default_config",
     # Data loading
     "ChessEpisodeDataset",
     "create_dataloaders",

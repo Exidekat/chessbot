@@ -68,14 +68,14 @@ class SmolVLAModel(VLAModelMixin):
     It's optimized for lower compute requirements while maintaining good performance.
 
     Key differences from PI0:
-        - Uses 512x512 images (vs 224x224 for PI0)
+        - Uses 256x256 images (vs 224x224 for PI0)
         - SmolVLM2 backbone (vs PaliGemma)
         - Tokenizer comes from the model processor
         - Higher default learning rate (1e-4 vs 2.5e-5)
 
     Attributes:
         MODEL_NAME: "smolvla"
-        DEFAULT_IMAGE_SIZE: (512, 512)
+        DEFAULT_IMAGE_SIZE: (256, 256)
         DEFAULT_PRETRAINED_PATH: "lerobot/smolvla_base"
         TOKENIZER_PATH: None (tokenizer from model processor)
     """
@@ -91,6 +91,9 @@ class SmolVLAModel(VLAModelMixin):
         'gripper': 'observation.images.camera2',
         'unused': 'observation.images.camera3',
     }
+
+    # Valid joint range for clipping (assumes SO-100 robot)
+    JOINT_RANGE = (0.0, 2 * np.pi)
 
     # SmolVLA normalization (ImageNet)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -169,8 +172,14 @@ class SmolVLAModel(VLAModelMixin):
 
         # Get tokenizer from model processor
         print(f"[SmolVLA] Getting tokenizer from model processor...")
-        instance.tokenizer = instance.policy.model.vlm_with_expert.processor.tokenizer
-        print(f"[SmolVLA] Tokenizer loaded")
+        try:
+            instance.tokenizer = instance.policy.model.vlm_with_expert.processor.tokenizer
+        except AttributeError as e:
+            print(f"[WARN] Could not access tokenizer via policy.model.vlm_with_expert.processor.tokenizer: {e}")
+            print(f"[WARN] SmolVLA tokenizer not available - tokenize_prompt() will fail")
+            instance.tokenizer = None
+        else:
+            print(f"[SmolVLA] Tokenizer loaded")
 
         # Pre-compute normalization tensors
         instance._mean_tensor = torch.tensor(cls.IMAGENET_MEAN).view(3, 1, 1).to(device)
@@ -418,10 +427,10 @@ class SmolVLAModel(VLAModelMixin):
                 print("[WARN] No normalizer - using raw action output (warning shown once)")
                 self._warned_no_normalizer = True
 
-        # Clip to valid joint range (0 to 2*pi radians for SO-100)
-        predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)
+        # Clip to valid joint range (assumes SO-100 robot)
+        predicted_joints = np.clip(predicted_joints, *self.JOINT_RANGE)
         if action_chunk is not None:
-            action_chunk = np.clip(action_chunk, 0.0, 2 * np.pi)
+            action_chunk = np.clip(action_chunk, *self.JOINT_RANGE)
 
         result = {
             "joint_positions": predicted_joints,

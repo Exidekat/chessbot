@@ -30,9 +30,11 @@ Requirements:
     - LeRobot dependencies installed
 """
 
-# Disable tokenizer parallelism before any imports to avoid fork warnings
 import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Set at module level to avoid fork warnings from tokenizers (must be before HF imports)
+if __name__ == "__main__":
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import sys
@@ -1016,4 +1018,8 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n[X] Training failed: {e}")
+        sys.exit(1)

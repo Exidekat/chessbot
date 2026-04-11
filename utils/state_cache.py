@@ -68,11 +68,12 @@ class StateCache:
         # Ensure data directory exists
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Load or initialize cache
-        if self.cache_path.exists():
-            self._load()
-        else:
-            self._initialize_default()
+        # Load or initialize cache (under lock for safety)
+        with self.lock:
+            if self.cache_path.exists():
+                self._load()
+            else:
+                self._initialize_default()
 
     def _load(self):
         """Load cache from disk."""
@@ -259,6 +260,9 @@ class StateCache:
                 return deepcopy(actions[idx])
             return None
 
+    # Minimum interval between disk writes for high-frequency updates (seconds)
+    _JOINT_SAVE_INTERVAL = 0.2  # Save at most 5 times/sec instead of every call
+
     def update_joint_positions(
         self,
         positions: List[float],
@@ -273,21 +277,28 @@ class StateCache:
         without requiring a second serial connection to the robot. tele_op.py writes
         joint positions here, and collect_vla_episodes.py reads them.
 
+        Disk writes are throttled to reduce I/O when called at high frequency (e.g. 15Hz).
+
         Args:
             positions: List of 6 joint angles in radians
             velocities: Optional list of 6 joint velocities (rad/s)
             gripper_state: Gripper position (joint 6 in radians)
             source: Source of update (default: "robot")
         """
+        now = time.time()
         with self.lock:
             self._state["robot_state"]["joint_positions"] = positions
             if velocities:
                 self._state["robot_state"]["joint_velocities"] = velocities
             self._state["robot_state"]["gripper_state"] = gripper_state
-            self._state["robot_state"]["last_joint_update"] = time.time()
-            self._state["metadata"]["timestamp"] = time.time()
+            self._state["robot_state"]["last_joint_update"] = now
+            self._state["metadata"]["timestamp"] = now
             self._state["metadata"]["last_updated_by"] = source
-            self._save()
+            # Throttle disk writes for high-frequency callers
+            last_save = getattr(self, '_last_joint_save', 0.0)
+            if now - last_save >= self._JOINT_SAVE_INTERVAL:
+                self._save()
+                self._last_joint_save = now
 
     def validate(self) -> bool:
         """

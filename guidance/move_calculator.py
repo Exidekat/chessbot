@@ -38,7 +38,14 @@ class MoveCalculator:
         Returns:
             Best move as chess.Move object, or None if no legal moves
         """
-        with chess.engine.SimpleEngine.popen_uci(self.engine_path) as engine:
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Chess engine not found at '{self.engine_path}'. "
+                "Install with: sudo apt install stockfish"
+            )
+        with engine:
             result = engine.play(
                 board,
                 chess.engine.Limit(time=time_limit)

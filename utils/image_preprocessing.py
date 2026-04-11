@@ -86,14 +86,7 @@ def preprocess_for_piece_detection(
     """
     Preprocess image for piece detection: grayscale + contrast normalization.
 
-    This preprocessing improves piece detection by:
-    1. Converting to grayscale (removes color variation, focuses on shape)
-    2. Applying CLAHE (Contrast Limited Adaptive Histogram Equalization)
-       to normalize contrast and enhance piece silhouettes
-
-    NOTE: While pieces have color (white vs black), grayscale + CLAHE helps the
-    model focus on shape features which are more robust to lighting variations.
-    The model learns to distinguish pieces by shape rather than absolute color.
+    Uses the same grayscale + CLAHE pipeline as corner detection.
 
     IMPORTANT: This preprocessing MUST be applied identically during:
     - Training data preparation (label_pieces.py)
@@ -108,43 +101,8 @@ def preprocess_for_piece_detection(
 
     Returns:
         Preprocessed image as numpy array (BGR format, 3-channel grayscale)
-        The output is 3-channel so it's compatible with YOLO which expects 3 channels.
     """
-    # Load image if path provided
-    if isinstance(image, (str, Path)):
-        img_bgr = cv2.imread(str(image))
-        if img_bgr is None:
-            raise ValueError(f"Failed to load image: {image}")
-    elif isinstance(image, Image.Image):
-        # Convert PIL to BGR numpy
-        img_rgb = np.array(image)
-        if len(img_rgb.shape) == 2:
-            # Already grayscale
-            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2BGR)
-        else:
-            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    else:
-        img_bgr = image.copy()
-
-    # Step 1: Convert to grayscale
-    if len(img_bgr.shape) == 3:
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img_bgr
-
-    # Step 2: Apply CLAHE for contrast normalization
-    # CLAHE enhances local contrast, making piece silhouettes more distinct
-    clahe = cv2.createCLAHE(
-        clipLimit=clahe_clip_limit,
-        tileGridSize=(clahe_tile_size, clahe_tile_size)
-    )
-    normalized = clahe.apply(gray)
-
-    # Step 3: Convert back to 3-channel (BGR) for YOLO compatibility
-    # YOLO expects 3-channel input, so we replicate the grayscale to all channels
-    result = cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
-
-    return result
+    return preprocess_for_corner_detection(image, clahe_clip_limit, clahe_tile_size)
 
 
 def preprocess_dataset_for_pieces(

@@ -50,6 +50,8 @@ class GlobalCamera:
         self.cap = cv2.VideoCapture(self.camera_id)
         if not self.cap.isOpened():
             print(f"[GlobalCamera] Error: Could not open camera {self.camera_id}")
+            self.cap.release()
+            self.cap = None
             return False
 
         # Set resolution
@@ -70,8 +72,10 @@ class GlobalCamera:
 
         if self.capture_thread:
             self.capture_thread.join(timeout=2.0)
+            if self.capture_thread.is_alive():
+                print("[GlobalCamera] Warning: capture thread did not stop within timeout")
 
-        if self.cap:
+        if self.cap and not (self.capture_thread and self.capture_thread.is_alive()):
             self.cap.release()
             self.cap = None
 
@@ -85,6 +89,7 @@ class GlobalCamera:
             if ret:
                 with self.frame_lock:
                     self.latest_frame = frame
+                time.sleep(0.001)
             else:
                 print("[GlobalCamera] Warning: Failed to capture frame")
                 time.sleep(0.1)

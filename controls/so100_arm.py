@@ -7,7 +7,7 @@ STS3215 smart servos. Communicates via Feetech serial protocol.
 Hardware Specifications:
 - 6x Feetech STS3215 smart servos (motor IDs 1-6)
 - Serial communication: 1000000 baud (1 Mbps)
-- Position resolution: 4096 counts/revolution (14-bit)
+- Position resolution: 4096 counts/revolution (12-bit)
 - Position register address: 0x38 (56 decimal)
 - Feetech protocol with checksum validation
 
@@ -56,29 +56,33 @@ class SO100Arm:
     INSTR_WRITE = 0x03      # Write instruction
 
     # Register addresses
-    REG_POSITION = 0x38     # Current position (2 bytes, read-only)
+    REG_POSITION = 0x38       # Current position (2 bytes, read-only)
     REG_GOAL_POSITION = 0x2A  # Goal position (2 bytes, write)
     REG_TORQUE_ENABLE = 0x28  # Torque enable (1 byte)
+    REG_ACCEL = 0x29          # Acceleration limit (1 byte)
+    REG_GOAL_SPEED = 0x2E     # Goal speed (2 bytes, write)
+    REG_TORQUE_LIMIT = 0x30   # Torque limit (2 bytes, write)
 
     # Motor IDs (1-6: motors 1-5 are arm joints, motor 6 is gripper)
     MOTOR_IDS = [1, 2, 3, 4, 5, 6]  # All 6 motors (5 arm + 1 gripper)
     NUM_MOTORS = 6                   # Total motors including gripper
     GRIPPER_INDEX = 5                # Gripper is index 5 in joint_positions array (0-indexed)
 
-    # Position resolution: 4096 counts/revolution
+    # Position resolution: 4096 counts/revolution (12-bit encoder)
     COUNTS_PER_REV = 4096
     COUNTS_TO_RAD = 2 * np.pi / COUNTS_PER_REV  # Conversion factor
     RAD_TO_COUNTS = COUNTS_PER_REV / (2 * np.pi)
 
-    # Joint limits (radians)
-    # Feetech encoders report 0-4095 counts = 0 to 2π radians (full rotation)
+    # Joint limits (radians) - based on SO-100 mechanical constraints
+    # These prevent self-collision and dangerous positions.
+    # Port-specific configs loaded by RobotController may further restrict these.
     JOINT_LIMITS = np.array([
-        [0, 2*np.pi],         # Joint 1 (base rotation) - full 360°
-        [0, 2*np.pi],         # Joint 2 (shoulder) - full 360°
-        [0, 2*np.pi],         # Joint 3 (elbow) - full 360°
-        [0, 2*np.pi],         # Joint 4 (wrist roll) - full 360°
-        [0, 2*np.pi],         # Joint 5 (wrist pitch) - full 360°
-        [0, 2*np.pi]          # Joint 6 (gripper) - full 360°
+        [np.radians(70),  np.radians(290)],  # Joint 1 (base rotation) - ~220 deg range
+        [np.radians(70),  np.radians(290)],  # Joint 2 (shoulder) - ~220 deg range
+        [np.radians(70),  np.radians(290)],  # Joint 3 (elbow) - ~220 deg range
+        [np.radians(70),  np.radians(290)],  # Joint 4 (wrist pitch) - ~220 deg range
+        [np.radians(70),  np.radians(290)],  # Joint 5 (wrist roll) - ~220 deg range
+        [np.radians(100), np.radians(260)],  # Joint 6 (gripper) - ~160 deg range
     ])
 
     def __init__(
@@ -102,6 +106,9 @@ class SO100Arm:
         self.serial: Optional[serial.Serial] = None
         self.connected = False
 
+        # Lock for serial port access -- shared with RobotController via self.serial_lock
+        self.serial_lock = threading.Lock()
+
         # Current state
         self.state = SO100State(
             joint_positions=np.zeros(6),  # All 6 motors
@@ -114,6 +121,10 @@ class SO100Arm:
         self.state_lock = threading.Lock()
         self.state_thread: Optional[threading.Thread] = None
         self.running = False
+
+        # Track consecutive read failures for disconnect detection
+        self._consecutive_read_failures = 0
+        self._max_read_failures = 10  # Disconnect after this many consecutive failures
 
     def connect(self) -> bool:
         """
@@ -252,7 +263,7 @@ class SO100Arm:
         speed = np.clip(speed, 0.0, 1.0)
 
         # Send command
-        success = self._send_joint_positions(positions, speed)
+        success = self._send_joint_positions(positions)
 
         if success and blocking:
             # Wait for movement to complete
@@ -262,16 +273,25 @@ class SO100Arm:
 
 
     def emergency_stop(self):
-        """Immediately stop all movement."""
-        if not self.connected:
+        """Immediately stop all movement by disabling torque on all motors."""
+        if not self.connected or not self.serial:
             return
 
-        # Send emergency stop command
-        try:
-            self.serial.write(bytes([self.CMD_EMERGENCY_STOP]))
-            print("[SO100] EMERGENCY STOP")
-        except serial.SerialException as e:
-            print(f"[SO100] Emergency stop failed: {e}")
+        # Feetech protocol has no single emergency stop byte.
+        # Disable torque on every motor as fast as possible.
+        with self.serial_lock:
+            for motor_id in self.MOTOR_IDS:
+                try:
+                    packet = [
+                        *self.HEADER, motor_id, 0x04,
+                        self.INSTR_WRITE, self.REG_TORQUE_ENABLE, 0x00,
+                    ]
+                    checksum = self._calculate_checksum(packet[2:])
+                    packet.append(checksum)
+                    self.serial.write(bytes(packet))
+                except serial.SerialException:
+                    pass  # Best-effort: keep trying remaining motors
+        print("[SO100] EMERGENCY STOP -- torque disabled on all motors")
 
     def is_moving(self) -> bool:
         """
@@ -323,16 +343,21 @@ class SO100Arm:
             checksum = self._calculate_checksum(packet[2:])
             packet.append(checksum)
 
-            # Clear input buffer and send packet
-            self.serial.reset_input_buffer()
-            self.serial.write(bytes(packet))
+            # All serial I/O under lock to prevent interleaving with control loop
+            with self.serial_lock:
+                self.serial.reset_input_buffer()
+                self.serial.write(bytes(packet))
 
-            # Wait for response
-            time.sleep(0.005)  # 5ms delay
+                # Wait for response
+                time.sleep(0.005)  # 5ms delay
 
-            # Read response: [FF FF ID Len Err P_L P_H Checksum]
-            if self.serial.in_waiting > 0:
-                response = self.serial.read(self.serial.in_waiting)
+                # Read response: [FF FF ID Len Err P_L P_H Checksum]
+                if self.serial.in_waiting > 0:
+                    response = self.serial.read(self.serial.in_waiting)
+                else:
+                    response = b''
+
+            if len(response) > 0:
 
                 # Validate response length (minimum 8 bytes for full response)
                 if len(response) >= 8:
@@ -450,21 +475,21 @@ class SO100Arm:
             checksum = self._calculate_checksum(packet[2:])
             packet.append(checksum)
 
-            # Send packet
-            self.serial.write(bytes(packet))
+            # Send packet (under serial lock)
+            with self.serial_lock:
+                self.serial.write(bytes(packet))
             return True
 
         except (serial.SerialException, ValueError) as e:
             print(f"[SO100] Write motor {motor_id} failed: {e}")
             return False
 
-    def _send_joint_positions(self, positions: np.ndarray, speed: float) -> bool:
+    def _send_joint_positions(self, positions: np.ndarray) -> bool:
         """
         Send target joint positions to all motors.
 
         Args:
             positions: Target joint positions in radians [6]
-            speed: Movement speed (currently unused - Feetech uses position mode)
 
         Returns:
             bool: True if all writes successful
@@ -494,6 +519,7 @@ class SO100Arm:
             positions = self._read_joint_positions()
 
             if positions is not None:
+                self._consecutive_read_failures = 0
                 with self.state_lock:
                     # Check if moving (position changed significantly)
                     position_change = np.linalg.norm(positions - self.state.joint_positions)
@@ -501,6 +527,12 @@ class SO100Arm:
 
                     self.state.joint_positions = positions
                     self.state.timestamp = time.time()
+            else:
+                self._consecutive_read_failures += 1
+                if self._consecutive_read_failures >= self._max_read_failures:
+                    print(f"[SO100] Lost connection ({self._consecutive_read_failures} consecutive read failures)")
+                    self.connected = False
+                    break
 
             time.sleep(0.05)  # 20 Hz update rate
 
@@ -545,7 +577,7 @@ def test_so100_connection(port: str = "/dev/ttyACM0"):
     state = arm.get_state()
     print(f"   Joint positions (rad): {state.joint_positions}")
     print(f"   Joint positions (deg): {np.degrees(state.joint_positions)}")
-    print(f"   Gripper: {state.gripper_position}")
+    print(f"   Gripper (joint 5): {np.degrees(state.joint_positions[arm.GRIPPER_INDEX]):.1f} deg")
     print(f"   Moving: {state.is_moving}")
 
     print("\n3. Testing small movement...")
@@ -565,14 +597,6 @@ def test_so100_connection(port: str = "/dev/ttyACM0"):
     else:
         print("[X] Movement failed")
 
-    print("\n4. Testing gripper...")
-    arm.set_gripper(1.0, blocking=True)  # Open
-    print(f"   Gripper opened: {arm.get_gripper_state()}")
-
-    arm.set_gripper(0.0, blocking=True)  # Close
-    print(f"   Gripper closed: {arm.get_gripper_state()}")
-
-    print("\n5. Disconnecting...")
     arm.disconnect()
 
     print("=" * 60)

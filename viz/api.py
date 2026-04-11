@@ -7,6 +7,7 @@ Serves camera streams, state cache, and React SPA.
 
 import json
 import asyncio
+import os
 from pathlib import Path
 from typing import Optional, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
@@ -30,10 +31,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware for development
+# CORS middleware -- restrict origins via VIZ_CORS_ORIGINS env var in production
+_cors_origins = os.environ.get("VIZ_CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins in dev (restrict in production)
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

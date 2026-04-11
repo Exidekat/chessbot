@@ -40,6 +40,7 @@ Usage:
 """
 
 import argparse
+import signal
 import sys
 import termios
 from pathlib import Path
@@ -108,6 +109,26 @@ except ImportError as e:
     print(f"[X] Failed to import PyTorch: {e}")
     print("    Run: conda activate cb && pip install torch")
     sys.exit(1)
+
+# Global list of resources to clean up on signal
+_cleanup_resources = []
+
+
+def _signal_handler(signum, frame):
+    for resource in _cleanup_resources:
+        try:
+            if hasattr(resource, 'disconnect'):
+                resource.disconnect()
+            elif hasattr(resource, 'release'):
+                resource.release()
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
 
 # Helper function for preprocessing observations
 def preprocess_observation(obs_dict):
@@ -596,6 +617,10 @@ def vla_control_loop(
     gripper_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     gripper_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     gripper_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+    # Register cameras for signal handler cleanup
+    _cleanup_resources.append(global_cap)
+    _cleanup_resources.append(gripper_cap)
 
     # Thread-safe stop flag
     stop_event = threading.Event()
@@ -1172,6 +1197,7 @@ def main():
             )
 
             if robot_controller.connect():
+                _cleanup_resources.append(robot_controller)
                 print(f"[OK] SO-100 connected on {args.robot_port}")
 
                 # Enable torque and start control loop targeting home

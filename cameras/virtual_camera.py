@@ -84,7 +84,7 @@ class VirtualCamera:
                 '-pix_fmt', 'yuv420p',
                 '-tune', 'zerolatency',  # Zero latency tuning
                 self.device_path
-            ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
             print(f"[VirtualCam] Started ffmpeg output to {self.device_path} (low latency mode)")
         except Exception as e:
@@ -108,7 +108,7 @@ class VirtualCamera:
                 self.ffmpeg_process.stdin.close()
                 self.ffmpeg_process.terminate()
                 self.ffmpeg_process.wait(timeout=2.0)
-            except:
+            except Exception:
                 self.ffmpeg_process.kill()
 
         print(f"[VirtualCam] Stopped output")
@@ -123,7 +123,11 @@ class VirtualCamera:
         try:
             self.frame_queue.put_nowait(frame)
         except queue.Full:
-            pass  # Drop frame if queue is full (maintains low latency)
+            if not hasattr(self, '_drop_count'):
+                self._drop_count = 0
+            self._drop_count += 1
+            if self._drop_count == 1 or self._drop_count % 100 == 0:
+                print(f"[VirtualCam] Frame dropped (total drops: {self._drop_count})")
 
     def _output_loop(self):
         """Continuous output loop (runs in background thread)."""

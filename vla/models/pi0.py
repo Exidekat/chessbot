@@ -12,6 +12,7 @@ Key changes from naive implementation:
 
 from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
+import contextlib
 import sys
 
 import numpy as np
@@ -31,20 +32,6 @@ from .registry import register_model
 from .base import VLAModelMixin
 from vla.normalization import ActionNormalizer
 
-
-# Chess robot camera configuration for PI0
-# Maps our 2 cameras to PI0's expected 3 camera slots
-CHESS_INPUT_FEATURES = {
-    'observation.images.base_0_rgb': PolicyFeature(
-        type=FeatureType.VISUAL, shape=(3, 224, 224)
-    ),
-    'observation.images.left_wrist_0_rgb': PolicyFeature(
-        type=FeatureType.VISUAL, shape=(3, 224, 224)
-    ),
-    'observation.images.right_wrist_0_rgb': PolicyFeature(
-        type=FeatureType.VISUAL, shape=(3, 224, 224)
-    ),
-}
 
 CHESS_OUTPUT_FEATURES = {
     'action': PolicyFeature(
@@ -79,6 +66,9 @@ class PI0Model(VLAModelMixin):
         'gripper': 'observation.images.left_wrist_0_rgb',
         'unused': 'observation.images.right_wrist_0_rgb',
     }
+
+    # Valid joint range for clipping (assumes SO-100 robot)
+    JOINT_RANGE = (0.0, 2 * np.pi)
 
     # ImageNet normalization (matches training in chess_dataloader.py)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -373,7 +363,11 @@ class PI0Model(VLAModelMixin):
 
         # Run inference (autocast needed: model is bfloat16 but lerobot's
         # sample_noise() creates float32 tensors internally)
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+        if 'cuda' in str(self.device):
+            ctx = torch.autocast('cuda', dtype=torch.bfloat16)
+        else:
+            ctx = contextlib.nullcontext()
+        with torch.inference_mode(), ctx:
             action_tensor = self.policy.select_action(observation)
 
         # Extract action as numpy
@@ -415,10 +409,10 @@ class PI0Model(VLAModelMixin):
                 print("[WARN] No normalizer - using raw action output (warning shown once)")
                 self._warned_no_normalizer = True
 
-        # Clip to valid joint range (0 to 2*pi radians for SO-100)
-        predicted_joints = np.clip(predicted_joints, 0.0, 2 * np.pi)
+        # Clip to valid joint range (assumes SO-100 robot)
+        predicted_joints = np.clip(predicted_joints, *self.JOINT_RANGE)
         if action_chunk is not None:
-            action_chunk = np.clip(action_chunk, 0.0, 2 * np.pi)
+            action_chunk = np.clip(action_chunk, *self.JOINT_RANGE)
 
         result = {
             "joint_positions": predicted_joints,
