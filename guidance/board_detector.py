@@ -784,7 +784,12 @@ class BoardDetector:
                 continue
 
             intersection_area = poly_base.intersection(poly_square).area
-            base_coverage = intersection_area / poly_base.area
+            # Normalize by the smaller of base/square area. Wide pieces (kings,
+            # queens) often have bboxes wider than a square — or that extend past
+            # the board edge — so dividing only by base_area can yield <50% even
+            # when the square sits fully inside the base.
+            denom = min(poly_base.area, poly_square.area)
+            base_coverage = intersection_area / denom
             list_of_overlap.append(base_coverage)
 
         # Piece belongs to square if >50% of its base is inside
@@ -1318,7 +1323,8 @@ class BoardDetector:
                         for row_idx, row in enumerate(squares):
                             for col_idx, sq in enumerate(row):
                                 poly_sq = Polygon(sq)
-                                coverage = poly_base.intersection(poly_sq).area / poly_base.area
+                                denom = min(poly_base.area, poly_sq.area)
+                                coverage = poly_base.intersection(poly_sq).area / denom if denom > 0 else 0.0
                                 if coverage > best_coverage:
                                     best_coverage = coverage
                                     best_square = (row_idx, col_idx)

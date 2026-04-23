@@ -22,6 +22,9 @@ python-chess>=1.999  # Chess library for move generation and board representatio
 # Scientific Computing
 numpy>=1.24.0  # Numerical operations
 
+# Kinematics for SO-101 (placo-based FK/IK via lerobot.model.RobotKinematics)
+placo  # Used by controls/kinematics.py
+
 # Optional: For visualization and debugging
 matplotlib>=3.7.0  # For plotting grid and visualization (optional)
 

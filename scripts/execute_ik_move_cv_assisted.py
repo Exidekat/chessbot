@@ -12,7 +12,6 @@ Usage:
     python scripts/execute_ik_move_cv_assisted.py --turn black --rotation right
     python scripts/execute_ik_move_cv_assisted.py --dry-run
     python scripts/execute_ik_move_cv_assisted.py --mjpeg
-    python scripts/execute_ik_move_cv_assisted.py --bridge http://localhost:8420
     python scripts/execute_ik_move_cv_assisted.py --verify
 """
 
@@ -33,15 +32,6 @@ from controls.robot_controller import (
     RobotController, JointConfig, load_joint_configs_for_port,
 )
 
-try:
-    import requests
-except ImportError:
-    print("ERROR: requests library required. Install: pip install requests",
-          file=sys.stderr)
-    sys.exit(1)
-
-
-DEFAULT_BRIDGE = "http://localhost:8420"
 
 # Arm joint names matching kinematics (excludes gripper)
 ARM_JOINT_NAMES = [
@@ -211,33 +201,8 @@ def go_home(robot: RobotController):
 
 
 # ---------------------------------------------------------------------------
-# Bridge helpers (disconnect/reconnect)
+# Port helpers
 # ---------------------------------------------------------------------------
-
-def check_health(bridge: str) -> bool:
-    try:
-        return requests.get(f"{bridge}/health", timeout=5).status_code == 200
-    except Exception:
-        return False
-
-
-def disconnect_bridge_robot(bridge: str):
-    try:
-        r = requests.post(f"{bridge}/robot/disconnect", timeout=5)
-        if r.status_code == 200:
-            print(f"  [OK] {r.json().get('message', 'Bridge robot disconnected')}")
-    except Exception:
-        pass
-
-
-def reconnect_bridge_robot(bridge: str):
-    try:
-        r = requests.post(f"{bridge}/robot/reconnect", timeout=10)
-        if r.status_code == 200 and r.json().get("success"):
-            print(f"  [OK] {r.json().get('message', 'Bridge robot reconnected')}")
-    except Exception:
-        pass
-
 
 def resolve_port(port: str) -> str:
     if port != "auto":
@@ -253,21 +218,16 @@ def resolve_port(port: str) -> str:
 # Calibration + IK
 # ---------------------------------------------------------------------------
 
-def load_calibration(bridge: str):
+def load_calibration():
     """Load BoardCalibration and gripper/home settings from calibration file."""
     global GRIPPER_OPEN_RAD, GRIPPER_CLOSED_RAD, HOME_RAD
 
-    claw_dir = Path(__file__).resolve().parent.parent.parent.parent / "claw"
-    sys.path.insert(0, str(claw_dir.parent))
+    from controls.kinematics import BoardCalibration, SO101Kinematics
 
-    from claw.bridge.kinematics import BoardCalibration, SO101Kinematics
-
-    agent_name = os.environ.get("AGENT_NAME", "")
-    if agent_name:
-        ws = claw_dir / "agents" / agent_name / "workspace"
-    else:
-        ws = claw_dir / "agents" / "chessbot" / "workspace"
-    cal_path = ws / "calibration" / "board_calibration.json"
+    cal_path = (
+        Path(__file__).resolve().parent.parent
+        / "data" / "calibration" / "board_calibration.json"
+    )
 
     if not cal_path.exists():
         print(f"[X] Calibration file not found: {cal_path}", file=sys.stderr)
@@ -504,8 +464,6 @@ def main():
                         help="Use 4K MJPEG -> 720p downscale")
     parser.add_argument("--corner-conf", type=float, default=0.005,
                         help="Corner detection threshold (default: 0.005)")
-    parser.add_argument("--bridge", type=str, default=DEFAULT_BRIDGE,
-                        help=f"Bridge URL (default: {DEFAULT_BRIDGE})")
     parser.add_argument("--port", type=str, default="auto",
                         help="Serial port (default: auto-detect /dev/ttyACM*)")
     parser.add_argument("--dry-run", action="store_true",
@@ -541,17 +499,14 @@ def main():
             print(json.dumps(detection, indent=2))
         return 0
 
-    # Step 2: Load calibration (direct, no bridge)
-    kin, cal = load_calibration(args.bridge)
+    # Step 2: Load calibration
+    kin, cal = load_calibration()
     if cal is None:
         return 1
 
     # Step 3: Connect RobotController
     port = resolve_port(args.port)
-
-    print(f"[Setup] Disconnecting bridge robot, connecting to {port}...")
-    disconnect_bridge_robot(args.bridge)
-    time.sleep(0.2)
+    print(f"[Setup] Connecting to {port}...")
 
     # Load joint configs for this port (3-tier fallback: port-specific > generic > defaults)
     configs, config_source = load_joint_configs_for_port(port)
@@ -559,21 +514,13 @@ def main():
 
     if not robot.connect():
         print(f"[X] Failed to connect to arm on {port}", file=sys.stderr)
-        reconnect_bridge_robot(args.bridge)
         return 1
 
     def cleanup():
         robot.stop_control_loop()
         robot.release_torque()
         robot.disconnect()
-        time.sleep(0.2)
-        reconnect_bridge_robot(args.bridge)
-        # Relax via bridge so the arm stays limp after reconnect
-        try:
-            requests.post(f"{args.bridge}/robot/relax", timeout=5)
-            print("  [OK] Arm relaxed")
-        except Exception:
-            pass
+        print("  [OK] Arm released")
 
     try:
         # Enable torque and start the 20Hz stability control loop

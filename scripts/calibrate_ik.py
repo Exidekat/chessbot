@@ -6,12 +6,9 @@ Interactive CLI that walks the user through recording 8 positions for
 the SO-101 chess arm: each of the 4 board corners at both the bottom
 (grasp) plane and the top (transit) plane.
 
-Reads joint positions directly from the Feetech servos over serial
-(same approach as create_so100_config.py). If the bridge holds the
-serial port, the script disconnects it first via POST /robot/disconnect
-and reconnects when done.
-
-Uses the bridge only for FK computation and calibration reload.
+Reads joint positions directly from the Feetech servos over serial,
+and computes forward kinematics locally via `controls.kinematics`
+(placo-based, backed by the SO-101 URDF at data/urdf/so101_new_calib.urdf).
 
 Usage:
     # Standard calibration (8 corner positions + graveyard)
@@ -20,8 +17,8 @@ Usage:
     # Skip graveyard recording
     python scripts/calibrate_ik.py --skip-graveyard
 
-    # Custom bridge URL, serial port, and output path
-    python scripts/calibrate_ik.py --bridge http://localhost:8420 --port /dev/ttyACM1 --output data/cal.json
+    # Custom serial port and output path
+    python scripts/calibrate_ik.py --port /dev/ttyACM1 --output data/cal.json
 """
 
 import argparse
@@ -38,16 +35,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 from controls.so100_arm import SO100Arm
-
-try:
-    import requests
-except ImportError:
-    print("ERROR: requests library required. Install: pip install requests",
-          file=sys.stderr)
-    sys.exit(1)
+from controls.kinematics import SO101Kinematics
 
 
-DEFAULT_BRIDGE = "http://localhost:8420"
 CORNERS = ["a1", "h1", "a8", "h8"]
 
 # Arm joint names matching kinematics.py (excludes gripper)
@@ -68,55 +58,15 @@ def resolve_port(port: str) -> str:
     sys.exit(1)
 
 
-def check_health(bridge: str) -> bool:
-    try:
-        r = requests.get(f"{bridge}/health", timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
+_KIN: SO101Kinematics | None = None
 
 
-def disconnect_bridge_robot(bridge: str) -> bool:
-    """Tell the bridge to release the serial port."""
-    try:
-        r = requests.post(f"{bridge}/robot/disconnect", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            print(f"  [OK] {data.get('message', 'Bridge robot disconnected')}")
-            return True
-        print(f"  [WARN] /robot/disconnect returned {r.status_code}: {r.text[:200]}")
-        return False
-    except Exception as e:
-        print(f"  [WARN] Could not disconnect bridge robot: {e}")
-        return False
-
-
-def reconnect_bridge_robot(bridge: str) -> bool:
-    """Tell the bridge to reconnect to the serial port."""
-    try:
-        r = requests.post(f"{bridge}/robot/reconnect", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("success"):
-                print(f"  [OK] {data.get('message', 'Bridge robot reconnected')}")
-                return True
-            print(f"  [WARN] Reconnect failed: {data.get('message')}")
-            return False
-        print(f"  [WARN] /robot/reconnect returned {r.status_code}")
-        return False
-    except Exception as e:
-        print(f"  [WARN] Could not reconnect bridge robot: {e}")
-        return False
-
-
-def compute_fk(bridge: str, joint_angles_deg: dict) -> list:
-    """Compute forward kinematics via bridge. Returns [x, y, z] in meters."""
-    r = requests.post(
-        f"{bridge}/kinematics/fk",
-        json={"joint_angles_deg": joint_angles_deg},
-        timeout=5,
-    )
-    return r.json()["xyz_meters"]
+def compute_fk(joint_angles_deg: dict) -> list:
+    """Compute forward kinematics locally. Returns [x, y, z] in meters."""
+    global _KIN
+    if _KIN is None:
+        _KIN = SO101Kinematics()
+    return _KIN.forward_kinematics(joint_angles_deg).tolist()
 
 
 def read_positions(arm: SO100Arm) -> dict:
@@ -140,31 +90,22 @@ def read_positions(arm: SO100Arm) -> dict:
     return positions
 
 
-def record_position(arm: SO100Arm, bridge: str, label: str) -> dict:
-    """Read current arm position (direct serial) and compute FK (bridge).
+def record_position(arm: SO100Arm, label: str) -> dict:
+    """Read current arm position (direct serial) and compute FK locally.
 
     Returns dict with joint_angles_deg and xyz_meters.
     """
     joints = read_positions(arm)
-    xyz = compute_fk(bridge, joints)
+    xyz = compute_fk(joints)
     print(f"  Joints: {json.dumps({k: round(v, 2) for k, v in joints.items()})}")
     print(f"  XYZ (m): [{xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f}]")
     return {"joint_angles_deg": joints, "xyz_meters": xyz}
 
 
 def default_output_path() -> str:
-    """Determine default calibration output path."""
-    agent_name = os.environ.get("AGENT_NAME", "")
-    claw_dir = Path(__file__).resolve().parent.parent.parent.parent / "claw"
-    if agent_name:
-        ws = claw_dir / "agents" / agent_name / "workspace"
-    else:
-        chessbot_ws = claw_dir / "agents" / "chessbot" / "workspace"
-        if chessbot_ws.exists():
-            ws = chessbot_ws
-        else:
-            return str(Path("data") / "calibration" / "board_calibration.json")
-    return str(ws / "calibration" / "board_calibration.json")
+    """Default chessbot-local calibration output path."""
+    repo_root = Path(__file__).resolve().parent.parent
+    return str(repo_root / "data" / "calibration" / "board_calibration.json")
 
 
 def main():
@@ -172,24 +113,16 @@ def main():
         description="Two-plane IK calibration for SO-101 chess arm"
     )
     parser.add_argument(
-        "--bridge", type=str, default=DEFAULT_BRIDGE,
-        help=f"Bridge URL (default: {DEFAULT_BRIDGE})"
-    )
-    parser.add_argument(
         "--port", type=str, default="auto",
         help="Serial port (default: auto-detect /dev/ttyACM*)"
     )
     parser.add_argument(
         "--output", type=str, default=None,
-        help="Output calibration JSON path (auto-detected if not specified)"
+        help="Output calibration JSON path (default: data/calibration/board_calibration.json)"
     )
     parser.add_argument(
         "--skip-graveyard", action="store_true",
         help="Skip graveyard position recording"
-    )
-    parser.add_argument(
-        "--no-reload", action="store_true",
-        help="Skip auto-reloading bridge calibration after saving"
     )
     parser.add_argument(
         "--gripper-only", action="store_true",
@@ -203,7 +136,6 @@ def main():
     print("=" * 60)
     print("Two-Plane IK Calibration")
     print("=" * 60)
-    print(f"Bridge: {args.bridge}")
     print(f"Serial: {port}")
     print(f"Output: {output_path}")
     print(f"Corners: {', '.join(CORNERS)}")
@@ -211,24 +143,11 @@ def main():
     print(f"Total positions: {len(CORNERS) * 2}{'' if args.skip_graveyard else ' + 1 graveyard'}")
     print()
 
-    # Pre-flight: bridge health (needed for FK)
-    if not check_health(args.bridge):
-        print(f"[X] Bridge not healthy at {args.bridge}", file=sys.stderr)
-        return 1
-    print("[OK] Bridge is healthy")
-
-    # Disconnect bridge robot so we can open serial directly
-    print("  Disconnecting bridge robot to free serial port...")
-    disconnect_bridge_robot(args.bridge)
-    time.sleep(0.2)  # Let serial port be released
-
     # Open direct serial connection
     print(f"  Connecting directly to {port}...")
     arm = SO100Arm(port=port, baudrate=1000000)
     if not arm.connect():
         print(f"[X] Failed to connect to arm on {port}", file=sys.stderr)
-        print("  Reconnecting bridge robot...")
-        reconnect_bridge_robot(args.bridge)
         return 1
     print(f"[OK] Direct serial connection to {port}")
     print()
@@ -240,7 +159,6 @@ def main():
             print(f"[X] No existing calibration at {output_path}", file=sys.stderr)
             print("    Run full calibration first (without --gripper-only)")
             arm.disconnect()
-            reconnect_bridge_robot(args.bridge)
             return 1
         with open(output_path) as f:
             calibration = json.load(f)
@@ -269,11 +187,8 @@ def main():
     print()
 
     def cleanup():
-        """Release serial and reconnect bridge."""
+        """Release serial port."""
         arm.disconnect()
-        time.sleep(0.2)
-        print("  Reconnecting bridge robot...")
-        reconnect_bridge_robot(args.bridge)
 
     try:
         if not args.gripper_only:
@@ -285,12 +200,12 @@ def main():
             input(f"  Position gripper at {corner} BOTTOM (board surface). Press Enter...")
 
             print(f"  Recording {corner} bottom...")
-            bottom = record_position(arm, args.bridge, f"{corner} bottom")
+            bottom = record_position(arm, f"{corner} bottom")
 
             input(f"  Raise gripper to {corner} TOP (transit height). Press Enter...")
 
             print(f"  Recording {corner} top...")
-            top = record_position(arm, args.bridge, f"{corner} top")
+            top = record_position(arm, f"{corner} top")
 
             delta_z = (top["xyz_meters"][2] - bottom["xyz_meters"][2]) * 1000
 
@@ -302,7 +217,7 @@ def main():
                 if redo == "y":
                     input(f"  Raise gripper to {corner} TOP (transit height). Press Enter...")
                     print(f"  Re-recording {corner} top...")
-                    top = record_position(arm, args.bridge, f"{corner} top")
+                    top = record_position(arm, f"{corner} top")
                     delta_z = (top["xyz_meters"][2] - bottom["xyz_meters"][2]) * 1000
 
             calibration["corners"][corner] = {
@@ -324,7 +239,7 @@ def main():
             input("  Position gripper at graveyard (off-board capture area). Press Enter...")
 
             print("  Recording graveyard...")
-            graveyard = record_position(arm, args.bridge, "graveyard")
+            graveyard = record_position(arm, "graveyard")
             calibration["graveyard"] = graveyard
             print(f"  [OK] Graveyard: XYZ = {graveyard['xyz_meters']}")
             print()
@@ -367,7 +282,7 @@ def main():
         calibration["home_rad"] = home_dict
         print()
 
-        # Release serial and reconnect bridge before computing/saving
+        # Release serial before computing/saving
         cleanup()
 
         # --- Compute calibration (skip if gripper-only, already has computed) ---
@@ -440,18 +355,6 @@ def main():
         tmp.rename(out)
 
         print(f"[OK] Calibration saved to {output_path}")
-
-        # --- Reload bridge calibration ---
-        if not args.no_reload:
-            print("  Reloading bridge calibration...")
-            try:
-                r = requests.post(f"{args.bridge}/calibration/reload", timeout=5)
-                if r.status_code == 200 and r.json().get("success"):
-                    print("  [OK] Bridge calibration reloaded")
-                else:
-                    print(f"  [WARN] Reload failed: {r.text}")
-            except Exception as e:
-                print(f"  [WARN] Could not reload: {e}")
 
         print()
         print("=" * 60)

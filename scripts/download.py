@@ -112,6 +112,46 @@ def download_alternative_piece_model(data_dir: Path) -> bool:
     return False
 
 
+def download_so101_urdf(data_dir: Path) -> bool:
+    """Download the SO-101 URDF and strip mesh references.
+
+    The URDF from TheRobotStudio references STL files that aren't included
+    with the URDF itself. For FK/IK (controls.kinematics, placo) only the
+    kinematic tree is needed, so <visual> and <collision> blocks are
+    stripped after download to avoid "mesh not found" errors.
+    """
+    url = "https://raw.githubusercontent.com/TheRobotStudio/SO-ARM100/main/Simulation/SO101/so101_new_calib.urdf"
+    urdf_dir = data_dir / "urdf"
+    urdf_dir.mkdir(parents=True, exist_ok=True)
+    dest = urdf_dir / "so101_new_calib.urdf"
+
+    if dest.exists():
+        print(f"✓ SO-101 URDF already present: {dest}")
+        return True
+
+    try:
+        print(f"  Downloading {url}")
+        urllib.request.urlretrieve(url, dest)
+    except Exception as e:
+        print(f"✗ Failed to download URDF: {e}")
+        return False
+
+    try:
+        import re
+        txt = dest.read_text()
+        txt = re.sub(r"<visual>.*?</visual>", "", txt, flags=re.DOTALL)
+        txt = re.sub(r"<collision>.*?</collision>", "", txt, flags=re.DOTALL)
+        dest.write_text(txt)
+    except Exception as e:
+        print(f"✗ Failed to strip mesh references: {e}")
+        return False
+
+    file_size = dest.stat().st_size / 1024  # KB
+    print(f"✓ SO-101 URDF ready: {dest}")
+    print(f"  Size: {file_size:.1f} KB (visual/collision blocks stripped)")
+    return True
+
+
 def verify_models(data_dir: Path) -> bool:
     """
     Verify that all required models are present.
@@ -169,6 +209,12 @@ def main():
 
     if not piece_success:
         piece_success = download_piece_model(data_dir)
+    print()
+
+    # Download SO-101 URDF (for controls.kinematics / placo-based IK)
+    print("Step 3: SO-101 URDF (IK)")
+    print("-" * 60)
+    download_so101_urdf(data_dir)
     print()
 
     # Verify all models
