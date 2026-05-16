@@ -54,24 +54,34 @@ echo ""
 # Check for conda environment
 REQUIRED_PY_MAJOR=3
 REQUIRED_PY_MINOR=10
+REQUIRED_ENV=cb
 
-if [ -z "$CONDA_DEFAULT_ENV" ]; then
-    echo_error "No conda environment active."
-    echo_error "The Jetson PyTorch wheel is cp310-only; installing into the system Python is unsupported."
-    echo "    conda activate cb   # must be Python ${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR}"
+# Locate conda so we can create/activate envs from inside this script.
+if ! command -v conda &> /dev/null; then
+    echo_error "conda not found on PATH. Install Miniconda/Anaconda first."
     exit 1
 fi
+CONDA_BASE="$(conda info --base)"
+# shellcheck source=/dev/null
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
-if [ "$CONDA_DEFAULT_ENV" = "base" ]; then
-    echo_error "Refusing to install into the 'base' conda environment."
-    echo_error "Project policy (CLAUDE.md) requires the 'cb' environment."
-    if conda env list 2>/dev/null | awk '{print $1}' | grep -qx cb; then
-        echo "    conda activate cb"
-    else
-        echo_warn "'cb' environment not found. Create it with:"
-        echo "    conda create -n cb python=${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR} -y"
-        echo "    conda activate cb"
-    fi
+# Create the 'cb' env if it doesn't exist yet.
+if ! conda env list | awk '{print $1}' | grep -qx "${REQUIRED_ENV}"; then
+    echo_warn "'${REQUIRED_ENV}' conda environment not found."
+    echo_info "Creating '${REQUIRED_ENV}' with Python ${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR}..."
+    conda create -n "${REQUIRED_ENV}" "python=${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR}" -y
+    echo_info "Created '${REQUIRED_ENV}' environment."
+fi
+
+# Ensure we're running inside 'cb' (activate if not).
+if [ "$CONDA_DEFAULT_ENV" != "${REQUIRED_ENV}" ]; then
+    echo_info "Activating '${REQUIRED_ENV}' environment..."
+    conda activate "${REQUIRED_ENV}"
+fi
+
+if [ "$CONDA_DEFAULT_ENV" != "${REQUIRED_ENV}" ]; then
+    echo_error "Failed to activate '${REQUIRED_ENV}'. Activate manually and re-run:"
+    echo "    conda activate ${REQUIRED_ENV}"
     exit 1
 fi
 
@@ -81,13 +91,12 @@ echo_info "Conda environment: $CONDA_DEFAULT_ENV"
 PY_MAJOR=$(python -c 'import sys; print(sys.version_info.major)')
 PY_MINOR=$(python -c 'import sys; print(sys.version_info.minor)')
 if [ "$PY_MAJOR" != "$REQUIRED_PY_MAJOR" ] || [ "$PY_MINOR" != "$REQUIRED_PY_MINOR" ]; then
-    echo_error "Python ${PY_MAJOR}.${PY_MINOR} detected; this script requires Python ${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR}."
+    echo_error "Python ${PY_MAJOR}.${PY_MINOR} detected in '${REQUIRED_ENV}'; this script requires Python ${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR}."
     echo_error "The NVIDIA Jetson PyTorch wheel is cp310-only and will not install on other versions."
     echo_warn "Recreate the environment with the correct Python:"
     echo "    conda deactivate"
-    echo "    conda remove -n ${CONDA_DEFAULT_ENV} --all -y   # if you want to recreate"
-    echo "    conda create -n cb python=${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR} -y"
-    echo "    conda activate cb"
+    echo "    conda remove -n ${REQUIRED_ENV} --all -y"
+    echo "    # then re-run this script (it will recreate '${REQUIRED_ENV}' at Python ${REQUIRED_PY_MAJOR}.${REQUIRED_PY_MINOR})"
     exit 1
 fi
 echo_info "Python version: ${PY_MAJOR}.${PY_MINOR} (matches pinned cp310 wheel)"
@@ -344,6 +353,9 @@ echo "============================================================"
 echo "Setup Complete!"
 echo "============================================================"
 echo ""
-echo "You can now run the ChessBot demo:"
+echo "Activate the 'cb' conda environment before running the demo:"
+echo "  conda activate cb"
+echo ""
+echo "Then run the ChessBot demo:"
 echo "  python scripts/best_move_demo.py --debug"
 echo ""
