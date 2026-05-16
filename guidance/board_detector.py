@@ -34,7 +34,7 @@ class BoardDetector:
         camera_position: str = "right",
         use_corner_rgb: bool = True,
         use_piece_rgb: bool = True,
-        device: str = "cpu",
+        device: Optional[str] = None,
     ):
         """
         Initialize the BoardDetector.
@@ -47,14 +47,29 @@ class BoardDetector:
                            If False, apply grayscale+CLAHE preprocessing.
             use_piece_rgb: If True (default), use RGB for piece detection.
                           If False, apply grayscale+CLAHE preprocessing.
-            device: Device for YOLO inference (default: "cpu")
+            device: Device for YOLO inference. If None (default), auto-selects
+                CUDA when available and falls back to CPU otherwise (e.g. MacBook).
         """
         self.corner_model_path = Path(corner_model_path)
         self.piece_model_path = Path(piece_model_path)
         self.camera_position = camera_position
         self.use_corner_rgb = use_corner_rgb
         self.use_piece_rgb = use_piece_rgb
-        self.device = device
+
+        # Auto-select device when not explicitly set; log the choice and warn on
+        # CPU since piece detection at imgsz=1280 on CPU is ~8-10s/frame slower.
+        if device is None:
+            import torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
+        print(f"[BoardDetector] YOLO inference device: {self.device}")
+        if str(self.device) == "cpu":
+            print(
+                "[BoardDetector] WARNING: running on CPU — piece detection at "
+                "imgsz=1280 may take 8-10s longer per frame than CUDA-accelerated."
+            )
 
         # Initialize models (lazy loading)
         self._corner_model: Optional[YOLO] = None
@@ -244,7 +259,8 @@ class BoardDetector:
                 source=temp_preprocessed_path,
                 conf=conf_threshold,
                 verbose=False,
-                imgsz=1280  # Match training resolution
+                imgsz=1280,  # Match training resolution
+                device=self.device,
             )
         finally:
             if _temp_file is not None:
