@@ -7,7 +7,7 @@ the SO-101 chess arm: each of the 4 board corners at both the bottom
 (grasp) plane and the top (transit) plane.
 
 Reads joint positions directly from the Feetech servos over serial,
-and computes forward kinematics locally via `controls.kinematics`
+and computes forward kinematics locally via `controls.so101_kinematics`
 (placo-based, backed by the SO-101 URDF at data/urdf/so101_new_calib.urdf).
 
 Usage:
@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 from controls.so100_arm import SO100Arm
-from controls.kinematics import SO101Kinematics
+from controls.so101_kinematics import SO101Kinematics
 
 
 CORNERS = ["a1", "h1", "a8", "h8"]

@@ -222,7 +222,7 @@ def load_calibration():
     """Load BoardCalibration and gripper/home settings from calibration file."""
     global GRIPPER_OPEN_RAD, GRIPPER_CLOSED_RAD, HOME_RAD
 
-    from controls.kinematics import BoardCalibration, SO101Kinematics
+    from controls.so101_kinematics import BoardCalibration, SO101Kinematics
 
     cal_path = (
         Path(__file__).resolve().parent.parent
