@@ -710,9 +710,17 @@ def main():
                     resolution=tuple(args.cv_assist_camera_resolution),
                 )
                 if gripper_cam.start():
-                    print(f"[CV  ] Gripper camera open on id="
-                          f"{args.cv_assist_camera_id} "
-                          f"@ {tuple(args.cv_assist_camera_resolution)}")
+                    from controls.chesster_cv_assist import probe_camera
+                    if probe_camera(gripper_cam, args.cv_assist_camera_id):
+                        print(f"[CV  ] Gripper camera open on id="
+                              f"{args.cv_assist_camera_id} "
+                              f"@ {tuple(args.cv_assist_camera_resolution)}")
+                    else:
+                        print("[CV  ] WARN: gripper camera produced no frames; "
+                              "proceeding without CV-assist.")
+                        try: gripper_cam.stop()
+                        except Exception: pass
+                        gripper_cam = None
                 else:
                     print("[CV  ] WARN: gripper camera failed to open; "
                           "proceeding without CV-assist.")

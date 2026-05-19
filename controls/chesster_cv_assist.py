@@ -70,6 +70,37 @@ def capture_frame(cam, warmup_frames: int = 5, settle_s: float = 0.04,
     return last
 
 
+def probe_camera(cam, camera_id, timeout_s: float = 2.0) -> bool:
+    """Verify the camera actually delivers a frame within `timeout_s`.
+
+    GripperCamera.start() returns True whenever cv2.VideoCapture.isOpened()
+    is True -- but OpenCV will sometimes open a non-capture V4L2 endpoint
+    (e.g. the metadata channel that USB UVC cameras expose alongside the
+    capture endpoint at the same physical device) where `cap.read()` then
+    silently fails forever in the background thread. This wrapper waits
+    for an actual frame and prints a diagnostic with available
+    /dev/video* devices on failure.
+    """
+    frame = capture_frame(cam, warmup_frames=0, max_wait_s=timeout_s)
+    if frame is not None:
+        return True
+
+    import glob as _glob
+    print(f"[CV  ] Camera id={camera_id} opened but no frame arrived within "
+          f"{timeout_s:.1f}s.")
+    devs = sorted(_glob.glob("/dev/video*"))
+    if devs:
+        print(f"[CV  ] Available video devices: {' '.join(devs)}")
+        print("[CV  ] Note: for USB UVC cameras Linux typically pairs "
+              "two /dev/video* endpoints per physical camera (capture + "
+              "metadata) -- try the lower number (e.g. 0 instead of 1, "
+              "or 2 instead of 3).")
+        print("[CV  ] To label devices, run: v4l2-ctl --list-devices")
+    else:
+        print("[CV  ] No /dev/video* devices found on this system.")
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Centroid detection
 # ---------------------------------------------------------------------------

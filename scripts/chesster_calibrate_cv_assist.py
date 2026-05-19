@@ -46,7 +46,7 @@ from controls.chesster_kinematics import (
     JOINT_TO_MOTOR_INDEX,
 )
 from controls.chesster_cv_assist import (
-    capture_frame, detect_piece_centroid,
+    capture_frame, detect_piece_centroid, probe_camera,
 )
 from cameras.gripper_camera import GripperCamera
 
@@ -261,6 +261,14 @@ def main():
         print("[X] Failed to open gripper camera", file=sys.stderr)
         arm.release_torque(); arm.disconnect()
         return 1
+    if not probe_camera(cam, args.camera_id):
+        print("[X] Gripper camera produced no frames; aborting before motion.",
+              file=sys.stderr)
+        try: cam.stop()
+        except Exception: pass
+        arm.release_torque(); arm.disconnect()
+        return 1
+    print("[Cam] Verified frame capture.")
 
     debug_dir = Path(args.debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
