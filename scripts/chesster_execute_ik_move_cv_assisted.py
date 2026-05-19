@@ -359,10 +359,33 @@ def detect_and_compute(args) -> dict:
 # Two-plane pick-and-place execution
 # ---------------------------------------------------------------------------
 
+def _read_current_pan_urdf_rad(arm: ChessterArm, cal: BoardCalibration) -> float:
+    """Read the live shoulder_pan servo position and convert it to URDF
+    radians (after sign + offset). Used by CV-assist to project the
+    gripper-cam image axes back onto the board frame.
+    """
+    from controls.chesster_kinematics import JOINT_TO_MOTOR_INDEX
+    state = arm.get_state()
+    pan_idx = JOINT_TO_MOTOR_INDEX["shoulder_pan"]
+    raw_rad = float(state.joint_positions[pan_idx])
+    pan_servo_deg = raw_rad_to_ik_deg(raw_rad)
+    sign = cal.ik["joint_signs"]["shoulder_pan"]
+    off = cal.ik["encoder_offsets_deg"]["shoulder_pan"]
+    pan_urdf_deg = sign * pan_servo_deg + off
+    return float(np.radians(pan_urdf_deg))
+
+
 def execute_stages(arm: ChessterArm, cal: BoardCalibration, stages: list,
-                   use_ik: bool = True) -> dict:
+                   use_ik: bool = True, gripper_cam=None) -> dict:
     seed = None
     results = []
+
+    cv_enabled = gripper_cam is not None and cal.has_cv_assist and use_ik
+    if gripper_cam is not None and not cv_enabled:
+        # Camera was opened but we can't refine -- explain why.
+        reason = ("calibration lacks cv_assist block" if not cal.has_cv_assist
+                  else "running in interpolation mode (cv-assist requires IK)")
+        print(f"    [WARN] CV-assist disabled at runtime: {reason}.")
 
     def angles(sq, plane, seed):
         return cal.get_joint_angles(sq, plane, seed, use_ik=use_ik)
@@ -404,18 +427,61 @@ def execute_stages(arm: ChessterArm, cal: BoardCalibration, stages: list,
         place_top_5 = ik_angles_to_raw_5(place_top)
         place_bot_5 = ik_angles_to_raw_5(place_bottom)
 
+        # CV-assist refine helpers. Update pick_bot_5 / place_bot_5 in place
+        # so subsequent step lambdas (which call `.copy()` at trajectory
+        # time) pick up the refined target.
+        def _refine_into(target_arr, square, label, current_seed):
+            from controls.chesster_cv_assist import cv_assist_refine
+            pan_now = _read_current_pan_urdf_rad(arm, cal)
+            debug_path = Path("data/cv_assist_debug") / f"stage{i+1}_{label}.png"
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            refined, info = cv_assist_refine(
+                cal, gripper_cam, square,
+                bottom_plane="bottom",
+                seed_servo=current_seed,
+                current_pan_rad=pan_now,
+                debug_frame_path=str(debug_path),
+            )
+            if refined is None:
+                if info.get("delta_mm") is not None:
+                    print(f"    [WARN] {label} CV-refine skipped: "
+                          f"{info['reason']} (delta={info['delta_mm']:.1f}mm)")
+                else:
+                    print(f"    [WARN] {label} CV-refine skipped: "
+                          f"{info['reason']}")
+                return
+            dx, dy = info["board_delta_m"]
+            print(f"    [CV ] {label} centroid uv={info['centroid_uv']}  "
+                  f"board_delta=({dx*1000:+.1f}, {dy*1000:+.1f}) mm  "
+                  f"|d|={info['delta_mm']:.1f} mm")
+            refined_5 = ik_angles_to_raw_5(refined)
+            # Preserve gripper slot (refined dict has no gripper key).
+            refined_5[1] = target_arr[1]
+            target_arr[:] = refined_5
+
+        cv_pick = (lambda: _refine_into(pick_bot_5, pick_sq, "pick", pick_top))
+        cv_place = (lambda: _refine_into(place_bot_5, place_sq, "place", pick_top))
+
         steps = [
             ("move top(pick)",    lambda: execute_trajectory(arm, pick_top_5.copy(), MOVE_LATERAL_S)),
+        ]
+        if cv_enabled:
+            steps.append(("cv refine pick", cv_pick))
+        steps.extend([
             ("gripper open",      lambda: execute_gripper(arm, True)),
             ("descend pick",      lambda: execute_trajectory(arm, pick_bot_5.copy(), MOVE_VERTICAL_S)),
             ("gripper close",     lambda: execute_gripper(arm, False)),
             ("ascend pick",       lambda: execute_trajectory(arm, pick_top_5.copy(), MOVE_VERTICAL_S)),
             ("move top(place)",   lambda: execute_trajectory(arm, place_top_5.copy(), MOVE_LATERAL_S)),
+        ])
+        if cv_enabled:
+            steps.append(("cv refine place", cv_place))
+        steps.extend([
             ("descend place",     lambda: execute_trajectory(arm, place_bot_5.copy(), MOVE_VERTICAL_S)),
             ("gripper open",      lambda: execute_gripper(arm, True)),
             ("travel up",         lambda: execute_trajectory(arm, place_top_5.copy(), MOVE_VERTICAL_S)),
             ("home",              lambda: go_home(arm)),
-        ]
+        ])
 
         step_results = []
         for label, action in steps:
@@ -476,6 +542,19 @@ def main():
                              "of the fitted IK. Useful as a fallback if the "
                              "IK block in the calibration is missing or you "
                              "want to compare behaviours.")
+    parser.add_argument("--cv-assist", action="store_true",
+                        help="After arriving at pick-top and place-top, "
+                             "capture the gripper camera, detect the piece "
+                             "centroid via OpenCV, and shift the descend "
+                             "target by the implied board-frame XY delta. "
+                             "Requires a `cv_assist` block in the "
+                             "calibration JSON -- run "
+                             "scripts/chesster_calibrate_cv_assist.py once "
+                             "to populate it.")
+    parser.add_argument("--cv-assist-camera-id", type=int, default=1,
+                        help="Gripper-camera device id (default 1)")
+    parser.add_argument("--cv-assist-camera-resolution", type=int, nargs=2,
+                        default=[640, 480], metavar=("W", "H"))
     args = parser.parse_args()
 
     global MANUAL_MODE
@@ -612,10 +691,46 @@ def main():
         # Default to IK; flip to interpolation if user passed --interpolation
         # OR if no fitted ik block is in the calibration.
         use_ik = (not args.interpolation) and cal.has_ik
+
+        # Open the gripper camera if --cv-assist; tolerate failures by
+        # falling back to unrefined IK.
+        gripper_cam = None
+        if args.cv_assist:
+            if not cal.has_cv_assist:
+                print("[CV  ] WARN: --cv-assist requested but calibration has no "
+                      "`cv_assist` block. Run scripts/chesster_calibrate_cv_assist.py "
+                      "first. Proceeding without CV-assist.")
+            elif not use_ik:
+                print("[CV  ] WARN: --cv-assist requires IK mode; --interpolation "
+                      "is set or no IK block. Proceeding without CV-assist.")
+            else:
+                from cameras.gripper_camera import GripperCamera
+                gripper_cam = GripperCamera(
+                    camera_id=args.cv_assist_camera_id,
+                    resolution=tuple(args.cv_assist_camera_resolution),
+                )
+                if gripper_cam.start():
+                    print(f"[CV  ] Gripper camera open on id="
+                          f"{args.cv_assist_camera_id} "
+                          f"@ {tuple(args.cv_assist_camera_resolution)}")
+                else:
+                    print("[CV  ] WARN: gripper camera failed to open; "
+                          "proceeding without CV-assist.")
+                    gripper_cam = None
+
+        cv_mode_str = " +CV" if gripper_cam is not None else ""
         print(f"\n[Execute] {best_move['san']} via ChessterArm on {port} "
-              f"(mode={'IK' if use_ik else 'interpolation'})...")
+              f"(mode={'IK' if use_ik else 'interpolation'}{cv_mode_str})...")
         start = time.time()
-        result = execute_stages(arm, cal, stages, use_ik=use_ik)
+        try:
+            result = execute_stages(arm, cal, stages, use_ik=use_ik,
+                                    gripper_cam=gripper_cam)
+        finally:
+            if gripper_cam is not None:
+                try:
+                    gripper_cam.stop()
+                except Exception as e:
+                    print(f"[CV  ] WARN: gripper camera stop raised: {e}")
         elapsed = time.time() - start
 
         success = result.get("success", False)

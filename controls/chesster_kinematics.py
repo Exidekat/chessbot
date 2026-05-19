@@ -190,6 +190,8 @@ class BoardCalibration:
         self.gripper_closed_rad: Optional[float] = None
         # IK block (populated by scripts/chesster_fit_ik.py).
         self.ik: Optional[dict] = None
+        # CV-assist block (populated by scripts/chesster_calibrate_cv_assist.py).
+        self.cv_assist: Optional[dict] = None
 
     @classmethod
     def load(cls, path: str, kin: ChessterKinematics) -> "BoardCalibration":
@@ -205,7 +207,18 @@ class BoardCalibration:
         cal.gripper_open_rad = data.get("gripper_open_rad")
         cal.gripper_closed_rad = data.get("gripper_closed_rad")
         cal.ik = data.get("ik")
+        cal.cv_assist = data.get("cv_assist")
         return cal
+
+    @property
+    def has_cv_assist(self) -> bool:
+        """True iff a `cv_assist` block has been written to the
+        calibration (via scripts/chesster_calibrate_cv_assist.py)."""
+        if not self.cv_assist:
+            return False
+        return all(k in self.cv_assist for k in (
+            "mm_per_pixel", "board_x_in_image_rad", "calibration_pan_rad",
+        ))
 
     @property
     def has_ik(self) -> bool:
