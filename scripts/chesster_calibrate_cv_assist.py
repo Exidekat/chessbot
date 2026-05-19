@@ -237,8 +237,21 @@ def prompt_user_centroid(frame: np.ndarray, cfg: dict, label: str,
     candidates = _all_candidate_contours(frame, cfg)
     h, w = frame.shape[:2]
 
-    # Annotated overlay with EVERY candidate labelled
+    # Annotated overlay with EVERY candidate labelled, plus a coordinate
+    # grid so the user can read pixel coords by eye without a measuring
+    # tool. Grid lines every 50 px with labels at the top and left edges.
     overlay = frame.copy()
+    # Light grid
+    grid_color = (60, 60, 60)
+    for gx in range(0, w, 50):
+        cv2.line(overlay, (gx, 0), (gx, h), grid_color, 1)
+        cv2.putText(overlay, str(gx), (gx + 2, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+    for gy in range(0, h, 50):
+        cv2.line(overlay, (0, gy), (w, gy), grid_color, 1)
+        cv2.putText(overlay, str(gy), (2, gy + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+    # Image centre as a red diagonal cross
     cv2.drawMarker(overlay, (w // 2, h // 2), (0, 0, 255),
                     cv2.MARKER_TILTED_CROSS, 30, 2)
     for idx, (a, cu, cv_, b, d) in enumerate(candidates):
