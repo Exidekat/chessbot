@@ -68,6 +68,7 @@ from controls.chesster_kinematics import (
 )
 from controls.chesster_cv_assist import (
     capture_frame, detect_piece_centroid, probe_camera,
+    _default_cfg_with,
 )
 from cameras.gripper_camera import GripperCamera
 
@@ -158,6 +159,142 @@ def drive_to_inactive(arm: ChessterArm, cal: BoardCalibration,
 # Calibration measurement
 # ---------------------------------------------------------------------------
 
+def _all_candidate_contours(frame: np.ndarray, cfg: dict) -> list:
+    """Re-run the same threshold pipeline as detect_piece_centroid and
+    return ALL contours that survive the area filter (sorted by distance
+    from frame centre, then area descending). Used to let the user pick
+    when auto-selection lands on the wrong contour."""
+    cfg = _default_cfg_with(cfg)
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    roi_px = cfg.get("roi_px")
+    if roi_px:
+        rw, rh = int(roi_px[0]), int(roi_px[1])
+        x0 = max(0, (w - rw) // 2); y0 = max(0, (h - rh) // 2)
+        x1 = min(w, x0 + rw); y1 = min(h, y0 + rh)
+    else:
+        x0, y0, x1, y1 = 0, 0, w, h
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0:
+        return []
+    k = int(cfg["blur_kernel"])
+    if k > 1:
+        if k % 2 == 0: k += 1
+        roi = cv2.GaussianBlur(roi, (k, k), 0)
+    if cfg["threshold_mode"] == "otsu":
+        _, th = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        b = int(cfg["adaptive_block"])
+        if b % 2 == 0: b += 1
+        th = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, b, int(cfg["adaptive_c"]))
+    inv = cfg["invert"]
+    if inv is True or (inv == "auto" and th.size and th.mean() > 127):
+        th = 255 - th
+    mk = int(cfg["morph_kernel"])
+    if mk > 1:
+        th = cv2.morphologyEx(
+            th, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mk, mk)),
+        )
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_a, max_a = float(cfg["min_area_px"]), float(cfg["max_area_px"])
+    out = []
+    cx_f, cy_f = w / 2.0, h / 2.0
+    for c in contours:
+        a = cv2.contourArea(c)
+        if a < min_a or a > max_a:
+            continue
+        m = cv2.moments(c)
+        if m["m00"] == 0:
+            continue
+        cu = m["m10"]/m["m00"] + x0
+        cv_ = m["m01"]/m["m00"] + y0
+        # Sample underlying brightness in a 30x30 patch (helps the user
+        # distinguish piece (dark) from gripper hardware (lighter).
+        patch = frame[max(0, int(cv_)-15):int(cv_)+15,
+                       max(0, int(cu)-15):int(cu)+15]
+        b = float(patch.mean()) if patch.size else 0.0
+        d = ((cu - cx_f)**2 + (cv_ - cy_f)**2) ** 0.5
+        out.append((a, cu, cv_, b, d))
+    out.sort(key=lambda r: (r[4], -r[0]))  # distance asc, area desc
+    return out
+
+
+def prompt_user_centroid(frame: np.ndarray, cfg: dict, label: str,
+                         debug_path: Path) -> tuple:
+    """Detect and ask the user to confirm the centroid. Returns (u, v).
+
+    Prints the top contour candidates with area, centroid, underlying
+    patch brightness, and distance from frame centre. The user can:
+      - press Enter to accept the auto-pick (top-of-list)
+      - type a candidate index (e.g. "1") to pick a different contour
+      - type "u,v" (e.g. "349,301") to enter pixel coords directly
+      - type "r" to retry (skip the prompt and recapture later)
+    Saves an overlay PNG marking ALL candidates so the user can confirm
+    visually (scp the file, view it).
+    """
+    candidates = _all_candidate_contours(frame, cfg)
+    h, w = frame.shape[:2]
+
+    # Annotated overlay with EVERY candidate labelled
+    overlay = frame.copy()
+    cv2.drawMarker(overlay, (w // 2, h // 2), (0, 0, 255),
+                    cv2.MARKER_TILTED_CROSS, 30, 2)
+    for idx, (a, cu, cv_, b, d) in enumerate(candidates):
+        color = (0, 255, 0) if idx == 0 else (0, 200, 255)
+        cv2.drawMarker(overlay, (int(cu), int(cv_)), color,
+                        cv2.MARKER_CROSS, 22, 2)
+        cv2.putText(overlay, f"#{idx} a={int(a)}", (int(cu)+10, int(cv_)-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    cv2.putText(overlay, label, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.imwrite(str(debug_path), overlay)
+
+    print(f"  [{label}] overlay -> {debug_path}")
+    if not candidates:
+        print("  [WARN] No contours passed the area filter "
+              f"({cfg.get('min_area_px',200)}-{cfg.get('max_area_px',80000)} px). "
+              "Try a different --threshold-mode, --min-area-px or "
+              "--max-area-px, or enter pixel coords manually.")
+    else:
+        print(f"  Candidates (sorted by distance-from-centre):")
+        print(f"    {'idx':<4s} {'area_px':<10s} {'centroid':<18s} "
+              f"{'bg_bright':<10s} {'dist_centre'}")
+        for idx, (a, cu, cv_, b, d) in enumerate(candidates):
+            print(f"    {idx:<4d} {a:<10.0f} ({cu:6.1f},{cv_:6.1f})   "
+                  f"{b:<10.1f} {d:.1f}")
+
+    while True:
+        resp = input(
+            "  Press Enter to accept #0, type a candidate index "
+            "(0,1,2,...), or type pixel coords 'u,v' to override: "
+        ).strip()
+        if resp == "" and candidates:
+            a, cu, cv_, b, d = candidates[0]
+            return (float(cu), float(cv_))
+        if resp.isdigit():
+            i = int(resp)
+            if 0 <= i < len(candidates):
+                a, cu, cv_, b, d = candidates[i]
+                return (float(cu), float(cv_))
+            print(f"  [X] Index {i} out of range; please retry.")
+            continue
+        if "," in resp:
+            try:
+                u_str, v_str = resp.split(",", 1)
+                u = float(u_str.strip()); v = float(v_str.strip())
+                if not (0 <= u < w and 0 <= v < h):
+                    print(f"  [X] ({u},{v}) outside frame {w}x{h}; please retry.")
+                    continue
+                return (u, v)
+            except ValueError:
+                print("  [X] could not parse 'u,v'; please retry.")
+                continue
+        print("  [X] unrecognised input; press Enter, or type an index, "
+              "or 'u,v' coords.")
+
+
 def derive_axis_calibration(centroid_a, centroid_b, square_pitch_m: float,
                             n_squares: float = 1.0):
     """Given two centroids that represent a known board-frame displacement
@@ -214,6 +351,18 @@ def main():
                    metavar=("W", "H"),
                    help="Centred ROI for centroid detection (default: full frame)")
     p.add_argument("--threshold-mode", choices=["otsu", "adaptive"], default="otsu")
+    p.add_argument("--min-area-px", type=int, default=200,
+                   help="Lower bound on detected piece contour area (px^2). "
+                        "Lower this if the piece's contour is small at this "
+                        "camera distance (e.g. small pieces or distant pose).")
+    p.add_argument("--max-area-px", type=int, default=8000,
+                   help="Upper bound on detected piece contour area (px^2). "
+                        "Tune below the area of any STATIC feature in view "
+                        "(gripper hardware, full board half, etc.) so the "
+                        "detector can't latch onto it. Inspect "
+                        "data/cv_assist_debug/0[123]_*.png to see candidate "
+                        "areas in the printed list. Default 8000 excludes "
+                        "the typical gripper-jaw blob seen on this bench.")
     p.add_argument("--max-correction-mm", type=float, default=25.0,
                    help="Runtime safety cap on CV-assist correction magnitude "
                         "(stored in the calibration block, default 25 mm).")
@@ -392,8 +541,8 @@ def main():
         "invert": "auto",
         "blur_kernel": 5,
         "morph_kernel": 5,
-        "min_area_px": 200,
-        "max_area_px": 80000,
+        "min_area_px": int(args.min_area_px),
+        "max_area_px": int(args.max_area_px),
     }
 
     centroids = {}
@@ -434,28 +583,19 @@ def main():
               f"urdf={pan_urdf_deg:.2f}deg ({pan_urdf_rad:+.4f} rad)")
 
         # 3) Capture centroid at each of three positions: sq, next_file, next_rank.
+        # The user picks the right candidate (or enters pixel coords) per
+        # capture -- auto-detection can lock onto static features like
+        # gripper hardware visible in the FOV.
         def measure(label, save_name):
             input(f"\n[Setup] Place a chess piece at the CENTER of {label} "
                   "(remove any other pieces from view). Press Enter when ready: ")
             frame = capture_frame(cam)
             if frame is None:
                 raise RuntimeError("No frame from gripper camera")
-            centroid = detect_piece_centroid(frame, detect_cfg)
             out_path = debug_dir / f"{save_name}.png"
-            overlay = frame.copy()
-            if centroid is not None:
-                cv2.drawMarker(overlay, (int(centroid[0]), int(centroid[1])),
-                               (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
-                # Draw image center for reference
-                h, w = frame.shape[:2]
-                cv2.drawMarker(overlay, (w // 2, h // 2),
-                               (0, 0, 255), cv2.MARKER_TILTED_CROSS, 30, 2)
-            cv2.imwrite(str(out_path), overlay)
-            if centroid is None:
-                print(f"[X] No centroid detected. See {out_path} for the frame.")
-                raise RuntimeError(f"No centroid for {label}")
-            print(f"[OK] {label}: centroid u={centroid[0]:.1f} v={centroid[1]:.1f}  "
-                  f"(overlay -> {out_path})")
+            centroid = prompt_user_centroid(frame, detect_cfg, label, out_path)
+            print(f"  [OK] {label}: chosen centroid u={centroid[0]:.1f} "
+                  f"v={centroid[1]:.1f}")
             return centroid
 
         c0 = measure(f"{sq} (calibration square)", "01_center")
@@ -546,8 +686,8 @@ def main():
             "invert": "auto",
             "blur_kernel": 5,
             "morph_kernel": 5,
-            "min_area_px": 200,
-            "max_area_px": 80000,
+            "min_area_px": int(args.min_area_px),
+            "max_area_px": int(args.max_area_px),
             "max_correction_mm": float(args.max_correction_mm),
         }
         print()
