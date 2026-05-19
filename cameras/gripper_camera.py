@@ -19,12 +19,17 @@ class GripperCamera:
     and verification during robot movements.
     """
 
-    def __init__(self, camera_id: int = 1, resolution: Tuple[int, int] = (640, 480)):
+    def __init__(self, camera_id: int = 0, resolution: Tuple[int, int] = (640, 480)):
         """
         Initialize the gripper camera.
 
         Args:
-            camera_id: Camera device ID (default: 1)
+            camera_id: Camera device ID (default: 0, the Innomaker U20CAM
+                capture endpoint on the Chesster bench). The matching V4L2
+                device is /dev/video0. For UVC cameras Linux pairs the
+                capture endpoint with a metadata endpoint at the next
+                index (1) which looks "open" but returns stale frames --
+                always use the lower index.
             resolution: Desired resolution (width, height)
         """
         self.camera_id = camera_id

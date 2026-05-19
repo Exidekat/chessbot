@@ -257,7 +257,7 @@ guidance:
 
 cameras:
   global_camera_id: 0               # Overhead camera device ID
-  gripper_camera_id: 1              # Gripper camera device ID
+  gripper_camera_id: 0              # Gripper camera device ID (Innomaker U20CAM = /dev/video0; idx 1 is the UVC metadata endpoint, do not use)
   global_resolution: [1280, 720]    # Overhead camera resolution
   gripper_resolution: [640, 480]    # Gripper camera resolution
 
@@ -317,7 +317,7 @@ from cameras import CameraManager
 
 config = {
     'global_camera_id': 0,
-    'gripper_camera_id': 1,
+    'gripper_camera_id': 0,
     'overlay_path': 'data/guidance_overlay.png',
     'overlay_flag_path': 'data/overlay_ready.flag'
 }
@@ -607,7 +607,7 @@ This means we should have exactly 2 lines per script usage. Some scripts may hav
     - **4K MJPEG Downscale**: 4K MJPEG capture (3840x2160) downscaled to 720p via LANCZOS4 interpolation. Provides ~9:1 supersampling with anti-aliasing. Use `capture_4k_downscale()` or pass `--mjpeg` flag.
     - **Real-time VLA**: Native 720p MJPEG at 30fps for low latency. Used by `LiveCameraCapture` class during episode recording and VLA inference control loops.
   - **Default capture mode**: Controlled by `DEFAULT_USE_YUYV` in `utils/camera_helpers.py`. Currently set to `True` (YUYV default).
-  - **Gripper Camera (eMeet C950)**: Captures at 640x480, then resized to 224x224 for VLA input. Most cameras don't natively support 224x224.
+  - **Gripper Camera (Innomaker U20CAM-1080P-S1)**: Mounted on the arm above the gripper; capture endpoint is `/dev/video0` (the matching `/dev/video1` is the UVC metadata endpoint and returns stale buffers — do not use). Defaults: `camera_id=0`, 640x480. Used by `--cv-assist` for closed-loop pickup/place refinement and (when downscaled to 224x224) for VLA inference.
 - Detection preprocessing modes:
   - **RGB (Default)**: Both corner and piece detection use original RGB images by default. This was determined to perform better through A/B testing.
   - **Grayscale + CLAHE**: Use `--corner-grayscale` and/or `--piece-grayscale` flags to enable grayscale preprocessing.

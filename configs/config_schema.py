@@ -11,9 +11,9 @@ from pathlib import Path
 # Default configuration
 DEFAULT_CONFIG = {
     "cameras": {
-        "global_camera_id": 0,
+        "global_camera_id": 2,   # WBC-0E01 overhead = /dev/video2 (idx 3 metadata)
         "global_resolution": [1280, 720],
-        "gripper_camera_id": 1,
+        "gripper_camera_id": 0,  # Innomaker U20CAM capture = /dev/video0 (idx 1 metadata)
         "gripper_resolution": [640, 480],
     },
     "models": {

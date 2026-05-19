@@ -21,7 +21,7 @@ What it does:
 Usage:
   python scripts/chesster_calibrate_cv_assist.py
   python scripts/chesster_calibrate_cv_assist.py --square e4 --next-file-square f4
-  python scripts/chesster_calibrate_cv_assist.py --camera-id 1
+  python scripts/chesster_calibrate_cv_assist.py --camera-id 0
   python scripts/chesster_calibrate_cv_assist.py --skip-rank-check
 
 After running, verify with:
@@ -161,8 +161,11 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=str, default="auto",
                    help="Serial port for the arm (default: autodetect ttyACM*)")
-    p.add_argument("--camera-id", type=int, default=1,
-                   help="Gripper-camera device id (default 1)")
+    p.add_argument("--camera-id", type=int, default=0,
+                   help="Gripper-camera device id (default 0, the Innomaker "
+                        "U20CAM capture endpoint = /dev/video0; id 1 is the "
+                        "matching metadata endpoint and won't return live "
+                        "frames). Try v4l2-ctl --list-devices to confirm.")
     p.add_argument("--camera-resolution", type=int, nargs=2, default=[640, 480],
                    metavar=("W", "H"), help="Gripper-camera resolution")
     p.add_argument("--cal-path", type=str, default=None,

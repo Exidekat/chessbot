@@ -158,7 +158,7 @@ from cameras import CameraManager
 
 config = {
     'global_camera_id': 0,
-    'gripper_camera_id': 1,
+    'gripper_camera_id': 0,
     'overlay_path': 'data/guidance_overlay.png',
     'overlay_flag_path': 'data/overlay_ready.flag'
 }

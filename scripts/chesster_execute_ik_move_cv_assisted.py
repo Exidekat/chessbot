@@ -551,8 +551,11 @@ def main():
                              "calibration JSON -- run "
                              "scripts/chesster_calibrate_cv_assist.py once "
                              "to populate it.")
-    parser.add_argument("--cv-assist-camera-id", type=int, default=1,
-                        help="Gripper-camera device id (default 1)")
+    parser.add_argument("--cv-assist-camera-id", type=int, default=0,
+                        help="Gripper-camera device id (default 0, the "
+                             "Innomaker U20CAM capture endpoint = "
+                             "/dev/video0). The next index is the metadata "
+                             "endpoint and returns stale buffers.")
     parser.add_argument("--cv-assist-camera-resolution", type=int, nargs=2,
                         default=[640, 480], metavar=("W", "H"))
     args = parser.parse_args()

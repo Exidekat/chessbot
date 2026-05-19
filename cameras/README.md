@@ -41,7 +41,7 @@ Arm-mounted camera for close-up views:
 ```python
 from cameras import GripperCamera
 
-camera = GripperCamera(camera_id=1, resolution=(640, 480))
+camera = GripperCamera(camera_id=0, resolution=(640, 480))
 camera.start()
 
 # Get latest frame
@@ -102,7 +102,7 @@ from cameras import CameraManager
 config = {
     'global_camera_id': 0,
     'global_resolution': (1280, 720),
-    'gripper_camera_id': 1,
+    'gripper_camera_id': 0,
     'gripper_resolution': (640, 480),
     'overlay_path': 'data/guidance_overlay.png',
     'overlay_flag_path': 'data/overlay_ready.flag'

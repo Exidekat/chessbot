@@ -59,7 +59,7 @@ class CameraManager:
         )
 
         self.gripper_camera = GripperCamera(
-            camera_id=config.get('gripper_camera_id', 1),
+            camera_id=config.get('gripper_camera_id', 0),
             resolution=config.get('gripper_resolution', (640, 480))
         )
 
@@ -97,7 +97,7 @@ class CameraManager:
         config = {
             'global_camera_id': camera_config.get('global_camera_id', 0),
             'global_resolution': tuple(camera_config.get('global_resolution', [1280, 720])),
-            'gripper_camera_id': camera_config.get('gripper_camera_id', 1),
+            'gripper_camera_id': camera_config.get('gripper_camera_id', 0),
             'gripper_resolution': tuple(camera_config.get('gripper_resolution', [640, 480])),
             'overlay_path': path_config.get('overlay_image', 'data/guidance_overlay.png'),
             'overlay_flag_path': path_config.get('overlay_flag', 'data/overlay_ready.flag'),
