@@ -126,6 +126,13 @@ class BoardCalibration:
                  "top":    {"xyz_meters": [...], "joint_angles_deg": {...}}},
           "h1": {...}, "a8": {...}, "h8": {...}
         },
+        "grid_extras": {                # optional, enables biquadratic interp
+          "mid_de1":  {bottom, top},    # rank-1 edge midpoint (between d1 and e1)
+          "mid_de8":  {bottom, top},    # rank-8 edge midpoint
+          "mid_a45":  {bottom, top},    # file-a edge midpoint (between a4 and a5)
+          "mid_h45":  {bottom, top},    # file-h edge midpoint
+          "center":   {bottom, top}     # board center (between d4/d5/e4/e5)
+        },
         "graveyard": {"xyz_meters": [...], "joint_angles_deg": {...}},
         "gripper_open_rad": float,
         "gripper_closed_rad": float,
@@ -133,19 +140,56 @@ class BoardCalibration:
         "inactive_rad": {joint_name: float, ..., "gripper": float},
         "computed": {"z_bottom_m": ..., "z_top_m": ..., ...}
       }
+
+    Interpolation:
+      - If `grid_extras` is fully populated, get_joint_angles uses biquadratic
+        Lagrange tensor-product interpolation over a 3x3 grid (corners + 5
+        midpoints). This captures the joint-space non-linearity that makes
+        bilinear-from-corners-alone systematically miss interior squares by
+        up to one rank.
+      - Otherwise, falls back to bilinear from the 4 corners.
     """
 
     _CORNER_NAMES = ("a1", "h1", "a8", "h8")
 
+    # 3x3 grid layout for biquadratic interpolation. Grid coordinates
+    # (i, j) range over {0, 1, 2} in each axis; each cell maps to a
+    # calibration source (either a corner or a `grid_extras` entry) and
+    # a normalized (u, v) ∈ {0, 0.5, 1} that matches the Lagrange basis
+    # node positions.
+    #
+    #   (i, j)  →  (kind, name, u_node, v_node)
+    _GRID_LAYOUT = [
+        # i=0 (u=0, file a)
+        [("corner", "a1",      0.0, 0.0),
+         ("extras", "mid_a45", 0.0, 0.5),
+         ("corner", "a8",      0.0, 1.0)],
+        # i=1 (u=0.5, between files d and e)
+        [("extras", "mid_de1", 0.5, 0.0),
+         ("extras", "center",  0.5, 0.5),
+         ("extras", "mid_de8", 0.5, 1.0)],
+        # i=2 (u=1, file h)
+        [("corner", "h1",      1.0, 0.0),
+         ("extras", "mid_h45", 1.0, 0.5),
+         ("corner", "h8",      1.0, 1.0)],
+    ]
+
+    _GRID_EXTRAS_NAMES = (
+        "mid_de1", "mid_de8", "mid_a45", "mid_h45", "center",
+    )
+
     def __init__(self, kin: ChessterKinematics):
         self.kin = kin
         self.corners: dict = {}
+        self.grid_extras: dict = {}
         self.graveyard: Optional[dict] = None
         self.computed: Optional[dict] = None
         self.home_rad: Optional[dict] = None
         self.inactive_rad: Optional[dict] = None
         self.gripper_open_rad: Optional[float] = None
         self.gripper_closed_rad: Optional[float] = None
+        # IK block (populated by scripts/chesster_fit_ik.py).
+        self.ik: Optional[dict] = None
 
     @classmethod
     def load(cls, path: str, kin: ChessterKinematics) -> "BoardCalibration":
@@ -153,13 +197,36 @@ class BoardCalibration:
             data = json.load(f)
         cal = cls(kin)
         cal.corners = data.get("corners", {}) or {}
+        cal.grid_extras = data.get("grid_extras", {}) or {}
         cal.graveyard = data.get("graveyard")
         cal.computed = data.get("computed")
         cal.home_rad = data.get("home_rad")
         cal.inactive_rad = data.get("inactive_rad")
         cal.gripper_open_rad = data.get("gripper_open_rad")
         cal.gripper_closed_rad = data.get("gripper_closed_rad")
+        cal.ik = data.get("ik")
         return cal
+
+    @property
+    def has_ik(self) -> bool:
+        """True iff a fitted ik block is available (encoder offsets +
+        joint signs + board pose). When True, `get_joint_angles` will
+        use closed-form IK by default; pass use_ik=False to force
+        interpolation."""
+        if not self.ik:
+            return False
+        return all(k in self.ik for k in (
+            "encoder_offsets_deg", "joint_signs", "board_pose_in_robot",
+            "square_pitch_m",
+        ))
+
+    def has_full_grid(self, plane: str = "bottom") -> bool:
+        """True iff all 5 grid_extras midpoints are present at the given plane."""
+        for name in self._GRID_EXTRAS_NAMES:
+            entry = self.grid_extras.get(name)
+            if not entry or plane not in entry:
+                return False
+        return True
 
     @property
     def is_calibrated(self) -> bool:
@@ -241,18 +308,31 @@ class BoardCalibration:
         self,
         square: str,
         plane: str,
-        seed: Optional[dict] = None,  # accepted for API compat; unused
+        seed: Optional[dict] = None,
+        use_ik: Optional[bool] = None,
     ) -> dict:
         """Resolve joint angles for a board square at a given plane via
-        bilinear interpolation across the four recorded corner poses.
+        biquadratic (9-point) or bilinear (4-corner) interpolation across
+        the recorded calibration poses.
 
         We interpolate directly in joint space rather than calling IK on
         the FK-reported corner XYZs: the Chesster URDF's link lengths are
         correct, but per-motor encoder zero offsets are not yet calibrated
-        out, so FK is numerically unreliable. The corner joint angles
-        themselves are ground truth (the user physically moved the arm to
-        those poses), so interpolating between them produces correct arm
-        poses for any square on the board to within ~1 cm at the TCP.
+        out, so FK is numerically unreliable. The recorded joint angles
+        are ground truth (the user physically moved the arm to those
+        poses), so interpolating between them produces correct arm poses.
+
+        Bilinear from 4 corners alone has a known limitation: the arm's
+        joint-to-Cartesian map is non-linear (shoulder_lift in particular
+        covers ~78° across the board), so the joint-space midpoint does
+        NOT correspond to the board midpoint -- interior squares get
+        biased by up to ~1 rank. Adding 5 midpoint calibration poses
+        (`grid_extras` block) lets us use **piecewise bilinear** on a 3x3
+        grid: the target's (u,v) is localized to one of four sub-cells
+        (each spanning half the board) and bilinearly interpolated from
+        that sub-cell's 4 anchors. This captures non-linearity AND avoids
+        the Runge-phenomenon overshoot that pure biquadratic (a single
+        polynomial through 9 points) produces on highly non-linear fields.
 
         For 'graveyard' the stored joint angles are returned directly.
         """
@@ -266,20 +346,164 @@ class BoardCalibration:
         if plane not in ("bottom", "top"):
             raise ValueError(f"Unknown plane: {plane!r}")
 
+        # Default: use IK if a fitted ik block is available, else interp.
+        # `use_ik=False` forces the interp path (e.g., for the
+        # --interpolation flag in the execute script).
+        if use_ik is None:
+            use_ik = self.has_ik
+        if use_ik and self.has_ik:
+            return self._joint_angles_via_ik(square, plane, seed)
+
         file_idx, rank_idx = self._parse_square(square)
         u = file_idx / 7.0  # a->0, h->1
         v = rank_idx / 7.0  # 1->0, 8->1
 
-        # Fallback for joints that weren't recorded at every corner. The
-        # pre-swap calibration only captured motors 1-4 per corner, which
-        # under Chesster's true wiring means shoulder_lift (motor 5) is
-        # absent from every corner. To keep validation/execute runnable
-        # before a full re-calibration, fall back to HOME's value for any
-        # missing joint -- effectively holding that joint at its HOME
-        # position across the board. Joint-space interp degrades to "lift
-        # constant" until the user re-records corners.
+        # Fallback for joints that weren't recorded at every corner.
         home_fallback_deg = self._home_to_midpoint_deg()
 
+        if self.has_full_grid(plane):
+            return self._piecewise_bilinear_interp(u, v, plane, home_fallback_deg)
+        return self._bilinear_interp(u, v, plane, home_fallback_deg)
+
+    def _joint_angles_via_ik(self, square: str, plane: str,
+                             seed: Optional[dict]) -> dict:
+        """Closed-form IK from the fitted ik block.
+
+        Maps the requested chess square to a target XYZ in the robot base
+        frame (using the fitted board pose + square pitch), runs the
+        Chesster 4-DOF IK with the nearest-anchor seed for branch
+        selection, then converts URDF angles back to servo angles via
+        the fitted signs and offsets.
+        """
+        import numpy as np
+        from controls.chesster_ik_fit import (
+            chesster_ik, servo_to_urdf, urdf_to_servo,
+        )
+
+        ik = self.ik
+        offsets = ik["encoder_offsets_deg"]
+        signs = ik["joint_signs"]
+        T = np.array(ik["board_pose_in_robot"])
+        pitch = ik["square_pitch_m"]
+        top_h = ik.get("top_plane_height_m", 0.10)
+        # Board-frame correction applied to every IK target. Accounts for
+        # any systematic bias between the gripper-tip pose recorded
+        # during calibration and the effective grasping point during
+        # pickup -- e.g. if the URDF TCP is offset from the centerline
+        # between the gripper jaws, or if the user calibrated against a
+        # consistent fraction-of-a-square offset. Tunable via
+        # scripts/chesster_set_tcp_offset.py.
+        tcp_off = np.array(ik.get("tcp_offset_board_m", [0.0, 0.0, 0.0]))
+
+        file_idx, rank_idx = self._parse_square(square)
+        z_board = top_h if plane == "top" else 0.0
+        p_board = np.array([file_idx * pitch, rank_idx * pitch, z_board]) + tcp_off
+        p_robot = T[:3, :3] @ p_board + T[:3, 3]
+
+        # Seed: prefer caller-supplied (last commanded pose, for trajectory
+        # continuity). Otherwise use the nearest calibrated anchor's
+        # recorded pose, converted to URDF angles.
+        if seed is not None:
+            seed_urdf = servo_to_urdf(seed, offsets, signs)
+        else:
+            nearest_servo = self._nearest_anchor_joints(square, plane)
+            seed_urdf = servo_to_urdf(nearest_servo, offsets, signs)
+
+        j_urdf = chesster_ik(p_robot, seed_joints_deg=seed_urdf)
+        j_servo = urdf_to_servo(j_urdf, offsets, signs)
+        return {k: round(float(v), 3) for k, v in j_servo.items()}
+
+    def _nearest_anchor_joints(self, square: str, plane: str) -> dict:
+        """Return the joint_angles_deg of the calibrated anchor closest
+        to `square` in (file, rank) board coordinates."""
+        target_f, target_r = self._parse_square(square)
+        anchor_specs = {
+            "a1": (0, 0), "h1": (7, 0), "a8": (0, 7), "h8": (7, 7),
+            "mid_de1": (3.5, 0), "mid_de8": (3.5, 7),
+            "mid_a45": (0, 3.5), "mid_h45": (7, 3.5),
+            "center": (3.5, 3.5),
+        }
+        best, dmin = None, float("inf")
+        for name, (fx, fy) in anchor_specs.items():
+            src = self.corners.get(name) or self.grid_extras.get(name)
+            if not src or plane not in src:
+                continue
+            d = (fx - target_f) ** 2 + (fy - target_r) ** 2
+            if d < dmin:
+                dmin, best = d, src[plane]["joint_angles_deg"]
+        if best is None:
+            raise ValueError(f"No anchors available for plane {plane!r}")
+        return best
+
+    def _joint_at_grid(self, i: int, j: int, plane: str, name: str,
+                       home_fallback_deg: dict) -> float:
+        """Look up joint `name` at grid cell (i, j) for the given plane,
+        falling back to HOME if the cell is missing that joint."""
+        kind, src_name, _, _ = self._GRID_LAYOUT[i][j]
+        bucket = self.corners if kind == "corner" else self.grid_extras
+        entry = bucket.get(src_name)
+        if entry is None:
+            raise KeyError(f"Grid cell ({i},{j}) source {kind}:{src_name} missing")
+        plane_entry = entry.get(plane)
+        if plane_entry is None:
+            raise KeyError(f"Grid cell ({i},{j}) source {src_name} missing plane {plane!r}")
+        joints = plane_entry["joint_angles_deg"]
+        if name in joints:
+            return float(joints[name])
+        if name in home_fallback_deg:
+            return home_fallback_deg[name]
+        raise KeyError(
+            f"Grid cell ({i},{j}) [{src_name} {plane}] is missing joint "
+            f"'{name}' and no HOME fallback is available. Re-run "
+            f"scripts/chesster_calibrate_ik.py to record full poses."
+        )
+
+    def _piecewise_bilinear_interp(self, u: float, v: float, plane: str,
+                                   home_fallback_deg: dict) -> dict:
+        """Piecewise bilinear over the 3x3 grid.
+
+        Locate the 2x2 sub-cell that contains (u, v), then bilinearly
+        interpolate using the 4 anchors of that sub-cell. Sub-cells are:
+
+          left  (i=0..1)  |  right (i=1..2)
+          lower (j=0..1)  |  upper (j=1..2)
+
+        At sub-cell boundaries (u=0.5 or v=0.5) the interpolation is
+        continuous (both adjacent sub-cells agree on the shared anchor),
+        so the field is C^0 across the whole board.
+        """
+        # Pick sub-cell indices in {0, 1} along each axis.
+        ci = 0 if u <= 0.5 else 1  # column block
+        cj = 0 if v <= 0.5 else 1  # row block
+
+        # Normalize (u, v) to [0, 1] within the sub-cell. Each sub-cell
+        # spans 0.5 in (u, v), starting at ci*0.5 / cj*0.5.
+        lu = (u - ci * 0.5) / 0.5
+        lv = (v - cj * 0.5) / 0.5
+
+        # 4 anchors of this sub-cell at grid indices (ci, cj), (ci+1, cj),
+        # (ci, cj+1), (ci+1, cj+1).
+        i0, i1 = ci, ci + 1
+        j0, j1 = cj, cj + 1
+
+        result: dict = {}
+        for name in ARM_JOINT_NAMES:
+            v00 = self._joint_at_grid(i0, j0, plane, name, home_fallback_deg)
+            v10 = self._joint_at_grid(i1, j0, plane, name, home_fallback_deg)
+            v01 = self._joint_at_grid(i0, j1, plane, name, home_fallback_deg)
+            v11 = self._joint_at_grid(i1, j1, plane, name, home_fallback_deg)
+            result[name] = round(
+                (1 - lu) * (1 - lv) * v00
+                + lu * (1 - lv) * v10
+                + (1 - lu) * lv * v01
+                + lu * lv * v11,
+                3,
+            )
+        return result
+
+    def _bilinear_interp(self, u: float, v: float, plane: str,
+                         home_fallback_deg: dict) -> dict:
+        """Bilinear fallback when grid_extras is missing or incomplete."""
         def joint_at(corner: str, name: str) -> float:
             j = self.corners[corner][plane]["joint_angles_deg"]
             if name in j:

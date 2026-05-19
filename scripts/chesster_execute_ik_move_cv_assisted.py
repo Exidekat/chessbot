@@ -276,7 +276,9 @@ def load_calibration():
     INACTIVE_RAD = np.array([cal.inactive_rad[n] for n in all_names])
     print(f"  Inactive position loaded ({len(INACTIVE_RAD)} joints)")
 
-    print("[OK] Loaded calibration (motion mode: joint-space interpolation)")
+    mode = ("closed-form IK" if cal.has_ik
+            else "joint-space interpolation (no IK block fitted)")
+    print(f"[OK] Loaded calibration (default motion mode: {mode})")
     return kin, cal
 
 
@@ -357,9 +359,13 @@ def detect_and_compute(args) -> dict:
 # Two-plane pick-and-place execution
 # ---------------------------------------------------------------------------
 
-def execute_stages(arm: ChessterArm, cal: BoardCalibration, stages: list) -> dict:
+def execute_stages(arm: ChessterArm, cal: BoardCalibration, stages: list,
+                   use_ik: bool = True) -> dict:
     seed = None
     results = []
+
+    def angles(sq, plane, seed):
+        return cal.get_joint_angles(sq, plane, seed, use_ik=use_ik)
 
     for i, stage in enumerate(stages):
         pick_sq = stage.get("pickup_square") or "graveyard"
@@ -368,22 +374,22 @@ def execute_stages(arm: ChessterArm, cal: BoardCalibration, stages: list) -> dic
 
         try:
             try:
-                pick_top = cal.get_joint_angles(pick_sq, "top", seed)
+                pick_top = angles(pick_sq, "top", seed)
             except ValueError as ik_err:
                 xyz = cal.square_to_xyz(pick_sq, "top")
                 print(f"    [WARN] Top-plane IK failed for {pick_sq}: {ik_err}")
                 print(f"           target={xyz.round(4).tolist()}, falling back to bottom")
-                pick_top = cal.get_joint_angles(pick_sq, "bottom", seed)
-            pick_bottom = cal.get_joint_angles(pick_sq, "bottom", pick_top)
+                pick_top = angles(pick_sq, "bottom", seed)
+            pick_bottom = angles(pick_sq, "bottom", pick_top)
 
             try:
-                place_top = cal.get_joint_angles(place_sq, "top", pick_top)
+                place_top = angles(place_sq, "top", pick_top)
             except ValueError as ik_err:
                 xyz = cal.square_to_xyz(place_sq, "top")
                 print(f"    [WARN] Top-plane IK failed for {place_sq}: {ik_err}")
                 print(f"           target={xyz.round(4).tolist()}, falling back to bottom")
-                place_top = cal.get_joint_angles(place_sq, "bottom", pick_top)
-            place_bottom = cal.get_joint_angles(place_sq, "bottom", place_top)
+                place_top = angles(place_sq, "bottom", pick_top)
+            place_bottom = angles(place_sq, "bottom", place_top)
         except ValueError as e:
             print(f"    [X] IK failed: {e}")
             results.append({"stage": i, "success": False, "error": str(e)})
@@ -464,6 +470,12 @@ def main():
                              "stage step, cleanup) and require ENTER to "
                              "proceed. Type 'a' to abort cleanly (drives to "
                              "INACTIVE via HOME then exits).")
+    parser.add_argument("--interpolation", action="store_true",
+                        help="Use piecewise-bilinear joint-space interpolation "
+                             "across the calibrated 3x3 anchor grid instead "
+                             "of the fitted IK. Useful as a fallback if the "
+                             "IK block in the calibration is missing or you "
+                             "want to compare behaviours.")
     args = parser.parse_args()
 
     global MANUAL_MODE
@@ -597,9 +609,13 @@ def main():
         else:
             print("[Preflight] WARN: no HOME pose loaded -- motion may be unsafe.")
 
-        print(f"\n[Execute] {best_move['san']} via ChessterArm on {port}...")
+        # Default to IK; flip to interpolation if user passed --interpolation
+        # OR if no fitted ik block is in the calibration.
+        use_ik = (not args.interpolation) and cal.has_ik
+        print(f"\n[Execute] {best_move['san']} via ChessterArm on {port} "
+              f"(mode={'IK' if use_ik else 'interpolation'})...")
         start = time.time()
-        result = execute_stages(arm, cal, stages)
+        result = execute_stages(arm, cal, stages, use_ik=use_ik)
         elapsed = time.time() - start
 
         success = result.get("success", False)

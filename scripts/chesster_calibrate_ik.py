@@ -19,11 +19,16 @@ and computes forward kinematics via `controls.chesster_kinematics`
 (placo-based, backed by data/urdf/chesster.urdf).
 
 Usage:
-    # Standard calibration
+    # Standard calibration (4 corners only -> bilinear interp)
     python scripts/chesster_calibrate_ik.py
 
     # Skip graveyard recording
     python scripts/chesster_calibrate_ik.py --skip-graveyard
+
+    # Add 5 midpoint poses to enable biquadratic interp (after corners exist).
+    # Recommended when bilinear-from-corners-alone gives off-by-one rank
+    # bias in interior squares (~1 rank short of the requested rank).
+    python scripts/chesster_calibrate_ik.py --grid-extras
 
     # Custom serial port and output path
     python scripts/chesster_calibrate_ik.py --port /dev/ttyACM1 --output data/cal.json
@@ -47,6 +52,26 @@ from controls.chesster_kinematics import (
 
 
 CORNERS = ["a1", "h1", "a8", "h8"]
+
+
+# Grid-extras: 5 midpoint poses that promote the calibration from 4-corner
+# bilinear (which has a known rank-axis bias up to ~1 rank in the middle of
+# the board) to a 9-point biquadratic Lagrange interpolation. Each entry:
+#   (name, description shown to user, file_idx, rank_idx)
+# The physical placement is the gripper tip at the geometric midpoint
+# described -- between square centers, NOT inside one square.
+GRID_EXTRAS_SPECS = [
+    ("mid_de1", "midpoint of rank-1 edge (between centers of d1 and e1)",
+     3.5, 0.0),
+    ("mid_de8", "midpoint of rank-8 edge (between centers of d8 and e8)",
+     3.5, 7.0),
+    ("mid_a45", "midpoint of file-a edge (between centers of a4 and a5)",
+     0.0, 3.5),
+    ("mid_h45", "midpoint of file-h edge (between centers of h4 and h5)",
+     7.0, 3.5),
+    ("center",  "center of the board (intersection of d4/d5/e4/e5)",
+     3.5, 3.5),
+]
 
 
 def resolve_port(port: str) -> str:
@@ -137,12 +162,18 @@ def main():
     parser.add_argument("--home-only", action="store_true",
                         help="Only re-record the HOME pose; leaves corners, "
                              "graveyard, gripper, and INACTIVE untouched.")
+    parser.add_argument("--grid-extras", action="store_true",
+                        help="Only record the 5 midpoint poses that enable "
+                             "biquadratic interpolation. Requires existing "
+                             "calibration with 4 corners (bottom+top). Each "
+                             "midpoint is recorded at both bottom and top.")
     args = parser.parse_args()
 
-    exclusive = sum([args.gripper_only, args.top_only, args.home_only])
+    exclusive = sum([args.gripper_only, args.top_only, args.home_only,
+                     args.grid_extras])
     if exclusive > 1:
-        print("[X] --gripper-only, --top-only, --home-only are mutually exclusive",
-              file=sys.stderr)
+        print("[X] --gripper-only, --top-only, --home-only, --grid-extras "
+              "are mutually exclusive", file=sys.stderr)
         return 1
 
     output_path = args.output or default_output_path()
@@ -167,7 +198,7 @@ def main():
     print(f"[OK] Direct serial connection to {port}")
     print()
 
-    if args.gripper_only or args.top_only or args.home_only:
+    if args.gripper_only or args.top_only or args.home_only or args.grid_extras:
         if not Path(output_path).exists():
             print(f"[X] No existing calibration at {output_path}", file=sys.stderr)
             arm.disconnect()
@@ -175,13 +206,25 @@ def main():
         with open(output_path) as f:
             calibration = json.load(f)
         print(f"[OK] Loaded existing calibration (v{calibration.get('version')})")
-        if args.top_only:
+        if args.top_only or args.grid_extras:
             for c in CORNERS:
                 if c not in calibration.get("corners", {}):
                     print(f"[X] Existing calibration is missing corner {c}; "
                           "run a full calibration first.", file=sys.stderr)
                     arm.disconnect()
                     return 1
+        if args.grid_extras:
+            # Each corner must have both bottom and top recorded so the
+            # biquadratic interp has all 9 grid points at both planes.
+            for c in CORNERS:
+                entry = calibration.get("corners", {}).get(c) or {}
+                for plane in ("bottom", "top"):
+                    if plane not in entry:
+                        print(f"[X] Corner {c} is missing the {plane} plane; "
+                              "run a full or --top-only calibration first.",
+                              file=sys.stderr)
+                        arm.disconnect()
+                        return 1
     else:
         calibration = {
             "version": 4,
@@ -206,6 +249,12 @@ def main():
         print("TOP-ONLY MODE: re-recording the 4 corner TOP positions only.")
         print("  Aim for ~10-15 cm above the board surface. Use the shoulder")
         print("  LIFT joint to gain height -- wrist tilt alone gives ~3-6 cm.")
+    elif args.grid_extras:
+        print("GRID-EXTRAS MODE: recording 5 midpoint poses for biquadratic")
+        print("  interpolation. Each midpoint is recorded at BOTH planes.")
+        print("  Existing corners stay untouched. These extras let the")
+        print("  interpolator capture rank-axis non-linearity that bilinear")
+        print("  alone systematically misses (~1-rank shift in middle).")
     else:
         print("INSTRUCTIONS:")
         print("  For each corner you will position the gripper twice:")
@@ -236,6 +285,40 @@ def main():
             print(f"  [OK] Home (rad): {json.dumps(calibration['home_rad'])}")
             print()
             cleanup()
+        elif args.grid_extras:
+            calibration.setdefault("grid_extras", {})
+            for name, desc, _file_idx, _rank_idx in GRID_EXTRAS_SPECS:
+                print(f"{'=' * 60}")
+                print(f"GRID EXTRA: {name}")
+                print(f"  Physical target: {desc}")
+                print(f"{'=' * 60}")
+
+                input(f"  Position gripper at {name} BOTTOM "
+                      "(tip touching the board at the midpoint). Press Enter...")
+                print(f"  Recording {name} bottom...")
+                bottom = record_position(arm, f"{name} bottom")
+
+                input(f"  Raise gripper to {name} TOP (~10-15 cm above "
+                      "the board at the same X/Y). Press Enter...")
+                print(f"  Recording {name} top...")
+                top = record_position(arm, f"{name} top")
+
+                lift_delta = abs(top["joint_angles_deg"]["shoulder_lift"]
+                                 - bottom["joint_angles_deg"]["shoulder_lift"])
+                if lift_delta < 3.0:
+                    print(f"  [WARN] shoulder_lift moved only {lift_delta:.1f}deg "
+                          "between bottom and top -- transit height likely "
+                          "insufficient for tall pieces. Aim for 10+ deg of lift.")
+                    redo = input(f"  Re-record {name} TOP? [y/N] ").strip().lower()
+                    if redo == "y":
+                        input(f"  Raise gripper to {name} TOP. Press Enter...")
+                        top = record_position(arm, f"{name} top")
+
+                calibration["grid_extras"][name] = {"bottom": bottom, "top": top}
+                print(f"  [OK] {name}: lift_delta={lift_delta:.1f}deg")
+                print()
+            # Bump version to advertise biquadratic-capable schema.
+            calibration["version"] = max(int(calibration.get("version", 4)), 5)
         elif args.top_only:
             for corner in CORNERS:
                 print(f"{'=' * 60}")
@@ -307,9 +390,9 @@ def main():
                 print(f"  [OK] Graveyard: XYZ = {graveyard['xyz_meters']}")
                 print()
 
-        # Gripper / HOME / INACTIVE are skipped in --top-only and
-        # --home-only modes (already handled or not relevant).
-        if not args.top_only and not args.home_only:
+        # Gripper / HOME / INACTIVE are skipped in --top-only, --home-only,
+        # and --grid-extras modes (already handled or not relevant).
+        if not args.top_only and not args.home_only and not args.grid_extras:
             # Gripper open
             print(f"{'=' * 60}")
             print("GRIPPER OPEN")
@@ -367,7 +450,7 @@ def main():
         # the 4 recorded corners; the FK-derived XYZ block below is
         # informational only (and currently unreliable until per-motor
         # encoder zeros are aligned with the URDF mechanical zero).
-        if not args.gripper_only and not args.home_only:
+        if not args.gripper_only and not args.home_only and not args.grid_extras:
             print(f"{'=' * 60}")
             print("CALIBRATION SUMMARY (joint-space interpolation)")
             print(f"{'=' * 60}")
