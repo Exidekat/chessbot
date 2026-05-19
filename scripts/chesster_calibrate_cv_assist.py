@@ -730,7 +730,10 @@ def main():
         # from arbitrary poses (longer links than SO-101 mean it would drop
         # over the board). Always retreat to INACTIVE before disabling
         # motors. Skip the retreat only if we never enabled torque or the
-        # arm is no longer connected.
+        # arm is no longer connected. Catch KeyboardInterrupt too, not
+        # just Exception -- Ctrl-C during the retreat motion otherwise
+        # propagates past the disconnect block and leaves the arm
+        # torqued mid-motion.
         try:
             cam.stop()
         except Exception:
@@ -742,6 +745,9 @@ def main():
                 if not ok:
                     print("[Cleanup] WARN: INACTIVE retreat reported failure. "
                           "Brace the arm before torque release.")
+        except KeyboardInterrupt:
+            print("[Cleanup] Interrupted during INACTIVE retreat; "
+                  "BRACE THE ARM -- torque release is next.")
         except Exception as e:
             print(f"[Cleanup] WARN: failed during INACTIVE retreat: {e}")
         try:

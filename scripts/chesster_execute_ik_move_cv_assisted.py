@@ -603,36 +603,43 @@ def main():
         return 1
 
     def cleanup(retreat: bool):
-        """Optionally retreat via HOME -> INACTIVE, then release torque + disconnect.
+        """Retreat via HOME -> INACTIVE, then release torque + disconnect.
 
         Joint-space interpolation can sweep through unsafe Cartesian space
         between two distant poses (e.g. over-board -> folded). Routing
         through HOME first keeps every leg short and predictable since
         HOME is calibrated as a known-safe above-the-board pose.
 
-        In --manual mode each cleanup leg is gated by ENTER as well.
-        Manual aborts during cleanup itself are silently swallowed and
-        the torque is released regardless -- safer to let the user
-        finalize by hand than to leave the arm stuck.
+        SAFETY: cleanup is intentionally NON-INTERACTIVE even in --manual
+        mode. Asking the user for ENTER between cleanup legs and giving
+        them an 'a' abort was disastrous: either input choice (Ctrl-C
+        from the prompt OR typing 'a') skipped past the per-leg handler
+        and fell into the outer `finally`, releasing torque while the arm
+        was still in the air over the board. Chesster's longer links make
+        that drop into the board surface. Now both retreat legs run to
+        completion without prompts; Ctrl-C during a motion leg is caught
+        and we still attempt the next leg before releasing torque.
         """
         try:
             if retreat:
                 if HOME_RAD is not None:
-                    print("[Cleanup] Driving arm to HOME pose...")
+                    print("[Cleanup] Driving arm to HOME pose "
+                          "(non-interactive: safety-critical)...")
                     try:
-                        _manual_gate("cleanup HOME")
                         go_home(arm)
-                    except _ManualAbort:
-                        print("[Cleanup] manual abort during HOME leg.")
+                    except KeyboardInterrupt:
+                        print("[Cleanup] Interrupted during HOME; "
+                              "attempting INACTIVE retreat anyway.")
                     except Exception as e:
                         print(f"[Cleanup] WARN: failed to reach HOME: {e}")
                 if INACTIVE_RAD is not None:
-                    print("[Cleanup] Driving arm to INACTIVE pose...")
+                    print("[Cleanup] Driving arm to INACTIVE pose "
+                          "(non-interactive: safety-critical)...")
                     try:
-                        _manual_gate("cleanup INACTIVE")
                         go_inactive(arm)
-                    except _ManualAbort:
-                        print("[Cleanup] manual abort during INACTIVE leg.")
+                    except KeyboardInterrupt:
+                        print("[Cleanup] Interrupted during INACTIVE; "
+                              "BRACE THE ARM -- torque release is next.")
                     except Exception as e:
                         print(f"[Cleanup] WARN: failed to reach INACTIVE: {e}")
         finally:

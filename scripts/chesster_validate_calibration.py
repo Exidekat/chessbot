@@ -426,6 +426,10 @@ def main():
         traceback.print_exc()
 
     # ----- Cleanup: drive directly to INACTIVE -----
+    # SAFETY: must complete (or at least attempt) the retreat before
+    # releasing torque, even if the user spams Ctrl-C. Catch the interrupt
+    # explicitly so we don't skip disconnect() and leave the arm torqued
+    # in mid-motion.
     print()
     print("Cleanup: returning to INACTIVE before releasing torque.")
     try:
@@ -434,6 +438,9 @@ def main():
         state = arm.get_state()
         final_dist = pose_distance_max(state.joint_positions, inactive_arr)
         print(f"  [OK] At INACTIVE (final max delta: {final_dist:.3f} rad)")
+    except KeyboardInterrupt:
+        print("  [WARN] Cleanup retreat interrupted; arm may not be "
+              "safely parked. BRACE THE ARM -- torque release is next.")
     except Exception as e:
         print(f"  [WARN] failed to reach INACTIVE: {e}")
 
