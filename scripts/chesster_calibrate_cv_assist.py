@@ -119,6 +119,20 @@ def drive_to_joints(arm: ChessterArm, target_5: np.ndarray,
     return bool(ok)
 
 
+def drive_to_inactive(arm: ChessterArm, cal: BoardCalibration,
+                      duration_s: float = 2.5) -> bool:
+    """Drive the arm to the calibrated INACTIVE pose. Returns True on
+    successful trajectory completion. Safety-critical on Chesster:
+    INACTIVE is the only pose where torque release will NOT drop the
+    arm onto the board / chassis."""
+    if cal.inactive_rad is None:
+        print("[X] No INACTIVE pose in calibration; cannot park safely.",
+              file=sys.stderr)
+        return False
+    target = np.array([cal.inactive_rad[n] for n in JOINT_NAMES_BY_INDEX])
+    return drive_to_joints(arm, target, duration_s)
+
+
 # ---------------------------------------------------------------------------
 # Calibration measurement
 # ---------------------------------------------------------------------------
@@ -426,11 +440,24 @@ def main():
         print("\n[X] Cancelled by user.")
         return 1
     finally:
-        # Always release torque cleanly.
+        # SAFETY-CRITICAL on Chesster: the arm cannot have torque released
+        # from arbitrary poses (longer links than SO-101 mean it would drop
+        # over the board). Always retreat to INACTIVE before disabling
+        # motors. Skip the retreat only if we never enabled torque or the
+        # arm is no longer connected.
         try:
             cam.stop()
         except Exception:
             pass
+        try:
+            if arm.connected:
+                print("[Cleanup] Driving arm to INACTIVE before releasing torque...")
+                ok = drive_to_inactive(arm, cal)
+                if not ok:
+                    print("[Cleanup] WARN: INACTIVE retreat reported failure. "
+                          "Brace the arm before torque release.")
+        except Exception as e:
+            print(f"[Cleanup] WARN: failed during INACTIVE retreat: {e}")
         try:
             arm.release_torque()
             arm.disconnect()

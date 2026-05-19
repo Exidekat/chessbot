@@ -70,24 +70,8 @@ def capture_frame(cam, warmup_frames: int = 5, settle_s: float = 0.04,
     return last
 
 
-def probe_camera(cam, camera_id, timeout_s: float = 2.0) -> bool:
-    """Verify the camera actually delivers a frame within `timeout_s`.
-
-    GripperCamera.start() returns True whenever cv2.VideoCapture.isOpened()
-    is True -- but OpenCV will sometimes open a non-capture V4L2 endpoint
-    (e.g. the metadata channel that USB UVC cameras expose alongside the
-    capture endpoint at the same physical device) where `cap.read()` then
-    silently fails forever in the background thread. This wrapper waits
-    for an actual frame and prints a diagnostic with available
-    /dev/video* devices on failure.
-    """
-    frame = capture_frame(cam, warmup_frames=0, max_wait_s=timeout_s)
-    if frame is not None:
-        return True
-
+def _diagnostic_hint(camera_id) -> None:
     import glob as _glob
-    print(f"[CV  ] Camera id={camera_id} opened but no frame arrived within "
-          f"{timeout_s:.1f}s.")
     devs = sorted(_glob.glob("/dev/video*"))
     if devs:
         print(f"[CV  ] Available video devices: {' '.join(devs)}")
@@ -98,7 +82,69 @@ def probe_camera(cam, camera_id, timeout_s: float = 2.0) -> bool:
         print("[CV  ] To label devices, run: v4l2-ctl --list-devices")
     else:
         print("[CV  ] No /dev/video* devices found on this system.")
-    return False
+
+
+def probe_camera(cam, camera_id, timeout_s: float = 2.0,
+                 min_frame_std: float = 4.0,
+                 min_inter_frame_change: float = 0.5,
+                 spacing_s: float = 0.20) -> bool:
+    """Verify the camera actually delivers live, varying frames.
+
+    GripperCamera.start() returns True whenever cv2.VideoCapture.isOpened()
+    is True, but OpenCV will sometimes open a non-capture V4L2 endpoint
+    (the metadata channel that USB UVC cameras expose alongside the
+    capture endpoint at the same physical device, or another camera with
+    a stale buffer) where `cap.read()` returns something but it isn't
+    the live scene. We catch that here by requiring:
+
+      1. A frame arrives within `timeout_s` seconds.
+      2. The frame has reasonable per-pixel variance (>= min_frame_std)
+         -- a uniform black/gray frame is most likely a metadata buffer.
+      3. A second frame captured `spacing_s` later differs from the first
+         (mean abs delta >= min_inter_frame_change) -- a frozen buffer
+         would show exactly zero change between captures.
+
+    On failure prints the available /dev/video* devices plus the hint
+    about UVC capture/metadata pairing.
+    """
+    f1 = capture_frame(cam, warmup_frames=0, max_wait_s=timeout_s)
+    if f1 is None:
+        print(f"[CV  ] Camera id={camera_id} opened but no frame arrived "
+              f"within {timeout_s:.1f}s.")
+        _diagnostic_hint(camera_id)
+        return False
+
+    s1 = float(f1.std())
+    if s1 < min_frame_std:
+        print(f"[CV  ] Camera id={camera_id} returns near-uniform frames "
+              f"(std={s1:.2f} < {min_frame_std}) -- probably a metadata "
+              f"endpoint or an unrelated buffer.")
+        _diagnostic_hint(camera_id)
+        return False
+
+    time.sleep(spacing_s)
+    f2 = capture_frame(cam, warmup_frames=0, max_wait_s=timeout_s)
+    if f2 is None:
+        print(f"[CV  ] Camera id={camera_id} returned the first frame but "
+              f"none after {spacing_s:.2f}s.")
+        _diagnostic_hint(camera_id)
+        return False
+
+    if f1.shape != f2.shape:
+        print(f"[CV  ] Camera id={camera_id} returned frames with mismatched "
+              f"shapes {f1.shape} vs {f2.shape} -- driver or codec issue.")
+        return False
+
+    delta = float(np.mean(np.abs(f1.astype(np.int16) - f2.astype(np.int16))))
+    if delta < min_inter_frame_change:
+        print(f"[CV  ] Camera id={camera_id} produces frozen frames "
+              f"(mean abs delta {delta:.3f} < {min_inter_frame_change} "
+              f"across {spacing_s:.2f}s) -- likely a stale buffer on a "
+              f"wrong V4L2 endpoint.")
+        _diagnostic_hint(camera_id)
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
