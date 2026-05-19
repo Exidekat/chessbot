@@ -9,19 +9,40 @@ What it does:
      square (default e4) using the existing fitted IK.
   2. Captures a frame from the gripper camera; finds the piece centroid
      via the same OpenCV heuristic used at runtime.
-  3. Asks the user to move the piece by exactly +1 square along the file
-     axis (e.g. e4 -> f4), captures again, and computes the pixel delta.
-  4. Derives `mm_per_pixel` and `board_x_in_image_rad` (the angle the
-     board's +file axis makes in the gripper-cam image at this pose).
-  5. Optionally repeats along the rank axis for a sanity check.
+  3. Asks the user to move the piece by N squares along the file axis
+     (default N=2, i.e. e4 -> g4, to keep the piece on the same-colour
+     square); captures and computes the pixel delta. N is inferred from
+     --square / --next-file-square; must be a pure-file move.
+  4. Repeats along the rank axis (default e4 -> e6) for the perpendicular
+     calibration; the script refuses to write the block if the two
+     pixel axes aren't perpendicular within +/-20 deg.
+  5. Derives `mm_per_pixel` and `board_x_in_image_rad` (the angle the
+     board's +file axis makes in the gripper-cam image at this pose),
+     scaling mm_per_pixel by the actual displacement in squares.
   6. Writes the result back into data/calibration/board_calibration.json
      under a top-level `cv_assist` block. The chesster execute script
      picks it up when run with --cv-assist.
 
 Usage:
+  # Default: --square e4 plus two-square same-colour displacements
+  # (e4 -> g4 along file, e4 -> e6 along rank). The "+2 squares" default
+  # keeps the piece on the same-colour square at both ends of each move,
+  # which is critical for thresholding -- a piece on a dark square gives
+  # very low local contrast and gets merged into the square by both OTSU
+  # and adaptive thresholding.
   python scripts/chesster_calibrate_cv_assist.py
-  python scripts/chesster_calibrate_cv_assist.py --square e4 --next-file-square f4
-  python scripts/chesster_calibrate_cv_assist.py --camera-id 0
+
+  # Custom single-square displacement (the original behaviour). Only
+  # useful if your gripper-cam has high local contrast on dark squares
+  # and you don't run into the piece-merged-with-dark-square failure.
+  python scripts/chesster_calibrate_cv_assist.py \
+      --square e4 --next-file-square f4 --next-rank-square e5
+
+  # Adaptive threshold + centred ROI, recommended for cluttered fields
+  # of view (gripper hardware visible in frame, half-board in shot, etc.)
+  python scripts/chesster_calibrate_cv_assist.py \
+      --threshold-mode adaptive --roi-px 200 200
+
   python scripts/chesster_calibrate_cv_assist.py --skip-rank-check
 
 After running, verify with:
@@ -137,15 +158,23 @@ def drive_to_inactive(arm: ChessterArm, cal: BoardCalibration,
 # Calibration measurement
 # ---------------------------------------------------------------------------
 
-def derive_axis_calibration(centroid_a, centroid_b, square_pitch_m: float):
-    """Given two centroids representing a one-square displacement along a
-    board axis (a -> b), return (mm_per_pixel, axis_angle_in_image_rad)."""
+def derive_axis_calibration(centroid_a, centroid_b, square_pitch_m: float,
+                            n_squares: float = 1.0):
+    """Given two centroids that represent a known board-frame displacement
+    of `n_squares` square-pitches along an axis (file or rank), return
+    (mm_per_pixel, axis_angle_in_image_rad, pixel_distance).
+
+    n_squares > 1 is encouraged because adjacent-square displacements
+    keep the piece on alternating-colour squares (chessboard parity),
+    which defeats simple thresholding. Two-square displacements along
+    file/rank keep the piece on a SAME-colour square at both ends.
+    """
     du = centroid_b[0] - centroid_a[0]
     dv = centroid_b[1] - centroid_a[1]
     pix = float(np.hypot(du, dv))
     if pix < 1e-6:
         raise ValueError("Centroids are identical; piece did not move.")
-    mm_per_px = (square_pitch_m * 1000.0) / pix
+    mm_per_px = (n_squares * square_pitch_m * 1000.0) / pix
     # Right-handed image coordinates flip v. Angle (CCW from image +u)
     # that the board axis makes:
     angle = float(np.arctan2(-dv, du))
@@ -208,6 +237,11 @@ def main():
         return 1
 
     # Derive auto next-file / next-rank squares if not provided.
+    # Default to TWO squares away (e.g. e4 -> g4 and e4 -> e6) so the
+    # piece stays on the same-colour square -- alternating-colour squares
+    # defeat global / adaptive thresholding when the piece sits on a
+    # dark square and has little local contrast.
+    DEFAULT_SQ_STEP = 2
     sq = args.square.lower()
     if len(sq) != 2 or sq[0] not in "abcdefgh" or sq[1] not in "12345678":
         print(f"[X] --square must be a chess square (got {args.square!r})",
@@ -215,20 +249,76 @@ def main():
         return 1
     file_idx = ord(sq[0]) - ord("a")
     rank_idx = int(sq[1]) - 1
+
+    def parse_sq(name):
+        s = name.lower()
+        if len(s) != 2 or s[0] not in "abcdefgh" or s[1] not in "12345678":
+            raise ValueError(f"Invalid square {name!r}")
+        return ord(s[0]) - ord("a"), int(s[1]) - 1
+
     next_file = args.next_file_square
     if not next_file:
-        if file_idx >= 7:
-            print("[X] Cannot auto-derive --next-file-square from file h; "
-                  "pass --next-file-square explicitly.", file=sys.stderr)
-            return 1
-        next_file = chr(ord("a") + file_idx + 1) + str(rank_idx + 1)
+        nf = file_idx + DEFAULT_SQ_STEP
+        if nf > 7:
+            nf = file_idx - DEFAULT_SQ_STEP
+            if nf < 0:
+                print("[X] Cannot auto-derive --next-file-square: --square "
+                      "too close to file edge for the default 2-square step.",
+                      file=sys.stderr)
+                return 1
+        next_file = chr(ord("a") + nf) + str(rank_idx + 1)
     next_rank = args.next_rank_square
     if not next_rank:
-        if rank_idx >= 7:
-            print("[X] Cannot auto-derive --next-rank-square from rank 8; "
-                  "pass --next-rank-square explicitly.", file=sys.stderr)
-            return 1
-        next_rank = sq[0] + str(rank_idx + 2)
+        nr = rank_idx + DEFAULT_SQ_STEP
+        if nr > 7:
+            nr = rank_idx - DEFAULT_SQ_STEP
+            if nr < 0:
+                print("[X] Cannot auto-derive --next-rank-square: --square "
+                      "too close to rank edge for the default 2-square step.",
+                      file=sys.stderr)
+                return 1
+        next_rank = sq[0] + str(nr + 1)
+
+    # Validate the moves are pure file / pure rank.
+    try:
+        nf_file, nf_rank = parse_sq(next_file)
+        nr_file, nr_rank = parse_sq(next_rank)
+    except ValueError as e:
+        print(f"[X] {e}", file=sys.stderr); return 1
+    if nf_rank != rank_idx:
+        print(f"[X] --next-file-square {next_file!r} is on rank "
+              f"{nf_rank+1}, not the same rank as --square {sq!r} "
+              f"(rank {rank_idx+1}). The file calibration move must be "
+              f"PURE file (rank unchanged).", file=sys.stderr)
+        return 1
+    if nr_file != file_idx:
+        print(f"[X] --next-rank-square {next_rank!r} is on file "
+              f"{chr(ord('a')+nr_file)}, not the same file as --square "
+              f"{sq!r} (file {sq[0]}). The rank calibration move must "
+              f"be PURE rank (file unchanged).", file=sys.stderr)
+        return 1
+    file_n_squares = abs(nf_file - file_idx)
+    rank_n_squares = abs(nr_rank - rank_idx)
+    if file_n_squares < 1 or rank_n_squares < 1:
+        print(f"[X] file/rank displacements must be >=1 square "
+              f"(got file={file_n_squares}, rank={rank_n_squares}).",
+              file=sys.stderr)
+        return 1
+
+    # Warn if the displacement keeps the piece on alternating-colour
+    # squares. With (file+rank) parity, a 1-square move flips colour;
+    # a 2-square move preserves it.
+    def square_colour(fi, ri):
+        return "dark" if (fi + ri) % 2 == 0 else "light"
+    sq_colour = square_colour(file_idx, rank_idx)
+    nf_colour = square_colour(nf_file, nf_rank)
+    nr_colour = square_colour(nr_file, nr_rank)
+    if nf_colour != sq_colour or nr_colour != sq_colour:
+        print(f"[WARN] Some calibration squares are different colours "
+              f"({sq}={sq_colour}, {next_file}={nf_colour}, "
+              f"{next_rank}={nr_colour}). Adaptive/OTSU thresholding may "
+              f"fail to separate piece from dark squares. Prefer a "
+              f"2-square displacement on same-colour squares.")
 
     print("=" * 60)
     print("Chesster CV-assist Calibration")
@@ -379,10 +469,11 @@ def main():
         # 4) Compute mm_per_pixel and angle.
         pitch_m = float(ik["square_pitch_m"])
         mm_per_px_file, angle_file_rad, pix_file = derive_axis_calibration(
-            c0, c_file, pitch_m,
+            c0, c_file, pitch_m, n_squares=file_n_squares,
         )
         print()
-        print(f"File-axis sample: pixel_delta={pix_file:.1f} px  "
+        print(f"File-axis sample ({file_n_squares} square(s) displacement): "
+              f"pixel_delta={pix_file:.1f} px  "
               f"-> mm/px={mm_per_px_file:.3f}  "
               f"angle={np.degrees(angle_file_rad):+.2f}deg")
         results = {"mm_per_pixel": mm_per_px_file,
@@ -390,9 +481,10 @@ def main():
 
         if c_rank is not None:
             mm_per_px_rank, angle_rank_rad, pix_rank = derive_axis_calibration(
-                c0, c_rank, pitch_m,
+                c0, c_rank, pitch_m, n_squares=rank_n_squares,
             )
-            print(f"Rank-axis sample: pixel_delta={pix_rank:.1f} px  "
+            print(f"Rank-axis sample ({rank_n_squares} square(s) displacement): "
+                  f"pixel_delta={pix_rank:.1f} px  "
                   f"-> mm/px={mm_per_px_rank:.3f}  "
                   f"angle={np.degrees(angle_rank_rad):+.2f}deg")
             # Sanity: rank should be roughly perpendicular (90 deg CCW from file).
