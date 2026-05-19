@@ -188,6 +188,12 @@ def main():
     p.add_argument("--max-correction-mm", type=float, default=25.0,
                    help="Runtime safety cap on CV-assist correction magnitude "
                         "(stored in the calibration block, default 25 mm).")
+    p.add_argument("--allow-bad-geometry", action="store_true",
+                   help="Skip the rank-vs-file perpendicularity check (a "
+                        "calibration where file and rank pixel axes are far "
+                        "from perpendicular implies a bad capture; the "
+                        "script aborts without writing the block unless "
+                        "this flag is passed).")
     p.add_argument("--debug-dir", type=str, default="data/cv_assist_debug",
                    help="Directory to save captured frames + overlays.")
     p.add_argument("--no-autodrive", action="store_true",
@@ -391,7 +397,8 @@ def main():
                   f"angle={np.degrees(angle_rank_rad):+.2f}deg")
             # Sanity: rank should be roughly perpendicular (90 deg CCW from file).
             angle_diff = (angle_rank_rad - angle_file_rad + np.pi) % (2 * np.pi) - np.pi
-            print(f"Rank vs file angle diff: {np.degrees(angle_diff):+.2f}deg "
+            angle_diff_deg = np.degrees(angle_diff)
+            print(f"Rank vs file angle diff: {angle_diff_deg:+.2f}deg "
                   f"(expected ~+90deg)")
             diff_mm_per_px = abs(mm_per_px_file - mm_per_px_rank)
             if diff_mm_per_px > 0.2 * max(mm_per_px_file, mm_per_px_rank):
@@ -399,6 +406,37 @@ def main():
                       f"{diff_mm_per_px:.3f} mm/px (>20%); the gripper camera "
                       f"may not be perpendicular to the board, or the piece "
                       f"placements were not on square centres.")
+            # Hard gate: if the file and rank pixel axes are far from
+            # perpendicular, something is wrong with the capture (most
+            # likely the centroid latched onto a non-piece feature in one
+            # of the three frames, or the piece was placed at the wrong
+            # square). Refuse to write the cv_assist block.
+            if abs(abs(angle_diff_deg) - 90.0) > 20.0:
+                msg = (f"Rank vs file angle diff is "
+                       f"{angle_diff_deg:+.2f}deg, expected ~+90deg "
+                       f"(tolerance +-20deg). The two pixel deltas are "
+                       f"nearly parallel, which means the piece did NOT "
+                       f"move in two independent directions across the "
+                       f"three captures.\n"
+                       f"  Look at data/cv_assist_debug/0[123]_*.png: "
+                       f"is the green crosshair on the actual piece in "
+                       f"each frame, and do the three frames clearly show "
+                       f"the piece at three different board positions?\n"
+                       f"  If yes, the camera optics likely need a richer "
+                       f"mapping than a single mm/px scalar -- raise an "
+                       f"issue. If no, re-run after fixing centroid "
+                       f"detection (try --threshold-mode adaptive, lower "
+                       f"--min-area-px, or smaller --roi-px to crop "
+                       f"out non-board content).")
+                if args.allow_bad_geometry:
+                    print(f"[WARN] {msg}")
+                    print("[WARN] --allow-bad-geometry set; writing anyway.")
+                else:
+                    print(f"[X] {msg}", file=sys.stderr)
+                    print("[X] Refusing to write cv_assist block. "
+                          "Pass --allow-bad-geometry to override.",
+                          file=sys.stderr)
+                    return 1
             # Average for the final scalar.
             results["mm_per_pixel"] = (mm_per_px_file + mm_per_px_rank) / 2.0
 
